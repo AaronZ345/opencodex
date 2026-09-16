@@ -35,6 +35,7 @@ import {
   codexPoolAffinityKey,
   previewCodexPoolLineage,
   applyCodexAuthContextToProvider,
+  hasCallerCodexBearer,
 } from "../../codex/auth-context";
 import {
   copyPreviousResponseReplayProvenance,
@@ -84,7 +85,11 @@ import {
   canPassThroughEncryptedV2AgentTask,
   applyFinalRouteRequestNormalization,
 } from "./core-normalize";
-import { resolveCodexModelEntitlements } from "../../codex/model-entitlements";
+import {
+  cachedDeniedCodexAccountIdsForModel,
+  resolveCodexModelEntitlements,
+} from "../../codex/model-entitlements";
+import { MAIN_CODEX_ACCOUNT_ID } from "../../codex/main-account";
 import {
   previewCodexAccountForRequest,
   codexQuotaScopeForModel,
@@ -101,7 +106,7 @@ import {
   isCodexReserveHelperUnsupported,
   CODEX_RESERVE_HELPER_UNSUPPORTED_MESSAGE,
 } from "../../codex/loopback-target";
-import { checkInputAdmission } from "./input-admission";
+import { checkComboTargetInputAdmission, checkInputAdmission } from "./input-admission";
 import { nativeContextLimits } from "../../codex/catalog";
 import { streamingContextOverflowResponse } from "./context-overflow";
 import {
@@ -115,6 +120,8 @@ import { codexAuthContextLogLabel } from "../../codex/account-label";
 import {
   conversationStateBindingFromAuth,
   applyAccountChangeConversationStateScrub,
+  accountChangeFileReferenceRefusal,
+  conversationCarriesUploadedFiles,
 } from "./account-change-state";
 
 /** Parses, selects, and admits one request without changing the dispatch policy. */
@@ -365,6 +372,14 @@ export async function prepareResponsesRequest(
   }
   logCtx.requestedModel = parsed.modelId;
   logCtx.requestedEffort = parsed.options.reasoning;
+  // What this request may spend beyond its input, for the durable spend reservation (#4707).
+  // Read from the caller rather than from the adapter's serialized body, because the
+  // reservation has to exist before the body does. A caller that omits it leaves the
+  // provider/model default in charge and reserves only the input estimate; settlement then
+  // books the real figure, so the gap is a looser bound up front, never a wrong one after.
+  if (typeof parsed.options.maxOutputTokens === "number" && parsed.options.maxOutputTokens > 0) {
+    logCtx.spendOutputCeilingTokens = Math.trunc(parsed.options.maxOutputTokens);
+  }
   logCtx.callerServiceTier = sanitizeLogMetadataString(parsed.options.serviceTier);
   logCtx.requestedServiceTier = parsed.options.serviceTier;
   logCtx.requestedSpeedLabel = requestLogSpeedLabel(parsed.options.serviceTier);
@@ -442,12 +457,41 @@ export async function prepareResponsesRequest(
     && (route.codexAccountId === undefined || initialSubagentFallbackChain !== null)
     ? codexAccountSelectionForTurn(options.turnAdmissionLease)?.()
     : undefined;
+  // The credential headers final authentication will be given, resolved once and reused by
+  // everything below that has to predict what final auth decides.
+  const previewAuthHeaders = codexRouteCredentialDomainHeaders(
+    req,
+    route,
+    options,
+    credentialDomainWasRewritten,
+  );
+  // Does the CALLER own the credential this request will authenticate with? Validated exactly
+  // the way final auth validates it: the route ownership predicate AND the caller-bearer check
+  // `resolveCodexAuthContext` re-applies to these same headers.
+  const previewRequestScopedMainCredential = codexRouteCredentialOwnership(
+    previewAuthHeaders,
+    config,
+    route,
+    options,
+  ).requestScopedMainCredential && hasCallerCodexBearer(previewAuthHeaders);
   const nativeMainRecoveryBlocked = isNativeMainTrafficBlocked();
-  const nativeMainReadsForbidden = nativeMainRecoveryBlocked
+  // The same three inputs final auth ORs together (src/codex/auth-context.ts). Request-owned
+  // ownership is first there and has to be first here: computing the preview fence from
+  // recovery and drain state alone let a `thread_spawn` carrying a forwardable caller bearer
+  // read the physical main token it is forbidden to touch, and score main differently than the
+  // resolution this preview exists to predict.
+  const nativeMainReadsForbidden = previewRequestScopedMainCredential
+    || nativeMainRecoveryBlocked
     || previewSelectionAdmission?.mainProfileDraining === true;
+  // Deliberately NOT fenced on ownership: final auth derives `nativeMainSelectionOnly` from the
+  // drain alone, and adding a term here would diverge from it in the other direction.
   const previewSelectionOptions = {
     nativeMainSelectionOnly: !nativeMainRecoveryBlocked
       && previewSelectionAdmission?.mainProfileDraining === true,
+    // Preview must reach the same answer as the final resolution, including the uploaded-file
+    // retention (#4778): a preview that reported a quota move the request will not make would
+    // hand subagent fallback a different account than the one that actually serves.
+    retainAccountForUploadedFiles: conversationCarriesUploadedFiles(parsed._rawBody),
   };
   let selectedForwardHeaders = req.headers;
   let subagentFallbackAccountId = config.activeCodexAccountId ?? null;
@@ -466,22 +510,11 @@ export async function prepareResponsesRequest(
   // deliberately create no affinity at all -- previewing a family binding for one of those would
   // hand model fallback an account this request can never authenticate as. Read-only: the record
   // is written by the resolution that binds, never by a preview that may own no Pool state.
-  const previewAuthHeaders = codexRouteCredentialDomainHeaders(
-    req,
-    route,
-    options,
-    credentialDomainWasRewritten,
-  );
   const poolLineage = previewCodexPoolLineage(previewAuthHeaders, options.codexAuthPolicy ?? config, {
     accountId: route.codexAccountId,
     modelId: route.modelId,
     admission: options.admission,
-    requestScopedMainCredential: codexRouteCredentialOwnership(
-      previewAuthHeaders,
-      config,
-      route,
-      options,
-    ).requestScopedMainCredential,
+    requestScopedMainCredential: previewRequestScopedMainCredential,
   });
 
   try {
@@ -519,7 +552,20 @@ export async function prepareResponsesRequest(
       config,
       previewNow,
       codexQuotaScopeForModel(modelId),
-      { ...previewSelectionOptions, modelEligibleAccountIds },
+      {
+        ...previewSelectionOptions,
+        modelEligibleAccountIds,
+        // Per CANDIDATE model, like the scope and the eligible set above: the preference is
+        // model-specific, so hoisting it out of the closure would score every fallback
+        // candidate against the requested model's evidence and diverge from final auth (#4768).
+        // Under the same native-main read fence final auth applies: the reader validates each
+        // cached roster against the account's current credential, and for main that is a
+        // synchronous read of the stored token. A preview that read it would both cross the
+        // fence and score main differently than the resolution it is supposed to predict.
+        deniedModelAccountIds: cachedDeniedCodexAccountIdsForModel(modelId, previewNow, {
+          excludeAccountIds: nativeMainReadsForbidden ? new Set([MAIN_CODEX_ACCOUNT_ID]) : undefined,
+        }),
+      },
       modelId,
       poolLineage,
     );
@@ -650,9 +696,31 @@ export async function prepareResponsesRequest(
           const fallback = (() => {
             try {
               const recoveryNativeMainBlocked = isNativeMainTrafficBlocked();
+              // Recompute ownership here rather than reusing the pre-decryption value: a
+              // subagent fallback above may have re-routed, and `requestScopedMainCredential`
+              // is a function of the route as well as the headers.
+              const recoveryAuthHeaders = codexRouteCredentialDomainHeaders(
+                req,
+                route,
+                options,
+                credentialDomainWasRewritten,
+              );
+              const recoveryRequestScopedMainCredential = codexRouteCredentialOwnership(
+                recoveryAuthHeaders,
+                config,
+                route,
+                options,
+              ).requestScopedMainCredential && hasCallerCodexBearer(recoveryAuthHeaders);
               const recoverySelectionOptions = {
                 nativeMainSelectionOnly: !recoveryNativeMainBlocked
                   && recoverySelectionAdmission?.mainProfileDraining === true,
+                // #4778, same reason as `previewSelectionOptions` above: this preview decides
+                // which account subagent fallback scores against, and final auth passes the
+                // retention. Recovery is exactly where the two could diverge -- it re-previews
+                // against the DECRYPTED body, which is the first point at which a file reference
+                // that was ciphertext-only becomes readable, so reconstructing the options
+                // without the bit lets preview report a quota move the request will not make.
+                retainAccountForUploadedFiles: conversationCarriesUploadedFiles(parsed._rawBody),
               };
               const recoveryNow = Date.now();
               // Carry the entitlement filter through recovery too (#2509/#2623). The scope was
@@ -665,7 +733,21 @@ export async function prepareResponsesRequest(
                 config,
                 previewNow,
                 codexQuotaScopeForModel(modelId),
-                { ...recoverySelectionOptions, modelEligibleAccountIds },
+                {
+                  ...recoverySelectionOptions,
+                  modelEligibleAccountIds,
+                  // Same read fence as the first preview, evaluated against recovery's own view
+                  // of the drain AND of credential ownership, rather than the one captured before
+                  // decryption. Omitting ownership here would reopen the fence the first preview
+                  // closes, on the one path that re-previews after the route may have moved.
+                  deniedModelAccountIds: cachedDeniedCodexAccountIdsForModel(modelId, previewNow, {
+                    excludeAccountIds: recoveryRequestScopedMainCredential
+                      || recoveryNativeMainBlocked
+                      || recoverySelectionAdmission?.mainProfileDraining === true
+                      ? new Set([MAIN_CODEX_ACCOUNT_ID])
+                      : undefined,
+                  }),
+                },
                 modelId,
                 poolLineage,
               );
@@ -860,7 +942,12 @@ export async function prepareResponsesRequest(
   // refusing the turn that shrinks the context would deadlock the client against the very
   // limit this gate reports — it would be told to compact and then denied the compaction.
   if (parsed._compactionRequest !== true) {
-    const inputAdmission = checkInputAdmission(parsed, route.provider, route.providerName, parsed.modelId, nativeContextLimits(config));
+    // A combo child is the one caller that can afford a strict gate: skipping a target it
+    // cannot fit is safe before any upstream bytes are sent, and the ladder continues. A
+    // direct request has nowhere to go, so it keeps the loose pathological-input gate.
+    const inputAdmission = options.comboAttempt
+      ? checkComboTargetInputAdmission(parsed, route.provider, route.providerName, parsed.modelId, nativeContextLimits(config))
+      : checkInputAdmission(parsed, route.provider, route.providerName, parsed.modelId, nativeContextLimits(config));
     if (!inputAdmission.admitted) {
       // #1524: this is a LOCAL preflight refusal, not an upstream verdict. A policy or combo
       // fallback must be able to skip this candidate and try one whose context window fits,
@@ -876,9 +963,13 @@ export async function prepareResponsesRequest(
       return formatErrorResponse(
         413,
         "input_admission_refused",
-        `Estimated input (~${inputAdmission.estimatedTokens} tokens) is far past the context window `
-          + `of ${parsed.modelId} (${inputAdmission.ceiling} tokens). Start a new session or choose a `
-          + `model with a larger context window.`,
+        inputAdmission.requiredOutputHeadroom !== undefined
+          ? `Estimated input (~${inputAdmission.estimatedTokens} tokens) plus ${inputAdmission.requiredOutputHeadroom} `
+            + `tokens of requested output headroom cannot fit the context window of ${parsed.modelId} `
+            + `(${inputAdmission.ceiling} tokens).`
+          : `Estimated input (~${inputAdmission.estimatedTokens} tokens) is far past the context window `
+            + `of ${parsed.modelId} (${inputAdmission.ceiling} tokens). Start a new session or choose a `
+            + `model with a larger context window.`,
       );
     }
   }
@@ -897,7 +988,18 @@ export async function prepareResponsesRequest(
   let substituteMainCredential = false;
   let callerAuthHeaders: Headers;
   {
-    const finalAuth = await resolveResponsesCodexAuth(req, config, route, options, credentialDomainWasRewritten);
+    // #4778: uploaded files are scoped to the account that issued them, so a conversation
+    // carrying live references must retain its binding across a voluntary quota move. Answered
+    // from the body alone, by the same predicate the refusal guard uses, so the two can never
+    // disagree about which conversations are in scope.
+    const finalAuth = await resolveResponsesCodexAuth(
+      req,
+      config,
+      route,
+      options,
+      credentialDomainWasRewritten,
+      conversationCarriesUploadedFiles(parsed._rawBody),
+    );
     if (!finalAuth.ok) return finalAuth.response;
     admissionState.authCtx = finalAuth.authCtx;
     selectedForwardHeaders = withClaudeNativeSession(finalAuth.headers, route.provider, options.claudeNativeSessionId);
@@ -921,6 +1023,14 @@ export async function prepareResponsesRequest(
   {
     const binding = conversationStateBindingFromAuth(admissionState.authCtx, poolAffinityKey);
     if (binding) {
+      // Before the scrub, because a file reference is refused rather than removed and the
+      // refusal has to happen while there is still no dispatch to undo.
+      const refusal = accountChangeFileReferenceRefusal({
+        body: parsed._rawBody,
+        bindingKey: binding.bindingKey,
+        servingAccountId: binding.accountId,
+      });
+      if (refusal) return refusal;
       applyAccountChangeConversationStateScrub({
         body: parsed._rawBody,
         parsed,

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, readFileSync, mkdirSync, openSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, readFileSync, mkdirSync, openSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ConfigMutationLockError,
@@ -266,6 +266,23 @@ export function listCodexAccountIds(): string[] {
 
 export function readCodexAccountRecord(id: string): CodexAccountCredentialRecord | null {
   return loadCodexAccountRecordStore()[id] ?? null;
+}
+
+/**
+ * One store load, every record, for a caller that resolves MANY ids in a single synchronous pass.
+ *
+ * `readCodexAccountRecord` reloads, reparses and renormalizes the whole file per id. That is the
+ * right shape for one lookup and the wrong shape for a loop: the entitlement denial reader holds
+ * up to 64 accounts with four client versions each, so scoring one warm flagship request could
+ * perform up to 256 full-store reads on the request path.
+ *
+ * These are the same normalized records `readCodexAccountRecord` hands out, tombstones included,
+ * so the caller keeps its own `deletedAt` and `generation` checks instead of trusting a filtered
+ * view. That is the difference from `loadCodexAccountStore`, which drops both and cannot answer a
+ * question about credential generation.
+ */
+export function loadCodexAccountRecordSnapshot(): Readonly<Record<string, CodexAccountCredentialRecord>> {
+  return loadCodexAccountRecordStore();
 }
 
 const QUOTA_HISTORY_IDENTITY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -655,8 +672,41 @@ function isRefreshLockStale(path: string): boolean {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as { acquiredAt?: unknown };
     return typeof parsed.acquiredAt !== "number" || Date.now() - parsed.acquiredAt > REFRESH_LOCK_STALE_MS;
   } catch {
-    return true;
+    // The owner creates the file and writes its metadata in two steps, so a live lock is
+    // briefly unreadable. Age the file itself instead of calling that window stale, which
+    // let a waiter delete a lock whose owner was still inside its critical section.
+    try {
+      return Date.now() - statSync(path).mtimeMs > REFRESH_LOCK_STALE_MS;
+    } catch {
+      return false;
+    }
   }
+}
+
+function releaseCodexRefreshFileLock(path: string, fd: number): void {
+  let owned: { dev: bigint; ino: bigint } | null = null;
+  try {
+    const info = fstatSync(fd, { bigint: true });
+    if (info.dev >= 0n && info.ino > 0n) owned = { dev: info.dev, ino: info.ino };
+  } catch { /* Unknown descriptor identity never authorizes unlink. */ }
+  try {
+    withConfigMutationLockSync(() => {
+      let current: { dev: bigint; ino: bigint } | null = null;
+      try {
+        const info = statSync(path, { bigint: true });
+        if (info.dev >= 0n && info.ino > 0n) current = { dev: info.dev, ino: info.ino };
+      } catch { /* Keep the lock and the callback outcome when the path probe fails. */ }
+      if (owned && current && current.dev === owned.dev && current.ino === owned.ino) {
+        try { unlinkSync(path); } catch (err) {
+          if (errCode(err) !== "ENOENT") throw err;
+        }
+      }
+    });
+  } catch (err) {
+    // Keep the descriptor alive through comparison/unlink so its inode cannot be recycled.
+    // Unavailable coordination leaves the path without masking the completed refresh.
+    if (!(err instanceof ConfigMutationLockError)) throw err;
+  } finally { closeSync(fd); }
 }
 
 export async function withCodexRefreshFileLock<T>(lockKey: string, signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
@@ -670,33 +720,45 @@ export async function withCodexRefreshFileLock<T>(lockKey: string, signal: Abort
   while (fd == null) {
     if (signal.aborted) throw signal.reason;
     try {
-      fd = openSync(path, "wx", 0o600);
-      writeFileSync(fd, JSON.stringify({ acquiredAt: Date.now(), pid: process.pid }) + "\n");
-      break;
-    } catch (err) {
-      if (errCode(err) !== "EEXIST") throw err;
-      if (isRefreshLockStale(path)) {
+      // Serialize only metadata operations, never the async refresh callback. Cooperating
+      // contenders cannot reclaim a successor between stale observation and path mutation.
+      withConfigMutationLockSync(() => {
         try {
-          unlinkSync(path);
-        } catch (unlinkErr) {
-          if (errCode(unlinkErr) !== "ENOENT") throw unlinkErr;
+          fd = openSync(path, "wx", 0o600);
+          writeFileSync(fd, JSON.stringify({ acquiredAt: Date.now(), pid: process.pid }) + "\n");
+        } catch (err) {
+          if (fd != null) {
+            const failedFd = fd;
+            fd = null;
+            try { releaseCodexRefreshFileLock(path, failedFd); } catch { /* Preserve write failure. */ }
+            throw err;
+          }
+          if (errCode(err) !== "EEXIST") throw err;
+          if (isRefreshLockStale(path)) {
+            try { unlinkSync(path); } catch (unlinkErr) {
+              if (errCode(unlinkErr) !== "ENOENT") throw unlinkErr;
+            }
+          }
         }
-        continue;
+      });
+    } catch (err) {
+      // A failed SQLite commit can follow successful file creation; it still owns an fd.
+      if (fd != null) {
+        const failedFd = fd;
+        fd = null;
+        try { releaseCodexRefreshFileLock(path, failedFd); } catch { /* Preserve admission failure. */ }
       }
-      if (Date.now() >= deadline) throw new CodexCredentialRefreshLockTimeoutError();
-      await sleep(REFRESH_LOCK_POLL_MS, signal);
+      if (!(err instanceof ConfigMutationLockError)) throw err;
     }
+    if (fd != null) break;
+    if (Date.now() >= deadline) throw new CodexCredentialRefreshLockTimeoutError();
+    await sleep(REFRESH_LOCK_POLL_MS, signal);
   }
 
   try {
     return await fn();
   } finally {
-    if (fd != null) closeSync(fd);
-    try {
-      unlinkSync(path);
-    } catch (err) {
-      if (errCode(err) !== "ENOENT") throw err;
-    }
+    releaseCodexRefreshFileLock(path, fd);
   }
 }
 
@@ -1137,9 +1199,20 @@ async function resolveCodexToken(
       let errDesc: string;
       let errCodeExact: string | undefined;
       try {
-        const parsed = JSON.parse(errText) as { error?: string; error_description?: string };
-        errCodeExact = typeof parsed.error === "string" ? parsed.error.trim() : undefined;
-        errDesc = [parsed.error, parsed.error_description].filter(Boolean).join(": ") || `HTTP ${res.status}`;
+        const parsed = JSON.parse(errText) as {
+          error?: string | { code?: string; message?: string };
+          error_description?: string;
+        };
+        if (typeof parsed.error === "string") {
+          errCodeExact = parsed.error.trim();
+          errDesc = [parsed.error, parsed.error_description].filter(Boolean).join(": ");
+        } else if (parsed.error && typeof parsed.error === "object") {
+          errCodeExact = typeof parsed.error.code === "string" ? parsed.error.code.trim() : undefined;
+          errDesc = [parsed.error.code, parsed.error.message, parsed.error_description].filter(Boolean).join(": ");
+        } else {
+          errDesc = parsed.error_description || `HTTP ${res.status}`;
+        }
+        if (!errDesc) errDesc = `HTTP ${res.status}`;
       } catch { errDesc = `HTTP ${res.status}`; }
       // `invalid_grant` is the standard OAuth code for a refresh token that is no longer
       // usable, and upstream sends it bare with no description. Without it here the dead
@@ -1149,9 +1222,23 @@ async function resolveCodexToken(
       // Matched on the exact `error` CODE, not anywhere in the combined text: a transient
       // `server_error` whose description happens to mention invalid_grant would otherwise
       // retire a healthy account, which is the failure this whole change exists to remove.
-      const reason = errCodeExact === "invalid_grant"
-          || errDesc.includes("invalidated") || errDesc.includes("revoked") ? "revoked" as const
-        : errDesc.includes("expired") ? "expired" as const
+      //
+      // That rule binds the DESCRIPTION words too. "invalidated", "revoked" and "expired" read
+      // as terminal prose, but upstream puts arbitrary text there: a `server_error` whose
+      // description says "token was revoked" or "session expired" is still a 5xx blip, and
+      // retiring the account on it is exactly the false quarantine #2887 exists to prevent.
+      // So a body that carries a structured code is classified by that code ALONE. The
+      // substring fallback survives only where there is no structured code to read at all --
+      // a description-only body, or one this parser could not decode -- because there the
+      // prose is the only signal upstream gave us.
+      const structuredCode = errCodeExact ? errCodeExact : undefined;
+      const proseIsOnlySignal = structuredCode === undefined;
+      const reason = structuredCode === "invalid_grant"
+          || structuredCode === "refresh_token_invalidated"
+          || (proseIsOnlySignal
+            && (errDesc.includes("invalidated") || errDesc.includes("revoked"))) ? "revoked" as const
+        : structuredCode === "refresh_token_expired"
+          || (proseIsOnlySignal && errDesc.includes("expired")) ? "expired" as const
         : "unknown" as const;
       throw new TokenRefreshError(reason, `Codex token refresh failed (${reason}); reauthenticate the account.`);
     }
