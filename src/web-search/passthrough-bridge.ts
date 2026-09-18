@@ -75,6 +75,7 @@ import {
 } from "./sidecar-providers";
 import { providerDestinationConfigError } from "../lib/destination-policy";
 import { redactSecretString } from "../lib/redact";
+import { rememberBridgeSearchReplay } from "../responses/bridge-search-replay-cache";
 
 /** Canonical Ollama Cloud origin. The only origin the "ollama" backend derives on its own. */
 export const OLLAMA_CLOUD_ORIGIN = "https://ollama.com";
@@ -378,10 +379,17 @@ export interface PassthroughWebSearchBridgeStreamOptions {
   send: (body: string) => Promise<Response>;
   execute: PassthroughWebSearchBridgeExecutor;
   /**
+   * Destination identity for the executed-search memo (#4587). When absent nothing is recorded,
+   * and the next turn replays the hosted cell exactly as it does today.
+   */
+  destinationScope?: string;
+  /**
    * Re-applies the caller's outbound body ceiling to a continuation body. Returns a refusal
    * message when the extended body may not be sent, or undefined when it is admitted.
    */
   checkOutboundBody?: (body: string) => string | undefined;
+  /** Releases request-scoped resources when the stream completes, fails, or is cancelled. */
+  onFinalize?: () => void;
   signal?: AbortSignal;
 }
 
@@ -1094,11 +1102,22 @@ async function* bridgeStreamBlocks(
         outcome = await options.execute(queries, options.signal);
       }
       yield* emit(state.searchEndFrames(call, queries, outcome));
-      turns.push({
-        call,
-        // The model needs a readable result either way; an executor error is reported as the
-        // tool result rather than as a turn failure, so it can still answer without the search.
-        output: outcome.error ? "Web search failed: " + outcome.error : outcome.text,
+      // The model needs a readable result either way; an executor error is reported as the
+      // tool result rather than as a turn failure, so it can still answer without the search.
+      const output = outcome.error ? "Web search failed: " + outcome.error : outcome.text;
+      turns.push({ call, output });
+      // Record what a continuation leg WOULD put on the wire, whether or not this leg sends one
+      // (#4587). The caller keeps the hosted cell and replays it next turn; the pre-dispatch
+      // rewrite in the Responses adapter uses this to hand the destination back its own call and
+      // result instead of an item type it never produced. Recording the same text that
+      // appendBridgeSearchTurn would append is what keeps a replayed turn and a continued turn
+      // showing the destination one consistent conversation.
+      rememberBridgeSearchReplay(options.destinationScope, call.cellItemId, {
+        callId: call.callId,
+        sourceItemId: call.sourceItemId,
+        name: WEB_SEARCH_TOOL_NAME,
+        argumentsText: call.argumentsText,
+        output,
       });
     }
 
@@ -1170,21 +1189,36 @@ export function createPassthroughWebSearchBridgeStream(
   const aborted = (): boolean => cancelled || options.signal?.aborted === true;
   const iterator = bridgeStreamBlocks(options, aborted)[Symbol.asyncIterator]();
   const encoder = new TextEncoder();
+  let finalized = false;
+  const finalize = (): void => {
+    if (finalized) return;
+    finalized = true;
+    options.onFinalize?.();
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await iterator.next();
         if (next.done) {
+          finalize();
           controller.close();
           return;
         }
         controller.enqueue(encoder.encode(next.value));
       } catch (error) {
+        finalize();
         controller.error(error);
       }
     },
     cancel(reason) {
       cancelled = true;
+      // Release request-scoped authority immediately. An async generator cannot
+      // process a queued return() while its active next() is blocked on an
+      // upstream read, so deferring finalize until that settles would hold the
+      // sidecar probe lease for as long as the abandoned upstream leg does.
+      // Optional chaining would also skip finalize entirely for an iterator
+      // with no return method.
+      finalize();
       void iterator.return?.(reason);
     },
   });

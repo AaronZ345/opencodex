@@ -12,7 +12,7 @@ import {
   adapterNeedsForcedContinuation,
   adapterResponseReachedServingTerminal,
 } from "./core-replay";
-import { sealRequestAttemptIdentity, recordAttemptCredentialSource } from "../request-log";
+import { noteAttemptRecoveryWithheld, sealRequestAttemptIdentity, recordAttemptCredentialSource } from "../request-log";
 import { waitForProviderRequestSlot, RequestPacingQueueOverloadError } from "../../providers/request-pacing";
 import type { AdapterEventQueue } from "../../adapters/run-turn-queue";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -231,12 +231,21 @@ export async function executeResponsesRunTurn(
         "auth-recovery",
         `${route.providerName}|${route.modelId}|runturn-oauth-429`,
       );
-      if (!hop.allowed) return false;
+      if (!hop.allowed) {
+        // The roster bound above already said this credential set may rotate again; the shared
+        // request budget is what refused. Returning false lets the preflight 429 reach the
+        // client unchanged, which is right, but it used to leave a log indistinguishable from
+        // a request where no rotation was ever available (#5044).
+        noteAttemptRecoveryWithheld(logCtx.activeAttempt, "rotation-send-budget");
+        return false;
+      }
       const nextAccountId = rotateGenericOAuthAccountOn429(
         config,
         route.providerName,
         transportState.genericFailoverAccountId,
         null,
+        Date.now(),
+        route.modelId,
       );
       if (!nextAccountId) {
         hop.permit?.release();
@@ -245,7 +254,8 @@ export async function executeResponsesRunTurn(
       try {
         const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
         transportState.genericFailovers += 1;
-        if (!await applyFailoverSnapshot(snapshot)) {
+        const admittedSnapshot = await applyFailoverSnapshot(snapshot);
+        if (!admittedSnapshot) {
           hop.permit?.release();
           return false;
         }
@@ -275,7 +285,10 @@ export async function executeResponsesRunTurn(
           providerName: route.providerName,
           provider: rotatedProvider,
           adapterName: rotatedAdapter.name,
-          oauthCredentialSnapshot: { accountId: snapshot.accountId, generation: snapshot.generation },
+          oauthCredentialSnapshot: {
+            accountId: admittedSnapshot.accountId,
+            generation: admittedSnapshot.generation,
+          },
           codexAuthContext: admissionState.authCtx,
           forwardHeaders: requestState.selectedForwardHeaders,
         });
@@ -299,7 +312,9 @@ export async function executeResponsesRunTurn(
       try {
         while (true) {
           const preflight = await preflightAdapterEvents(source);
-          if (!preflight.error || !(await rotateRunTurnAdapterOnPreflight429(preflight.error))) {
+          if (preflight.replayUnsafe
+            || !preflight.error
+            || !(await rotateRunTurnAdapterOnPreflight429(preflight.error))) {
             return preflight.stream;
           }
           const retryQueue = createAdapterEventQueue({

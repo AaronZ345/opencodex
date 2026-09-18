@@ -33,6 +33,7 @@ import {
   readCodexCatalogPath,
   readCodexCatalogPathForHome,
   readNativeBaseline,
+  nativeMultiAgentDefaults,
 } from "./parsing";
 import type { CatalogModel, MultiAgentMode, RawCatalog, RawEntry } from "./parsing";
 import {
@@ -50,6 +51,7 @@ import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
 import { bundledCatalogCacheState, loadBundledCodexCatalog } from "./bundled";
 import { isMultiAgentV2Enabled } from "../features";
 import { clampCatalogModelsToCodexSupport } from "./effort";
+import { suppressedSyntheticMaxCatalogSlugs } from "./model-hints";
 import { filterCatalogVisibleModels, gatherRoutedModels, type CatalogGatherProviderModelOutcome } from "./provider-fetch";
 import { dedupeCatalogEntriesBySlug, enforceCatalogSlugUniqueness, exactComboCatalogSlugs, type ComboCatalogOmission } from "./aggregation";
 import {
@@ -75,6 +77,7 @@ import {
 import { finishUpstreamNativeEntry } from "./derive-entry";
 import { finalizeAutoReviewModelOverride } from "./auto-review";
 import { gatedNativeAccountLabel, gatedNativeReauthSuppressionReason, warnGatedNativeSuppressedOnce } from "./gated-native-warn";
+import { reserveCatalogSuppressionReason, warnReserveSuppressedOnce } from "./reserve-warn";
 
 interface RetainedCatalogSyncRead {
   readonly catalogPath: string;
@@ -320,6 +323,11 @@ function writeRetainedCatalogSync({
   const enabledGo = filterCatalogVisibleModels(goModels, config);
   const featured = config.subagentModels ?? [];
   const orderedGoModels = orderForSubagents(enabledGo, featured); // stable tie-break among equal priorities
+  const suppressedSyntheticMaxSlugs = suppressedSyntheticMaxCatalogSlugs(
+    config,
+    orderedGoModels,
+    catalogModelsForMerge,
+  );
   const modelPickerOrder = config.modelPickerOrder ?? [];
   const multiAgentMode: MultiAgentMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2" ? config.multiAgentMode : "default";
   const exactComboSlugs = exactComboCatalogSlugs(config);
@@ -376,6 +384,14 @@ function writeRetainedCatalogSync({
   const accountTargets = new Map(codexAccountNamespaceEntries(config));
   const reserveMainSelectors = accountSelectors.filter(selector =>
     isMainCodexAccountTarget(accountTargets.get(selector) ?? ""));
+  // #4811: an omitted Reserve row carries no reason, so the explanation has to be emitted here,
+  // where the selector inputs that produced the omission are still in scope. Silent for every
+  // install that did not opt into authless Codex Desktop routing.
+  const reserveSuppression = reserveCatalogSuppressionReason(config, {
+    includeAccountBoundNativeOpenAi,
+    mainSelectors: reserveMainSelectors,
+  });
+  if (reserveSuppression) warnReserveSuppressedOnce(reserveSuppression);
   // The active file can own a bare source even when the bundled catalog is the build base.
   // A previously clamped qualified projection must not shorten a retained genuine ladder.
   const reserveObservations = [
@@ -443,6 +459,7 @@ function writeRetainedCatalogSync({
   // like `gpt-5.5`; those must not delete the native OpenAI/Codex base row.
   const baselineCatalog = readCatalogBackup(catalogPath);
   const baseline = readNativeBaseline(catalogPath);
+  const nativePinBaseline = nativeMultiAgentDefaults(baselineCatalog?.models);
   const gatheredProviderNames = new Set(
     Object.entries(config.providers ?? {})
       .filter(([, prov]) => prov.disabled !== true)
@@ -512,8 +529,10 @@ function writeRetainedCatalogSync({
     includeNativeOpenAi,
     accountBoundEntries,
     suppressedBareNativeSlugs,
+    suppressedSyntheticMaxSlugs,
     openaiContextCap,
     nativeDisplayNames: config.providers[OPENAI_CODEX_PROVIDER_ID]?.modelDisplayNames,
+    nativeMultiAgentDefaults: nativePinBaseline,
     policy: {
       ...CANONICAL_NATIVE_CATALOG_CONTENT_POLICY,
       nativeBackfillSlugs: [...availableBareNativeSlugs, ...observedNativeSlugs],

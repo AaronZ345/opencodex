@@ -6,6 +6,8 @@ Catalog HTTP acquisition follows the [proxy-routing contract](../catalog.md#remo
 
 Refresh-lock validation covers fresh unreadable locks, descriptor-matched release, path-probe failures preserving callback outcomes, and confirmed-owner unlink error handling in `tests/codex-integration/codex-account-store.test.ts`; the [catalog contract](../catalog.md#accounts-namespaces-and-pool-rotation) explicitly does not promise atomic compare-and-delete. Cooperating lock metadata changes serialize through the existing SQLite mutation transaction; release keeps the descriptor open through identity comparison and any unlink, then closes it. Failed metadata writes remove only a matching owned path after successful coordination; unknown identity, failed probes or unavailable coordination retain the path for stale recovery. Async refresh work holds no metadata transaction.
 
+The CLI documents explicit Windows x64 installation observation separately from updates; observation never grants installation authority. See the [read-only observation contract](../runtime.md#explicit-codex-cli-installation-observation).
+
 The configuration-only [plaintext V2 contract](../subagents.md#plaintext-v2-agent-messages)
 is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged. CLI installation inspection reason codes, including Windows deferral, follow the [runtime inspection contract](../runtime.md#lifecycle).
 
@@ -23,6 +25,10 @@ Native main reauthentication follows the [CLI JSON output contract](../runtime.m
 
 The Codex restart command follows the [CLI restart scope contract](../runtime.md#cli-codex-restart-scope).
 
+The account reference documents the [Orca source-owned import](../codex-home.md#orca-source-owned-account-import).
+Its local-only command is declared in `src/cli/capabilities.ts`, and the generated skill surface
+lists its required source/registry paths and preview/apply flags.
+
 ## Public docs
 
 The public documentation site lives in `docs-site/` and is built with Astro + Starlight. English is
@@ -31,12 +37,22 @@ served at the site root, with Korean under `/ko`, Simplified Chinese under `/zh-
 Manual navigation is defined in `docs-site/astro.config.mjs`. When adding a public page, update the
 sidebar and either add localized copies or intentionally accept Starlight fallback behavior.
 
+Provider preset totals are recounted from the current registry when a preset lands. With Crusoe the
+documented split is 94 total: 78 key-based, 12 OAuth, three local, and one default ChatGPT-forward
+preset. The English provider guide and all seven translated copies carry the same counts and the
+same fixed-host discovery limits.
+
 Native retirement keeps active model/quota instructions aligned across locales with the
 [catalog contract](../catalog.md#shared-catalog). Historical records and other providers
 sharing a model-name fragment remain distinct from current Codex-native support.
 
 The Remote Hub guide distinguishes selected-runtime readiness from general runtime diagnostics;
 `tests/cli/cli-connect-readiness.test.ts` exercises that boundary and general status's single discovery pass with isolated executable fixtures.
+
+The provider guide's OrcaRouter login section in English and all seven translated sources follows
+the [bounded ingestion contract](../transports/inventory.md#bounded-response-ingestion-and-orcarouter-login):
+64 KiB of valid UTF-8 JSON and one 30-second deadline covering headers and body. These are login
+limits, so the public guide does not apply them to inference payloads.
 
 ## GitHub Pages
 
@@ -77,14 +93,15 @@ container bootstrap helper, but still publishes no registry image. The source bu
 base by multi-platform digest, runs non-root with a read-only root filesystem and dropped
 capabilities, publishes the data port on host loopback by default (remote binding is an explicit
 `OPENCODEX_BIND_ADDRESS` opt-in), persists `OPENCODEX_HOME`, and streams the initial data token through stdin into the
-owner-only canonical token file. Before every image build, operators run
-`bun scripts/generate-compatibility-version.ts` in the host Git checkout. The runtime copies
-that untracked JSON artifact without including `.git` in the Docker context or changing the
-generator's tracked-source authority. `docker/verify-compatibility.ts` rejects stale manifests
-by comparing all file hashes and the complete source inventory in the read-only build context
-and copied runtime tree. It rejects symlinks, missing/mismatched entries, and extra source files.
+owner-only canonical token file. A build-only manifest stage uses Git metadata from a read-only
+context mount to run `scripts/generate-compatibility-version.ts`; remote Git contexts retain that
+metadata through `BUILDKIT_CONTEXT_KEEP_GIT_DIR=1`. A verified host-generated artifact remains a
+compatible input. No `COPY` includes `.git`, and the Git executable does not reach the runtime stage.
+`docker/verify-compatibility.ts` compares all file hashes and the complete source inventory in the
+read-only build context before source copy and again in the copied runtime tree. It rejects symlinks,
+missing/mismatched entries, and extra source files.
 The required roots are `package.json`, `bun.lock`, and `scripts/model-metadata.source.json`;
-the context admits only that exact scripts artifact.
+the context also admits the canonical generator, while the runtime includes only the metadata source.
 Operators must still prove liveness, readiness, authenticated
 catalog access, and a real routed response before promotion.
 
@@ -367,7 +384,7 @@ and its matching-cache or `unavailable` result.
 
 The Remote Hub guide and affected CLI, server-config, management-API, and dashboard references have eight sources: root English plus `fr`, `ko`, `zh-cn`, `zh-tw`, `ru`, `ja`, and `tr`. English is canonical; commands, defaults, endpoint auth, and warnings remain exact in translations. A release requires the remote-only focused/full gates, privacy scan, GUI/docs builds, protocol compatibility receipts, and the MAINTAINERS security review for the exact head.
 
-Codex display-cache expiry, retained main-policy evidence, and reset history follow the
+Codex display-cache expiry, retained blocking main-policy evidence, and reset history follow the
 [quota cache contract](../providers/openai-tiers.md#quota-cache-and-short-window-history).
 
 The account CLI and translated Codex integration guides follow the [automatic plan exclusion contract](../providers/openai-tiers.md#automatic-pool-plan-exclusions), including all-excluded pools and explicit routes.
@@ -399,7 +416,7 @@ Provider configuration documents distinguish actual summaries from raw reasoning
 
 Private pool credential metadata follows the [quota-history publication identity contract](../providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
 
-Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
+Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback, preserved affinity, strategy-specific threshold summaries, and shared short-observation freshness for switch warnings.
 
 Hub/browser pairing instructions distinguish machine enrollment, session authentication, permission denial and network failure. The hosted dashboard preview is the render artifact used to review these states.
 The integrations guide documents Cline CLI as a two-file, loopback-only integration. Hosted CI validates its source-backed fixtures; the packaged dashboard exposes it through the existing client list.

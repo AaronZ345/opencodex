@@ -356,3 +356,148 @@ describe("image rejection classifier bounds", () => {
     expect(comboFailureCooldownScope(400, message, { code: "invalid_request_error" })).toBe("none");
   });
 });
+
+/**
+ * #4903. A combo opens a new conversation, the shadow title call carries `response_format`, and
+ * the first target's gateway refuses it. The chain stopped instead of trying the target behind
+ * it, because the gateway reports `type: "invalid_request_error"` and that reaches the generic
+ * terminal list before anything asks whether the next target could serve the request.
+ *
+ * Neither obvious alternative is taken here. Hopping on every 400 would replay a genuinely
+ * malformed request against every remaining target; dropping `response_format` would change the
+ * output contract the caller asked for. Only a refusal that names the field AND says it is
+ * unavailable is treated as a target-local capability gap.
+ */
+describe("response_format capability refusal", () => {
+  const unavailable = {
+    code: "invalid_parameter_error",
+    param: null,
+    message: "This response_format type is unavailable now",
+    type: "invalid_request_error",
+  };
+  const reported = JSON.stringify({ error: unavailable, id: "chatcmpl-946b178a" });
+
+  test("hops without cooling, through every envelope the report shows", () => {
+    // The last two are the shape actually observed: the gateway reports the refusal in a single
+    // SSE frame, so the error object is never extracted and the structured code arrives
+    // undefined -- which is why the user sees `Provider error 400: data: {...}`.
+    for (const message of [
+      reported,
+      `Provider error 400: ${reported}`,
+      `data: ${reported}`,
+      `Provider error 400: data: ${reported}`,
+    ]) {
+      expect(comboFailureDecision(400, message)).toBe("hop");
+      expect(comboFailureCooldownScope(400, message)).toBe("none");
+    }
+    // And when the gateway's own code does survive extraction.
+    expect(comboFailureDecision(400, reported, { code: "invalid_parameter_error" })).toBe("hop");
+    expect(comboFailureCooldownScope(400, reported, { code: "invalid_parameter_error" })).toBe("none");
+  });
+
+  test("a malformed response_format is a request defect and stays terminal", () => {
+    // Names the field, claims nothing about capability. Replaying this at every later target
+    // is exactly what the issue asked not to do.
+    for (const message of [
+      "Invalid schema for response_format 'reply': 'type' is a required property.",
+      "response_format.type must be one of 'text', 'json_object', 'json_schema'.",
+    ]) {
+      expect(comboFailureDecision(400, JSON.stringify({
+        error: { ...unavailable, message },
+      }))).toBe("stop");
+    }
+  });
+
+  test("an unavailability claim about some other field stays terminal", () => {
+    expect(comboFailureDecision(400, JSON.stringify({
+      error: { ...unavailable, message: "This parameter type is unavailable now" },
+    }))).toBe("stop");
+    // A param naming a different field contradicts the message, so it fails closed.
+    expect(comboFailureDecision(400, JSON.stringify({
+      error: { ...unavailable, param: "messages" },
+    }))).toBe("stop");
+  });
+
+  test("the envelope stays bounded and fails closed", () => {
+    // Reflected prose, a truncated body, a non-400 status, an unrecognized code, a wrong type,
+    // and a multi-event stream body are all refused. The single-frame unwrap is one frame.
+    expect(comboFailureDecision(400, `please fix ${reported}`)).toBe("stop");
+    expect(comboFailureDecision(400, reported.slice(0, -1))).toBe("stop");
+    expect(comboFailureDecision(422, reported)).toBe("stop");
+    expect(comboFailureDecision(400, reported, { code: "unknown_terminal_code" })).toBe("stop");
+    expect(comboFailureDecision(400, JSON.stringify({
+      error: { ...unavailable, type: "server_error" },
+    }))).toBe("stop");
+    expect(comboFailureDecision(400, `data: ${reported}\ndata: [DONE]`)).toBe("stop");
+    expect(comboFailureDecision(400, JSON.stringify({
+      error: { ...unavailable, message: `This response_format type is unavailable now ${"x".repeat(16_384)}` },
+    }))).toBe("stop");
+  });
+
+  test("a hard refusal still outranks the capability verdict", () => {
+    for (const code of ["origin_rejected", "upstream_no_response", "cyber_policy"]) {
+      expect(comboFailureDecision(400, reported, { code })).toBe("stop");
+    }
+    expect(comboFailureDecision(499, reported)).toBe("stop");
+  });
+});
+
+/**
+ * #5035 reports the same refusal from a second gateway. The capability claim is worded
+ * identically, but this vendor spells its code `invalid_request_error` rather than
+ * `invalid_parameter_error` and sends no `id` beside the error object.
+ *
+ * That code is the one the generic terminal list stops on, which makes the ordering inside
+ * `comboFailureDecision` load-bearing here rather than incidental: the capability verdict has to
+ * be read before that list, and the code has to be accepted at the outer and the inner level
+ * both. The first gateway never exercised that, because its `invalid_parameter_error` is not a
+ * terminal code to begin with.
+ *
+ * Pinned rather than fixed. The reporter ran 2.58.0, which was tagged before #4927 landed, so
+ * this envelope already hops on `dev`. What a second vendor confirming the shape buys is a
+ * reason to hold the code set still.
+ */
+describe("response_format capability refusal, second gateway", () => {
+  const refusal = {
+    message: "This response_format type is unavailable now",
+    type: "invalid_request_error",
+    param: null,
+    code: "invalid_request_error",
+  };
+  const body = JSON.stringify({ error: refusal });
+
+  test("hops without cooling when the vendor code is the generic terminal one", () => {
+    // Undefined is the code an unparsed body yields; the explicit one is what extraction yields.
+    for (const options of [undefined, { code: "invalid_request_error" }]) {
+      expect(comboFailureDecision(400, body, options)).toBe("hop");
+      expect(comboFailureCooldownScope(400, body, options)).toBe("none");
+    }
+  });
+
+  test("survives the wrapper the proxy adds on the way back out", () => {
+    const rewrapped = JSON.stringify({
+      error: {
+        type: "upstream_error",
+        code: "invalid_request_error",
+        message: `Provider error 400: ${body}`,
+      },
+    });
+    for (const message of [`Provider error 400: ${body}`, rewrapped]) {
+      expect(comboFailureDecision(400, message, { code: "invalid_request_error" })).toBe("hop");
+      expect(comboFailureCooldownScope(400, message, { code: "invalid_request_error" })).toBe("none");
+    }
+  });
+
+  test("the same vendor code without a capability claim stays terminal", () => {
+    // These differ from the envelope above only in what the message claims. Replaying a request
+    // defect against every remaining target is the outcome the hop rule exists to avoid, so the
+    // claim -- not the code, and not the field name on its own -- is what authorizes the hop.
+    for (const message of [
+      "Invalid schema for response_format: 'json_schema' is required",
+      "Unknown parameter: temperature",
+    ]) {
+      expect(comboFailureDecision(400, JSON.stringify({ error: { ...refusal, message } })))
+        .toBe("stop");
+    }
+  });
+});

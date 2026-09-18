@@ -1,5 +1,7 @@
 # Streaming Health And WebSocket
 
+Management provider-validation calls use the [initialization-independent relative send-path validation](../config.md#provider-relative-send-paths) before persistence.
+
 Native and translated delivery now have separate owners in the
 [core module ownership](responses.md#core-module-ownership). This surface retains its existing behavior.
 
@@ -11,7 +13,7 @@ by the [OpenAI quota owner](../providers/openai-tiers.md#public-provider-contrac
 removing support for non-default WebSocket quota families.
 
 Key-auth hosted-search continuations validate account selection after pacing and report a failed
-terminal on drift; see [continuation binding contract](../runtime.md#hosted-search-continuation-binding).
+terminal on drift; see [continuation binding contract](../providers-and-adapters.md#hosted-search-continuation-binding).
 
 Shared parsing and streaming follow the [request-copy](byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](responses.md#passthrough-sse-stream-shapes-314).
 
@@ -60,6 +62,43 @@ and terminal events remain buffered until the iteration validates. Only the firs
 response headers/status and any 429 key rotations are handled eagerly. A failure before downstream
 SSE starts returns non-2xx JSON; once headers have started the final response, a generation failure
 is emitted as `response.failed` SSE.
+
+### Pending response-body reads
+
+`src/lib/response-body-inactivity.ts` bounds pending byte reads using the resolved
+`stallTimeoutSec` (the 300-second default and configuration schema are unchanged).
+Connect/stall budgets and this body-silence budget therefore read the same setting in
+different phases: one bounds event stalls on the bridge, the other bounds pending raw
+byte reads. There is no separate body-inactivity setting.
+The guard has no read-ahead queue: it starts a monotonic deadline only when its
+consumer asks for bytes, pauses on a non-empty chunk, and does not reset on empty
+chunks. Discarded empty chunks yield to the macrotask queue periodically, so a large
+configured timeout cannot starve timers or unrelated requests, and yielding is not
+progress. A slow downstream consumer is not an upstream stall. EOF, errors, caller
+abort and parser abandonment remove the timer/listener and release the source
+reader without awaiting a potentially broken cancellation promise.
+
+`src/server/responses/passthrough-execution.ts` applies the guard after native
+response classification, outside the direct relay and lifetime wrappers. Native
+SSE, including the missing-Content-Type fallback, retains its original Response
+identity and existing watchdog/terminal ownership. Bounded JSON and error readers
+are not wrapped again. Direct bodies and returned redirect bodies are guarded;
+bytes, response headers and status are preserved.
+
+`src/server/responses/adapter-delivery.ts` and
+`src/server/responses/adapter-continuation.ts` scope initial and continuation
+parsers independently, for both streaming and buffered HTTP adapters. Retried
+responses are classified before parsing, so unread retry-body cancellation does
+not abort the shared request or start a generation deadline during backoff.
+A body timeout publishes a typed read failure and cancels only that body's reader;
+it does not abort the request-wide signal before the enclosing bridge can emit
+its failure terminal. A caught body failure is classified before signal state, so a
+source cancellation that synchronously aborts the shared signal still reports the
+stall. Buffered initial timeouts return HTTP 504; continuation
+timeouts become an in-stream error with status 504, while caller cancellation
+retains status 499. Normal completion does not abort a shared request.
+
+Regression coverage lives in `tests/lib/abort-idle-deadline.test.ts`.
 
 ### Pre-stream provider input overflow
 
@@ -470,3 +509,5 @@ Codex App/CLI UI certification. The fixture suite also exercises real loopback s
 `tests/responses/ws-steering-completion.test.ts` and `ws-steering-smoke.test.ts`
 cover effective wire settings, immutable-route refusals, policy preservation,
 independent API credentials, unavailable-mode diagnostics and safe probe outcomes.
+
+Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).

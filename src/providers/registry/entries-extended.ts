@@ -98,6 +98,10 @@ import {
   DIGITALOCEAN_CHAT_COMPLETION_MODELS,
   SCALEWAY_SERVERLESS_CHAT_MODELS,
   SCALEWAY_MODEL_INPUT_MODALITIES,
+  OPPER_MODELS,
+  OPPER_MODEL_CONTEXT_WINDOWS,
+  OPPER_MODEL_MAX_OUTPUT_TOKENS,
+  OPPER_MODEL_INPUT_MODALITIES,
 } from "./model-seeds";
 
 export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
@@ -218,6 +222,72 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
       },
     },
     note: "Shared Token Factory text-output inference only; live discovery excludes embedding and image-generation rows.",
+  },
+  {
+    // Primary sources checked 2026-09-11:
+    // - https://docs.crusoecloud.com/quickstart/getting-started-with-serverless-inference documents
+    //   the fixed OpenAI-compatible host https://api.inference.crusoecloud.com/v1, Bearer API keys
+    //   created in the Cloud console (Intelligence Foundry > Inference > Create API Key), and an
+    //   OpenAI SDK chat.completions example against meta-llama/Llama-3.3-70B-Instruct.
+    // - https://docs.crusoecloud.com/serverless-inference/available-models lists the served models
+    //   with slash-delimited ids; https://docs.crusoecloud.com/serverless-inference/rate-limits
+    //   documents per-project, per-model TPM/RPM limits (429 when exceeded, 503 under shared load).
+    // - GET /v1/models rejects unauthenticated requests with 401 {"errors":["Authentication failed"]},
+    //   so a successful authenticated list response is evidence that the supplied key is valid.
+    //   An authenticated capture on 2026-09-12 returned 18 rows shaped like OpenRouter's catalog
+    //   (`is_public`, `type`, `context_length`, `architecture.modality` of "text" or "multimodal",
+    //   `tags`, `pricing`, `supported_parameters`); 17 were public serverless models and one was an
+    //   account-private dedicated deployment with empty `type`/`modality`. `type` is blank on one
+    //   public model, so the filter keys on `is_public` plus `architecture.modality` instead.
+    // - https://legal.crusoe.ai/ hosts the Crusoe Cloud Platform Terms of Service v1.10 (effective
+    //   2026-08-10), which name Crusoe Technologies LLC as the contracting entity, and the Service
+    //   Specific Terms v5.0 (effective 2026-07-14), whose Crusoe Intelligence Foundry Terms cover the
+    //   Managed Inference Service reached through the Crusoe API.
+    // - https://models.dev/api.json (provider "crusoe") records openai/gpt-oss-120b as the one served
+    //   model with a low/medium/high reasoning_effort ladder; the other reasoning models expose an
+    //   on/off toggle only.
+    // Maintainer: @acheamponge, who works at Crusoe (affiliation disclosed) and also maintains the
+    // models.dev crusoe entry.
+    id: "crusoe",
+    label: "Crusoe",
+    baseUrl: "https://api.inference.crusoecloud.com/v1",
+    adapter: "openai-chat",
+    authKind: "key",
+    dashboardUrl: "https://console.crusoecloud.com",
+    liveModels: true,
+    preserveCustomDestination: true,
+    // The getting-started guide documents tools through the OpenAI SDK but no provider-wide
+    // parallel tool-call contract.
+    parallelToolCalls: false,
+    // Only gpt-oss-120b has a real effort ladder; toggle-style reasoning models must not be promoted
+    // to Codex's full fallback ladder.
+    reasoningEfforts: [],
+    modelReasoningEfforts: { "openai/gpt-oss-120b": ["low", "medium", "high"] },
+    directReasoningEffortModels: ["openai/gpt-oss-120b"],
+    // The catalog reports `architecture.modality: "multimodal"` without an input list. Four rows
+    // also carry the explicit "image text to text" tag; yutori/n2 instead reports multimodal
+    // type/modality plus browser/computer-use tags. Those five captured rows are classified here.
+    modelInputModalities: {
+      "google/gemma-4-31b-it": ["text", "image"],
+      "moonshotai/Kimi-K2.6": ["text", "image"],
+      "nvidia/Nemotron-3-Nano-Omni-Reasoning-30B-A3B": ["text", "image"],
+      "yutori/n2": ["text", "image"],
+      "zai-org/GLM-5.3-Flash": ["text", "image"],
+    },
+    modelDiscovery: {
+      path: "models",
+      maxResponseBytes: 256 * 1024,
+      maxModels: 256,
+      filter: {
+        // Keep public serverless rows whose architecture produces text; account-private
+        // deployments (blank modality) and any embedding or media rows fail closed.
+        allOf: [
+          { path: ["is_public"], equalsAny: [true] },
+          { path: ["architecture", "modality"], equalsAny: ["text", "multimodal"] },
+        ],
+      },
+    },
+    note: "Public Serverless Inference chat models on the shared OpenAI-compatible host; account-private and self-serve dedicated deployments are excluded from discovery and out of scope.",
   },
   {
     id: "digitalocean",
@@ -736,6 +806,7 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
       ...Object.fromEntries(ALIBABA_TOKEN_PLAN_QWEN_MODELS.map(id => [id, THINKING_BUDGET_EFFORTS])),
       ...Object.fromEntries(QWEN38_FAMILY.map(id => [id, QWEN38_REASONING_EFFORTS])),
       "glm-5.2": ZAI_GLM_52_REASONING_EFFORTS,
+      "glm-5.3": ZAI_GLM_53_REASONING_EFFORTS,
       "deepseek-v4-pro": deepseekThinkingEffortsFor("deepseek-v4-pro"),
       "deepseek-v4-pro-0813": deepseekThinkingEffortsFor("deepseek-v4-pro-0813"),
       "deepseek-v4-flash-0731": deepseekThinkingEffortsFor("deepseek-v4-flash-0731"),
@@ -781,6 +852,7 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
       ...Object.fromEntries(ALIBABA_INTL_TOKEN_PLAN_QWEN_MODELS.map(id => [id, THINKING_BUDGET_EFFORTS])),
       ...Object.fromEntries(QWEN38_FAMILY.map(id => [id, QWEN38_REASONING_EFFORTS])),
       "glm-5.2": ZAI_GLM_52_REASONING_EFFORTS,
+      "glm-5.3": ZAI_GLM_53_REASONING_EFFORTS,
       "deepseek-v4-pro": deepseekThinkingEffortsFor("deepseek-v4-pro"),
       "deepseek-v4-pro-0813": deepseekThinkingEffortsFor("deepseek-v4-pro-0813"),
       "deepseek-v4-flash": deepseekThinkingEffortsFor("deepseek-v4-flash"),
@@ -957,6 +1029,30 @@ export const PROVIDER_REGISTRY_EXTENDED: readonly ProviderRegistryEntry[] = [
     noJsonSchemaModels: [...DEEPSEEK_GATEWAY_THINKING_MODELS, ...OPENCODE_FREE_DEEPSEEK_MODELS],
   },
   { id: "vercel-ai-gateway", label: "Vercel AI Gateway", baseUrl: "https://ai-gateway.vercel.sh/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://vercel.com/dashboard" },
+  {
+    // Opper: EU-hosted AI gateway (Opper AI AB, Stockholm). One OpenAI-compatible endpoint and one
+    // key in front of 30+ upstream providers. Seeded ids are Opper *pools* (bare names such as
+    // `claude-sonnet-4-6`): the gateway chooses the provider/region per request, and a
+    // `vendor/model` id (`anthropic/claude-sonnet-4-6`, `aws/claude-sonnet-4-6-eu`) pins one route.
+    // The original provider author reported on 2026-09-08 that GET /v3/compat/models answers 401
+    // without a key, so the default discovery URL doubles as key validation. Windows, output caps
+    // and modalities live in model-seeds.ts (smallest value / shared modality across each pool's
+    // members); live discovery owns which models exist.
+    id: "opper",
+    label: "Opper",
+    adapter: "openai-chat",
+    baseUrl: "https://api.opper.ai/v3/compat",
+    authKind: "key",
+    dashboardUrl: "https://platform.opper.ai",
+    liveModels: true,
+    preserveCustomDestination: true,
+    defaultModel: "claude-sonnet-4-6",
+    models: OPPER_MODELS,
+    modelContextWindows: OPPER_MODEL_CONTEXT_WINDOWS,
+    modelMaxOutputTokens: OPPER_MODEL_MAX_OUTPUT_TOKENS,
+    modelInputModalities: OPPER_MODEL_INPUT_MODALITIES,
+    note: "EU-hosted AI gateway: one OpenAI-compatible endpoint and one key in front of 30+ providers. Bare model ids are pools (claude-sonnet-4-6, gpt-5.5) and Opper picks the route per request; vendor/model ids (anthropic/claude-sonnet-4-6) pin one provider. The catalogue is discovered live from /v3/compat/models with your key; the public list is at opper.ai/models. Token rates are the model providers' rates with no markup; Opper charges a 3% fee when you buy credits.",
+  },
   {
     id: "opencode-free",
     label: "OpenCode Free",

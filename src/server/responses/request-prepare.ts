@@ -105,7 +105,9 @@ import { hasUnmappedRoutedCustomToolOutput } from "../../responses/custom-tool-c
 import { PROVIDER_OWNED_CONTINUATION_WIRES, resolvedAdapterWire } from "../../responses/continuation-ownership";
 import {
   isCodexReserveHelperUnsupported,
+  isCodexReserveOptInMissing,
   CODEX_RESERVE_HELPER_UNSUPPORTED_MESSAGE,
+  CODEX_RESERVE_OPT_IN_REQUIRED_MESSAGE,
 } from "../../codex/loopback-target";
 import { checkComboTargetInputAdmission, checkInputAdmission } from "./input-admission";
 import { nativeContextLimits } from "../../codex/catalog";
@@ -231,6 +233,10 @@ export async function prepareResponsesRequest(
     (body as { input?: unknown } | undefined)?.input,
   );
   const inboundClientThreadId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
+  // The request's OWN thread, which `x-codex-parent-thread-id` is not: parallel children of one
+  // parent all present the same parent id. `codexConversationIdentity` already reads this header
+  // for the same reason, and a surface that must tell siblings apart needs it too (#5033).
+  const inboundOwnThreadId = req.headers.get("thread-id")?.trim() || undefined;
   const cursorClientThreadId = codexPoolAffinityKey(req.headers);
   const originalBody = body;
   if (options.comboReplaySnapshot) {
@@ -303,6 +309,7 @@ export async function prepareResponsesRequest(
       ? options.comboReplaySnapshot.providerContinuation
       : previousResponseProviderState(parsed.previousResponseId);
     if (providerContinuationCandidate) parsed._providerContinuationCandidate = providerContinuationCandidate;
+    if (inboundOwnThreadId) parsed._codexOwnThreadId = inboundOwnThreadId;
     if (inboundClientThreadId) {
       parsed._clientThreadId = inboundClientThreadId;
     } else if (
@@ -699,6 +706,7 @@ export async function prepareResponsesRequest(
             "_providerContinuationOwner",
             "_cursorConversationId",
             "_clientThreadId",
+            "_codexOwnThreadId",
             "_promptCacheKeyIsSharedCohort",
             "_cursorClientThreadId",
             "_reasoningReplayScope",
@@ -975,6 +983,27 @@ export async function prepareResponsesRequest(
     && isCodexReserveHelperUnsupported(options.codexAuthPolicy ?? config, route.modelId,
       options.admission, options.visionDescribeTerminal === true)) {
     return formatErrorResponse(400, "invalid_request_error", CODEX_RESERVE_HELPER_UNSUPPORTED_MESSAGE);
+  }
+  // #4940: the opt-in is off, so every Reserve affordance in this process is inert -- no catalog
+  // row, no main-credential substitution, no authorization handshake, and no `luna-reserve` header
+  // on the send. Forwarding `gpt-reserve` as an ordinary native model therefore buys nothing but a
+  // 429 "The usage limit has been reached", which names neither the real cause nor the setting the
+  // operator would have to change. Refuse here instead, on the same terms and in the same place as
+  // the helper refusal above: after alias/combo resolution, before auth, host-circuit budget or any
+  // upstream byte.
+  //
+  // Two narrowings beyond the predicate, both about not answering a question this refusal cannot
+  // answer correctly. A terminal vision/search helper is excluded because enabling the opt-in would
+  // not make it work -- it would produce the helper refusal above instead, so telling that caller to
+  // enable the flag is advice that does not hold. Non-native inbound wires are excluded because a
+  // `gpt-reserve` selector reaching us over Chat or Anthropic Messages is an operator-authored
+  // route (a `claudeCode.modelMap` entry, say), not a Codex client that was forced onto Reserve by
+  // its own usage snapshot, and that route keeps whatever behavior it has today.
+  if (inboundWire === "responses"
+    && options.visionDescribeTerminal !== true
+    && isCanonicalOpenAiForwardProvider(route.provider)
+    && isCodexReserveOptInMissing(options.codexAuthPolicy ?? config, route.modelId, options.admission)) {
+    return formatErrorResponse(400, "invalid_request_error", CODEX_RESERVE_OPT_IN_REQUIRED_MESSAGE);
   }
   // Refuse an input that cannot plausibly fit the model context window before spending auth,
   // circuit budget, or upstream bandwidth on a turn the provider will reject anyway (#1412).

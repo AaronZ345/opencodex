@@ -1,9 +1,13 @@
 import type { ResponsesRequestContext } from "./core-options";
 import { createRequestExecutionBudget, isRequestExecutionBudget } from "../../lib/request-execution-budget";
-import { chargeWorkflowSends, workflowSendCeilingReached } from "../../lib/workflow-budget";
+import {
+  chargeWorkflowSends,
+  workflowSendCeilingReached,
+  workflowSpendCeilingReached,
+} from "../../lib/workflow-budget";
 import { workflowRefusalResponse } from "../workflow-refusal";
-import type { AttemptRecoveryKind } from "../../usage/log";
-import { noteAttemptSend } from "../request-log";
+import type { AttemptRecoveryKind, AttemptRecoveryWithheld } from "../../usage/log";
+import { noteAttemptRecoveryWithheld, noteAttemptSend } from "../request-log";
 import { TRANSIENT_RETRY_MAX_ATTEMPTS } from "../../lib/upstream-retry";
 import type {
   DispatchDecision,
@@ -12,6 +16,28 @@ import type {
   SendClass,
   SingleUseDispatchPermit,
 } from "../../lib/request-execution-budget";
+
+/**
+ * The transient-5xx ladder cap for ONE leg, given the provider's configured request total.
+ *
+ * `remainingTransientSendBudget(cap)` treats `cap` as a ceiling on what REMAINS, which is the
+ * right shape for the fixed constant: every leg may ask for up to three, and the request-wide
+ * base allowance is what actually bounds the total. A configured `transientRetryOn5xx.attempts`
+ * is documented as the total for one request including the first send, so it has to be reduced
+ * by what the request already sent before it is intersected with that allowance. Passing it
+ * straight through would make it a per-leg ceiling instead, and a request configured at one send
+ * could still reach upstream again on a recovery leg (#4893).
+ *
+ * An absent policy returns the constant unchanged, so a provider that configures nothing behaves
+ * exactly as it does today at every call site.
+ */
+export function transientSendCapFor(
+  configuredAttempts: number | undefined,
+  sendsUsed: number,
+): number {
+  if (configuredAttempts === undefined) return TRANSIENT_RETRY_MAX_ATTEMPTS;
+  return Math.max(0, configuredAttempts - Math.max(0, sendsUsed));
+}
 
 /** Owns the shared request send counter and recovery permits. */
 export function createResponsesSendBudget(
@@ -45,6 +71,22 @@ export function createResponsesSendBudget(
     // marked synthetic rather than reading as a request that vanished with zero sends.
     return workflowRefusalResponse("workflow-sends-exhausted", logCtx, undefined, workflowRootId);
   }
+  // The token ceiling asked at the same seam, for the same reason the count one is asked here.
+  // Without it a spent root reaches the dispatch ladder, is refused by the ledger at the first
+  // physical send, and answers with the generic send-budget error every exhausted request
+  // returns -- a refusal an operator cannot tell from an ordinary budget exhaustion, on a
+  // ceiling they configured themselves. Asked before dispatch, it names the scope and the
+  // number instead. Returns undefined and touches no ledger when no ceiling is configured.
+  const spentCeiling = workflowSpendCeilingReached(workflowRootId);
+  if (spentCeiling) {
+    return workflowRefusalResponse(
+      "workflow-spend-exhausted",
+      logCtx,
+      undefined,
+      workflowRootId,
+      spentCeiling,
+    );
+  }
   // No floor. Math.max(1, ...) meant an exhausted request still funded one send on every
   // recovery leg, so a bounded per-leg allowance never became a bounded per-request one.
   const remainingTransientSendBudget = (budget: number): number =>
@@ -71,8 +113,28 @@ export function createResponsesSendBudget(
     if (send.ordinal <= 1) return;
     noteAttemptSend(logCtx.activeAttempt, inputTokens, send.recovery);
   };
-  const sendBudgetExhausted = (): boolean =>
-    remainingTransientSendBudget(TRANSIENT_RETRY_MAX_ATTEMPTS) === 0;
+  /**
+   * Records a recovery an adapter was ready to make and the budget refused.
+   *
+   * No send happened, so this deliberately does not touch `sendCount`. It is the other half of
+   * the pair that makes a one-send log readable: no recovery kind AND no withheld reason means
+   * nothing was eligible; a withheld reason means something was (#5044).
+   */
+  const noteAdapterRecoveryWithheld = (withheld: { reason: AttemptRecoveryWithheld }): void => {
+    noteAttemptRecoveryWithheld(logCtx.activeAttempt, withheld.reason);
+  };
+  /**
+   * Whether this request has any base send left under `cap`.
+   *
+   * The cap is a parameter because a lane that reads a provider's configured
+   * `transientRetryOn5xx` ladder has to ask this question at the SAME cap its sends use.
+   * Asking at the constant while dispatching at a configured value lets a provider with
+   * headroom be told it is exhausted, and lets one configured below the constant pass this
+   * check and then be refused at the send (#4893). Defaulted, so every existing caller keeps
+   * the constant it already used.
+   */
+  const sendBudgetExhausted = (cap: number = TRANSIENT_RETRY_MAX_ATTEMPTS): boolean =>
+    remainingTransientSendBudget(cap) === 0;
   /**
    * A credential hop reserves the send its own replay will make, and that replay is a recovery
    * leg. The leg must SPEND the hop's reservation instead of taking a second one: the
@@ -113,16 +175,22 @@ export function createResponsesSendBudget(
    * The base allowance is spent first. Once it is gone a recovery class may still draw the
    * single shared final-recovery reserve -- which is what keeps the validated sanitized rebuild
    * after a 5xx streak alive at four total sends -- but an account move and a rebuild cannot
-   * each take one. `countedExternally` is set because these legs run through the retry helper,
-   * which reports the same send again through `onSendsConsumed`.
+   * each take one. A caller with an exact provider total can suppress that reserve. The
+   * `countedExternally` flag exists because these legs run through the retry helper, which reports
+   * the same send again through `onSendsConsumed`.
    */
   const recoverySendAllowance = (
     cap: number,
     sendClass: SendClass,
     targetKey: string,
+    options: { allowFinalRecoveryReserve?: boolean } = {},
   ): { attempts: number; permit?: SingleUseDispatchPermit } => {
     const base = remainingTransientSendBudget(cap);
     if (base > 0) return { attempts: base };
+    // A provider-configured transient total is an exact physical-send ceiling. Once it is
+    // exhausted, the request-wide recovery reserve must not silently widen it. The default stays
+    // permissive so unconfigured providers retain the guarded profile's fourth recovery send.
+    if (options.allowFinalRecoveryReserve === false) return { attempts: 0 };
     if (pendingHopPermit) {
       const hopPermit = pendingHopPermit;
       pendingHopPermit = undefined;
@@ -178,9 +246,18 @@ export function createResponsesSendBudget(
     workflowRootId,
     noteTransientSends,
     remainingTransientSendBudget,
+    /**
+     * Physical sends this logical request has already made.
+     *
+     * A live getter, not a snapshot: it is read once per dispatch leg to resolve a configured
+     * ladder, and a value frozen at construction would answer for a request that had sent
+     * nothing.
+     */
+    get sendsUsed(): number { return sendBudget.used; },
     adapterSendBudget,
     adapterDispatchBudget,
     noteAdapterPhysicalSend,
+    noteAdapterRecoveryWithheld,
     sendBudgetExhausted,
     get pendingHopPermit(): SingleUseDispatchPermit | undefined {
       return pendingHopPermit;

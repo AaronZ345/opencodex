@@ -41,7 +41,7 @@ import {
   resolveCurrentProviderApiKeyTransport,
 } from "../../providers/api-key-selection";
 import { resolveAdapter, resolveWireProtocolOverride } from "../adapter-resolve";
-import { providerFetch } from "./fetch-helpers";
+import { providerFetch, sendWithConnectionPolicy } from "./fetch-helpers";
 import type { ProviderFetchOptions } from "./fetch-helpers";
 import { captureConfigGeneration } from "../../lib/state-store-sweeper";
 import { recordAnthropicAccountQuotaFromHeaders, hasPassiveAccountQuota } from "../../providers/quota";
@@ -190,8 +190,9 @@ export async function prepareResponsesTransport(
    * lines, and the divergence that produced was the bug: `apiKey` was swapped while the routing
    * metadata paired with it stayed behind.
    *
-   * Returns false when the snapshot cannot be used safely, and the caller must then abandon the
-   * rotation rather than send a half-applied identity:
+   * Returns the admitted snapshot, which can differ when a newer manual selection wins the
+   * proposal race. Returns null when the snapshot cannot be used safely, and the caller must then
+   * abandon the rotation rather than send a half-applied identity:
    *
    * - Copilot pins its bearer to an account-scoped regional origin, so transport is re-resolved
    *   with the new account's `apiBaseUrl` instead of inheriting the previous account's host. The
@@ -207,10 +208,10 @@ export async function prepareResponsesTransport(
   const applyFailoverSnapshot = async (
     snapshot: OAuthAccessSnapshot,
     retryParsed: OcxParsedRequest = parsed,
-  ): Promise<boolean> => {
-    if (route.provider.googleMode === "cloud-code-assist" && !snapshot.projectId) return false;
+  ): Promise<OAuthAccessSnapshot | null> => {
+    if (route.provider.googleMode === "cloud-code-assist" && !snapshot.projectId) return null;
     const committed = await commitResolvedOAuthSelection(snapshot);
-    if (!committed) return false;
+    if (!committed) return null;
     snapshot = committed;
     let rotatedProvider: OcxProviderConfig = { ...route.provider, apiKey: snapshot.accessToken };
     if (route.providerName === "github-copilot") {
@@ -243,7 +244,7 @@ export async function prepareResponsesTransport(
     }
     sentOAuthSnapshot = snapshot;
     replayOAuthCredentialSnapshot = { accountId: snapshot.accountId, generation: snapshot.generation };
-    return true;
+    return snapshot;
   };
   // Key sends may be rebuilt while queued. Keep metadata pending until the guarded
   // physical dispatch binds it to the selection that actually reaches the upstream.
@@ -405,8 +406,10 @@ export async function prepareResponsesTransport(
             && sentHeaders?.get("authorization") === `Bearer ${snapshot.accessToken}`
             && !sentHeaders?.has("x-api-key");
           // Reselection can choose a provider override instead of the supplied executor.
+          // Either way the send crosses the physical boundary, so the connection policy is
+          // applied around whichever implementation was just selected (#4992).
           commitKeyAttemptSend();
-          const response = await fetchImpl(destination, { ...dispatchInit, redirect: "manual" });
+          const response = await sendWithConnectionPolicy(fetchImpl, destination, { ...dispatchInit, redirect: "manual" });
           if (!response.ok) await recordKeyAttemptFailure(logCtx, response, dispatchInit.signal ?? options.abortSignal);
           // Observe each physical response before retries replace it. The binding belongs to
           // this dispatch, so a manual switch cannot file A's headers against B. Header
@@ -487,7 +490,7 @@ export async function prepareResponsesTransport(
         // measured as spent. A null answer means "use the active account", so every provider
         // without quota evidence keeps the resolution it has today.
         const preferredAccountId = isGenericFailoverProvider(route.providerName, route.provider)
-          ? preferredInitialAccount(config, route.providerName)
+          ? preferredInitialAccount(config, route.providerName, Date.now(), route.modelId)
           : null;
         // Resolved account-scoped, NOT through failoverAccountSnapshot: that helper marks a
         // rotation site, and rotation sites must apply their credential through
@@ -550,7 +553,7 @@ export async function prepareResponsesTransport(
           // Advance the pool cursor only now that this account is actually admitted. The
           // helper returns immediately unless the kernel is on AND the strategy is
           // round-robin, so quota and fill-first pools reach it without being touched.
-          noteGenericPoolSelection(config, route.providerName, resolved.accountId);
+          noteGenericPoolSelection(config, route.providerName, resolved.accountId, route.modelId);
         }
         // Anthropic is excluded from isGenericFailoverProvider -- its own pool owns affinity and
         // a fail-closed local-cli credential rule -- so without this stamp its identity is
