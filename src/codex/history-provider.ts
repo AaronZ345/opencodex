@@ -441,18 +441,32 @@ export function preflightCodexHistoryInjection(
     const paginatedColumn = columns.some(column => column.name === "history_mode");
     if (paginatedColumn && restoreEntries.length > 0) return HISTORY_RELABEL_STANDS_DOWN;
     for (const entry of restoreEntries) assertLegacyHistoryWritable(entry.rolloutPath);
-    const rows = db.query<{ rollout_path: string; history_mode: string | null }, []>(`
-      SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}
+    const rows = db.query<{ rollout_path: string; history_mode: string | null; model_provider: string }, []>(`
+      SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}, model_provider
       FROM threads
       WHERE ${providerTableMode
         ? resumeHistory ? "model_provider IN ('openai', 'opencodex')" : "0"
         : "model_provider = 'opencodex'"}
     `).all();
+    // No ORDER BY: a paginated opencodex row can precede a paginated openai one, so the
+    // verdict waits for the full scan instead of standing down on the first paginated row.
+    let foundPaginatedRow = false;
+    let foundPaginatedOpenaiRow = false;
     for (const row of rows) {
-      if (paginatedColumn || row.history_mode === "paginated") return HISTORY_RELABEL_STANDS_DOWN;
+      if (paginatedColumn || row.history_mode === "paginated") {
+        foundPaginatedRow = true;
+        // A provider-table transition removes the root openai_base_url, and a row already
+        // paginated cannot be relabeled: standing it down would route the openai-tagged
+        // thread to Codex's built-in OpenAI endpoint. A still-legacy row only stands down.
+        if (providerTableMode && row.history_mode === "paginated" && row.model_provider === "openai") {
+          foundPaginatedOpenaiRow = true;
+        }
+        continue;
+      }
       assertLegacyHistoryWritable(row.rollout_path);
     }
-    return null;
+    if (foundPaginatedOpenaiRow) return "history_paginated_openai_requires_native_writer";
+    return foundPaginatedRow ? HISTORY_RELABEL_STANDS_DOWN : null;
   } catch (error) {
     return error instanceof CodexHistoryIntegrityError
       ? error.message
