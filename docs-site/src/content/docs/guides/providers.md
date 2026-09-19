@@ -209,6 +209,17 @@ ocx logout <provider>
 
 Google Antigravity account and provider quota probes use fixed Google accounting endpoints, including the models fallback. They support transparent Fake-IP DNS for those destinations while retaining TLS verification, redirect rejection and private-address checks. A custom provider base URL changes model requests, not quota destinations; `NO_PROXY` continues to select the direct-route policy.
 
+### Google tool-schema loss diagnostics
+
+Google tool declarations are compiled against the selected endpoint class. When provider debug is
+on — `ocx debug provider on`, the dashboard Logs toggle, or `OCX_DEBUG=1` — schema loss during compatibility
+conversion emits a `[ocx:google:google-tool-schema-loss]` record (tail with `ocx debug provider logs -f`)
+carrying only the report version, endpoint class, a `lossy` indicator, fixed loss categories with
+bounded counts, and a truncation flag. Tool and property names, paths, values, and schema text are
+never included. This diagnostic observes the existing compatible conversion and does not reject
+the request. Native output schemas are outside this diagnostic. See the
+[debug command reference](/reference/cli/agents/).
+
 
 After a terminal Nous refresh failure, run `ocx login nous` to reauthenticate.
 

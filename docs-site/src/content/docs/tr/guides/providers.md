@@ -144,6 +144,17 @@ ocx logout <saglayici>
 
 Google Antigravity hesap ve sağlayıcı kota sorguları, model listesine geri dönüş dahil sabit Google uç noktalarını kullanır. Bu hedefler için şeffaf Fake-IP DNS desteklenirken TLS doğrulaması, yönlendirme reddi ve özel adres kontrolleri korunur. Özel base URL yalnızca model isteklerini değiştirir; `NO_PROXY` doğrudan bağlantı politikasını korur.
 
+### Google araç şeması kayıp tanılaması
+
+Google araç bildirimleri seçilen uç nokta sınıfına göre derlenir. Sağlayıcı hata ayıklaması
+`ocx debug provider on`, kontrol panelindeki Logs anahtarı veya `OCX_DEBUG=1` ile açıldığında,
+uyumluluk dönüşümü sırasında şema kaybı bir `[ocx:google:google-tool-schema-loss]` kaydı yayınlar
+(`ocx debug provider logs -f` ile takip edin). Kayıt yalnızca rapor sürümünü, uç nokta sınıfını,
+bir `lossy` göstergesini, sınırlı sayımlara sahip sabit kayıp kategorilerini ve kesilme işaretini
+taşır. Araç ve özellik adları, yollar, değerler ve şema metni hiçbir zaman dahil edilmez. Bu
+tanılama mevcut uyumlu dönüşümü gözlemler ve isteği reddetmez. Yerel çıktı şemaları bu tanılamanın
+dışındadır. [Hata ayıklama komutu başvurusuna](/tr/reference/cli/agents/) bakın.
+
 
 Uç bir Nous yenileme hatasından sonra yeniden kimlik doğrulamak için `ocx login
 nous` çalıştırın.

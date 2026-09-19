@@ -117,6 +117,16 @@ ocx logout <provider>
 
 Google Antigravity 帳戶與供應商的配額查詢（包括模型清單備援）使用固定的 Google 計量端點。這些目標支援透明 Fake-IP DNS，同時保留 TLS 驗證、重新導向拒絕與私有位址檢查。自訂 base URL 只改變模型請求，不改變配額目標；`NO_PROXY` 仍使用直連政策。
 
+### Google 工具結構描述損失診斷
+
+Google 工具宣告會依所選端點類別進行編譯。透過 `ocx debug provider on`、儀表板 Logs 開關或
+`OCX_DEBUG=1` 啟用供應商偵錯後，相容性轉換中的結構描述損失會輸出一筆
+`[ocx:google:google-tool-schema-loss]` 記錄（可用 `ocx debug provider logs -f` 持續查看），
+其中只包含報告版本、端點類別、`lossy` 指標、帶有上限計數的固定損失類別與截斷旗標，
+絕不包含工具名稱、屬性名稱、路徑、值或結構描述文字。此診斷只觀察既有的相容轉換，
+不會拒絕請求。原生輸出結構描述不屬於此診斷範圍。請參閱
+[偵錯命令參考](/zh-tw/reference/cli/agents/)。
+
 
 終端 Nous refresh 失敗後，執行 `ocx login nous` 重新認證。
 
