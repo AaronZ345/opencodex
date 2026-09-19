@@ -121,6 +121,7 @@ import { recordCodexUpstreamOutcome } from "../../codex/routing";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import {
+  isOpenCodeGoDestination,
   rateLimitRetryPolicyFor,
   rateLimitRetryDelayMs,
   transientRetryPolicyFor,
@@ -841,7 +842,15 @@ export async function preparePassthroughExchange(
             // retry wrapper replaces — proves the host was reached (#914 review).
             .then(adoptObservedResponse);
         },
-        { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends },
+        { abortSignal: upstream.signal, label: safeHostLabel(request.url),
+          attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
+          // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
+          // pre-header resets surfacing as refused 429s); its subscription traffic is
+          // inference-only, so a bounded reset replay here absorbs the blip instead of
+          // failing the turn. Recovery legs keep the fail-closed refusal; only this
+          // initial send is replay-eligible. Attempts stay budget-bounded via attempts.
+          replaySafe: isOpenCodeGoDestination(route.provider),
+        },
       );
     } catch (err) {
       return transportFailureResponse(err);
