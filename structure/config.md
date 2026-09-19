@@ -314,6 +314,32 @@ Both fields must stay positive finite integers at disk-config and management val
 Registry entries may seed them through `providerConfigSeed`, key-login derivation, OAuth reconcile,
 and `routeModel`, but user config overrides registry defaults per field/key.
 
+`src/providers/resolved-model-policy.ts` is the detached static-policy authority for this merge
+contract. It preserves each field's existing rule rather than assigning one global priority:
+operator scalars and explicit booleans fill over registry defaults, per-model maps fill per key,
+restriction lists form a stable union, and hard wire pins precede valid operator overrides and
+registry wire defaults. Only the canonical `openai-apikey` provider merges
+`modelContextWindows` and `modelMaxInputTokens` by taking the lower positive value; other
+providers use ordinary operator-per-key fill. Its output is recursively
+frozen and carries field/model provenance. It never persists resolved policy and excludes API keys,
+account selection, quota, health, cooldowns, discovered availability, and request-owned evidence.
+Observed context/input/output values are combined only in a call-local projection that can narrow a
+captured static cap but cannot write observations into the static result.
+The resolver's model id is the post-alias, post-virtual-rewrite wire identity. An exact nonempty
+`modelCapabilities[model].inputModalities` declaration outranks the legacy per-model modality map;
+an empty declaration is non-authoritative and falls through. OAuth/key override admission remains a
+live caller decision: the resolver accepts only its credential-free effective auth mode and records
+that provenance, never the key, reference, or usability evidence that produced it.
+Canonical static catalogs force live discovery off, narrowly recognized generated reasoning shapes
+are repaired before freezing only for a matched registry transport, and same-named custom
+destinations keep their operator-owned values. Key-auth service-tier defaults apply only to a
+captured key authority; exact-model provenance comes from the merged key/registry map, then falls
+back to the resolved provider capability provenance. A model max-input value is bounded by its
+resolved context window.
+Legacy model maps resolve exact id, then the base before a colon suffix, then case-folded exact id;
+the separately captured explicit capability row remains exact-only. Per-model provenance is assigned
+from the key that wins that same merged lookup, not from an independent source search.
+
 ## Provider validation ownership
 
 `src/config/provider-validation.ts` owns the pure provider payload checks shared by persisted config,
