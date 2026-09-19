@@ -398,7 +398,7 @@ The account history response can include a [low-confidence effective capacity es
 
 Account quota surfaces use [safe probe diagnostics](transports/inventory.md#account-quota-failure-diagnostics) separately from quota validity, credential health and routing authority.
 
-Translated Chat request construction uses the [inline-image budget](transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached.
+Translated Chat request construction uses the [inline-image budget](transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
 
 OpenCode catalog discovery in `src/cli/opencode.ts` derives a catalog-only bearer from the local admin credential and uses a validated numeric-loopback management origin. `src/server/management-auth.ts` accepts that derived bearer only for the exact `GET /api/models` read, so a spoofed listener cannot capture reusable administrator authority; that read can still finalize a pending initial model selection, so the bearer is catalog-scoped rather than strictly read-only. The launcher dials through `src/server/direct-local-http.ts`, rejects redirects and preserves the request/body deadline. Hub ingress selection stays separate from exported inference settings.
 
