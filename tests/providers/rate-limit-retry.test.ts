@@ -73,6 +73,32 @@ describe("rateLimitRetryPolicyFor", () => {
     } as OcxProviderConfig)).toMatchObject({ attempts: 2, intervalMs: 5_000 });
   });
 
+  test("matches the Go destination canonically: host case and default ports", () => {
+    const patient = {
+      enabled: true,
+      attempts: 6,
+      intervalMs: 10_000,
+      maxIntervalMs: 60_000,
+      respectRetryAfter: true,
+    };
+    for (const baseUrl of [
+      "https://opencode.ai/zen/go/v1/",
+      "https://OpenCode.ai/zen/go/v1",
+      "https://opencode.AI/zen/go/v1",
+      "https://opencode.ai:443/zen/go/v1",
+    ]) {
+      expect(rateLimitRetryPolicyFor({ baseUrl, adapter: "openai-chat" } as OcxProviderConfig)).toEqual(patient);
+    }
+    // Userinfo, query strings, and look-alike hosts still refuse the fallback.
+    for (const baseUrl of [
+      "https://opencode.ai/zen/go/v1?x=1",
+      "https://user:pass@opencode.ai/zen/go/v1",
+      "https://opencode.ai.evil.net/zen/go/v1",
+    ]) {
+      expect(rateLimitRetryPolicyFor({ baseUrl, adapter: "openai-chat" } as OcxProviderConfig)).toBeNull();
+    }
+  });
+
   test("honors explicit values", () => {
     expect(rateLimitRetryPolicyFor({
       retryOn429: { attempts: 10, intervalMs: 1_000, maxIntervalMs: 5_000, respectRetryAfter: false },
