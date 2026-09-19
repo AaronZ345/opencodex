@@ -14,6 +14,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { saveCredential } from "../../src/oauth/store";
 import { createRequestExecutionBudget } from "../../src/lib/request-execution-budget";
 
@@ -31,6 +32,16 @@ import { createRequestExecutionBudget } from "../../src/lib/request-execution-bu
  */
 const originalFetch = globalThis.fetch;
 
+// Every dispatching row below calls the handler directly, so it takes the spend-journal writer
+// lease that startServer would have taken for it. Per row rather than per file: two rows install
+// their own OPENCODEX_HOME, and a lease is bound to the directory in effect when it was taken.
+// The teardown drop is a backstop for a row that throws mid-assertion, because a lease left
+// behind makes the NEXT row's different home read as an ownership conflict rather than as this
+// row's failure.
+let releaseSpendHome: (() => void) | undefined;
+const takeSpendHome = (): void => { releaseSpendHome = acquireOwnedSpendHome(); };
+const dropSpendHome = (): void => { releaseSpendHome?.(); releaseSpendHome = undefined; };
+
 beforeEach(() => {
   clearComboSelectionState();
   clearComboTargetCooldowns();
@@ -38,6 +49,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  dropSpendHome();
   globalThis.fetch = originalFetch;
   setCachedCatalogForTests(null);
   clearComboSelectionState();
@@ -105,6 +117,9 @@ describe("upstream sends per logical request", () => {
     const previousJwtFlag = process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
     const home = mkdtempSync(join(tmpdir(), "devin-send-count-"));
     process.env.OPENCODEX_HOME = home;
+    // Taken on the home this row just installed, and dropped in its finally before that home
+    // is removed: an open lease inside a directory being deleted fails the removal on Windows.
+    takeSpendHome();
     delete process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
     const apiKey = "devin-count-test";
     // Devin is an OAuth-kind provider: the key the adapter ends up using is injected onto the
@@ -149,6 +164,7 @@ describe("upstream sends per logical request", () => {
         totalSends: totalSends(logCtx),
       }, `status ${response.status}: ${body.slice(0, 200)}`).toEqual({ chatCalls: 1, totalSends: 1 });
     } finally {
+      dropSpendHome();
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       if (previousJwtFlag === undefined) delete process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
@@ -168,6 +184,7 @@ describe("upstream sends per logical request", () => {
     const previousJwtFlag = process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
     const home = mkdtempSync(join(tmpdir(), "devin-send-denied-"));
     process.env.OPENCODEX_HOME = home;
+    takeSpendHome();
     delete process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
     const apiKey = "devin-denied-test";
     await saveCredential("devin", {
@@ -235,6 +252,7 @@ describe("upstream sends per logical request", () => {
         refused: true,
       });
     } finally {
+      dropSpendHome();
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       if (previousJwtFlag === undefined) delete process.env.OPENCODEX_DEVIN_SEND_USER_JWT;
@@ -248,6 +266,7 @@ describe("upstream sends per logical request", () => {
     const upstream = alwaysFailing(502, "upstream busy");
     const logCtx: RequestLogContext = { model: "", provider: "" };
 
+    takeSpendHome();
     const response = await handleResponses(
       responsesRequest("t0/model-t0"),
       { defaultProvider: "t0", providers: { t0: transientChatProvider("t0") } } as unknown as OcxConfig,
@@ -267,6 +286,7 @@ describe("upstream sends per logical request", () => {
     const upstream = alwaysFailing(502, "upstream busy");
     const logCtx: RequestLogContext = { model: "", provider: "" };
 
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), comboOverTargets(1), logCtx);
 
     expect(response.status).toBe(502);
@@ -281,6 +301,7 @@ describe("upstream sends per logical request", () => {
     const upstream = alwaysFailing(502, "upstream busy");
     const logCtx: RequestLogContext = { model: "", provider: "" };
 
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), comboOverTargets(3), logCtx);
 
     expect(response.status).toBe(502);
@@ -311,6 +332,7 @@ describe("upstream sends per logical request", () => {
     const upstream = alwaysFailing(502, "upstream busy");
     const logCtx: RequestLogContext = { model: "", provider: "" };
 
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), comboOverTargets(13), logCtx);
 
     expect(response.status).toBe(502);
@@ -348,6 +370,7 @@ describe("ambiguous reset safety across Responses recovery", () => {
           throw Object.assign(new Error("The socket connection was closed unexpectedly."), { code: "ECONNRESET" });
         }) as typeof fetch;
         const logCtx: RequestLogContext = { model: "", provider: "" };
+        takeSpendHome();
         const response = await handleResponses(
           responsesRequest(combo ? "combo/fan" : "t0/model-t0"), config, logCtx,
         );
@@ -372,6 +395,7 @@ describe("ambiguous reset safety across Responses recovery", () => {
       throw Object.assign(new Error("connection reset by peer"), { code: "ECONNRESET" });
     }) as typeof fetch;
     const logCtx: RequestLogContext = { model: "", provider: "" };
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), comboOverTargets(2), logCtx);
     expect(response.status).toBe(429);
     expect((await response.json()).error.code).toBe("upstream_reset_replay_refused");
@@ -387,6 +411,7 @@ describe("ambiguous reset safety across Responses recovery", () => {
       sends += 1;
       throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
     }) as typeof fetch;
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), config, { model: "", provider: "" });
     expect(response.status).toBe(429);
     expect((await response.json()).error.code).toBe("upstream_reset_replay_refused");
@@ -407,6 +432,7 @@ describe("ambiguous reset safety after outer recovery", () => {
       throw Object.assign(new Error("connection reset by peer"), { code: "ECONNRESET" });
     }) as typeof fetch;
     const logCtx: RequestLogContext = { model: "", provider: "" };
+    takeSpendHome();
     const response = await handleResponses(responsesRequest("combo/fan"), config, logCtx);
     expect(response.status).toBe(429);
     expect((await response.json()).error.code).toBe("upstream_reset_replay_refused");
@@ -435,6 +461,7 @@ describe("ambiguous reset safety after outer recovery", () => {
         throw Object.assign(new Error("connection reset by peer"), { code: "ECONNRESET" });
       }) as typeof fetch;
       const logCtx: RequestLogContext = { model: "", provider: "" };
+      takeSpendHome();
       const response = await handleResponses(responsesRequest("t0/model-t0"), config, logCtx);
 
       expect(response.status).toBe(429);
