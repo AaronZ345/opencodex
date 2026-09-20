@@ -502,6 +502,33 @@ export function unusedProxyWarningLines(input: {
   ];
 }
 
+/**
+ * The mirror case: routing is ours and nothing is answering it.
+ *
+ * #5261: this state does not merely fail model calls. The root `openai_base_url` we inject
+ * is the base URL of Codex's own built-in openai provider, so with the proxy down a user can
+ * be stopped at Codex sign-in with no mention of opencodex anywhere on the screen. The
+ * injection is on disk and survives reboot, so it does not clear itself.
+ *
+ * The rest of the not-running report offers only ways to bring the proxy BACK, which is the
+ * wrong half of the choice for someone who wants their editor working again now. `ocx restore`
+ * needs no proxy, no management API and no network, so name it here — this report is the
+ * surface such a user is most likely to reach before the config file itself.
+ *
+ * Restricted to routing opencodex owns. `custom-local` is somebody else's gateway, and
+ * `ocx restore` would not remove it.
+ */
+export function deadProxyRoutingAdviceLines(input: {
+  proxyUp: boolean;
+  routingKind: StartupHealth["routingKind"];
+}): string[] {
+  if (input.proxyUp || input.routingKind !== "opencodex-local") return [];
+  return [
+    "Codex is still pointed at this proxy, so sign-in and model requests both fail while it is down.",
+    "To hand Codex back to its own account and endpoints without starting anything: ocx restore",
+  ];
+}
+
 export async function collectStatus(): Promise<CliStatusView> {
   const configDiagnostics = readConfigDiagnostics();
   const config = configDiagnostics.config;

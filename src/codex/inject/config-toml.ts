@@ -4,6 +4,7 @@ import { contextCompatibleBaseLine } from "../context-compat";
 import { resolveEffectiveProjectModelProvider } from "../project-config-warnings";
 import {
   OCX_SECTION_MARKER,
+  OCX_ROUTING_MARKER_LINE,
   REALTIME_WS_BASE_URL_KEY,
   isRootOpenaiBaseUrlLine,
   isRootRealtimeWsBaseUrlLine,
@@ -128,7 +129,7 @@ export function buildProviderTableBlockForTarget(
 ): string {
   const lines = [
     "",
-    OCX_SECTION_MARKER,
+    OCX_ROUTING_MARKER_LINE,
     "[model_providers.opencodex]",
     `name = ${tomlString(resolveCodexProviderDisplayName(displayName))}`,
     `base_url = ${tomlString(target.baseUrl)}`,
@@ -213,6 +214,9 @@ export function setRootOpenaiBaseUrl(
     if (!isRootOpenaiBaseUrlLine(lines[i])) continue;
     const markerOwned = i > 0 && lines[i - 1].includes(OCX_SECTION_MARKER);
     if (!markerOwned) return { content, keptUserBaseUrl: true };
+    // Refresh the marker too, so a config injected by a build that predates the recovery
+    // hint gains it on the next `ocx start` instead of keeping a bare marker forever.
+    lines[i - 1] = OCX_ROUTING_MARKER_LINE;
     lines[i] = key;
     return { content: lines.join("\n"), keptUserBaseUrl: false };
   }
@@ -222,7 +226,7 @@ export function setRootOpenaiBaseUrl(
       content:
         content.replace(/\n+$/, "") +
         "\n" +
-        OCX_SECTION_MARKER +
+        OCX_ROUTING_MARKER_LINE +
         "\n" +
         key +
         "\n",
@@ -231,7 +235,7 @@ export function setRootOpenaiBaseUrl(
   }
   let insertAt = firstTable;
   while (insertAt > 0 && lines[insertAt - 1].trim() === "") insertAt--;
-  lines.splice(insertAt, 0, OCX_SECTION_MARKER, key);
+  lines.splice(insertAt, 0, OCX_ROUTING_MARKER_LINE, key);
   return { content: lines.join("\n"), keptUserBaseUrl: false };
 }
 
@@ -247,18 +251,19 @@ export function setRootOpenaiBaseUrlForTarget(
     if (!isRootOpenaiBaseUrlLine(lines[index])) continue;
     const markerOwned = index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER);
     if (!markerOwned) return { content, keptUserBaseUrl: true };
+    lines[index - 1] = OCX_ROUTING_MARKER_LINE;
     lines[index] = key;
     return { content: lines.join("\n"), keptUserBaseUrl: false };
   }
   if (firstTable === -1) {
     return {
-      content: `${content.replace(/\n+$/, "")}\n${OCX_SECTION_MARKER}\n${key}\n`,
+      content: `${content.replace(/\n+$/, "")}\n${OCX_ROUTING_MARKER_LINE}\n${key}\n`,
       keptUserBaseUrl: false,
     };
   }
   let insertAt = firstTable;
   while (insertAt > 0 && lines[insertAt - 1].trim() === "") insertAt -= 1;
-  lines.splice(insertAt, 0, OCX_SECTION_MARKER, key);
+  lines.splice(insertAt, 0, OCX_ROUTING_MARKER_LINE, key);
   return { content: lines.join("\n"), keptUserBaseUrl: false };
 }
 
@@ -284,13 +289,14 @@ export function setRootRealtimeWsBaseUrl(
     if (!isRootRealtimeWsBaseUrlLine(lines[index])) continue;
     const markerOwned = index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER);
     if (!markerOwned) return { content, keptUserRealtimeWsBaseUrl: true };
+    lines[index - 1] = OCX_ROUTING_MARKER_LINE;
     lines[index] = key;
     return { content: lines.join("\n"), keptUserRealtimeWsBaseUrl: false };
   }
   for (let index = 0; index < rootEnd; index += 1) {
     if (!isRootOpenaiBaseUrlLine(lines[index])) continue;
     if (!(index > 0 && lines[index - 1].includes(OCX_SECTION_MARKER))) continue;
-    lines.splice(index + 1, 0, OCX_SECTION_MARKER, key);
+    lines.splice(index + 1, 0, OCX_ROUTING_MARKER_LINE, key);
     return { content: lines.join("\n"), keptUserRealtimeWsBaseUrl: false };
   }
   // No marker-owned routing override to attach to: the override has no owner, so inject nothing.
