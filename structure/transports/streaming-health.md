@@ -159,6 +159,8 @@ once the server observes the client disconnect (Bun propagates it asynchronously
 cancelled with 499 before any replay; because the propagation is async, a replay may precede
 the cancel if the interval elapses first (bounded by the same `attempts` budget).
 
+OpenCode Go (`https://opencode.ai/zen/go/v1`, serving subscription traffic such as Muse Spark) ships a patient same-target fallback when no explicit `retryOn429` is configured: same-key wait-and-replay with a 10s interval and a 60s cap, `Retry-After` honored. Replays draw from the shared per-request send budget, so a burst typically absorbs a couple of paced sends before the 429 surfaces — without this, a single-key pool surfaced the first 429 immediately and the client’s own retry budget aborted the goal (`exceeded retry limit, last status: 429`). An explicit `retryOn429` — including `enabled: false` — always overrides the fallback; every other provider without the knob keeps fail-fast behavior.
+
 Provider-level `requestPacing` is the proactive companion to `retryOn429`. It reserves outbound
 request-start slots before transport work begins, so a known RPM ceiling does not have to fail once
 before the proxy reacts. One provider-wide lane enforces the aggregate ceiling. Exact model lanes
@@ -286,7 +288,7 @@ Live sideband admission and its bounded upstream handshake follow the [runtime c
 
 ## Translated Chat inline-image budget
 
-`src/adapters/openai-chat-images.ts` reuses the shared image normalization ladder for translated Chat bodies above a 3.5 MiB base64-image budget. This is best effort, not a whole-request ceiling. Remote URLs are not fetched; unprocessable and terminal images remain attached, and retained bytes continue to count during demotion. Under-budget construction stays synchronous; delegating MiMo awaits conditional asynchronous construction. Native Chat passthrough and Anthropic-only 413 retry policy retain their existing behavior.
+`src/adapters/openai-chat-images.ts` reuses the shared image normalization ladder for translated Chat bodies above a 3.5 MiB base64-image budget. This is best effort, not a whole-request ceiling. Remote URLs are not fetched; unprocessable and terminal images remain attached, and retained bytes continue to count during demotion. Under-budget construction stays synchronous; delegating MiMo awaits conditional asynchronous construction. Native decoding is admitted through a process-wide four-operation gate, guarded by a 16-million-pixel ceiling confirmed from codec metadata, and request cancellation stops queued and subsequent normalization work. Native Chat passthrough and Anthropic-only 413 retry policy retain their existing behavior.
 
 The [explicit model-capability contract](../config.md#explicit-per-model-capability-declarations) preserves operator declarations through provider storage and catalog capture; it does not infer upstream capability or change this surface's routing behavior.
 
@@ -511,3 +513,5 @@ cover effective wire settings, immutable-route refusals, policy preservation,
 independent API credentials, unavailable-mode diagnostics and safe probe outcomes.
 
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
+
+WebSocket [compaction routing selection](responses.md#compaction-routing-overrides) uses per-frame metadata; handshake metadata cannot supply a later frame's trigger.

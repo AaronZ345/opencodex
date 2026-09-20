@@ -15,6 +15,8 @@ import { getCachedCatalog, type CacheEntry } from "./devin/cloud-direct/catalog"
 import { collapseDevinModelUid } from "./devin/live-models";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { DEVIN_DEFAULT_API_SERVER, resolveDevinApiServer } from "../oauth/devin";
+import { isProviderIssuedThinkingSignature } from "../responses/reasoning-envelope";
+import { SendBudgetExhaustedError } from "../lib/upstream-retry";
 
 /**
  * Combine two usage frames from one turn by keeping the larger count per field.
@@ -253,6 +255,17 @@ function textFromParts(content: string | OcxContentPart[] | undefined): string {
   return content.map((part) => (part.type === "text" ? part.text : "")).filter(Boolean).join("\n");
 }
 
+const MAX_DEVIN_REMOTE_IMAGE_URL_CHARS = 8_192;
+
+function boundedDevinRemoteImageReference(imageUrl: string): string | undefined {
+  if (imageUrl.length > MAX_DEVIN_REMOTE_IMAGE_URL_CHARS) return undefined;
+  try {
+    return new URL(imageUrl).protocol === "https:" ? imageUrl : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Convert inbound content parts to the multimodal shape the wire encoder accepts.
  *
@@ -261,9 +274,10 @@ function textFromParts(content: string | OcxContentPart[] | undefined): string {
  * text-only string and a message whose only content was an image was dropped
  * entirely, which is why a pasted screenshot killed the turn and the only
  * workaround was running OCR before sending. A data: URL carries everything
- * field #10 needs; a remote https URL cannot be inlined without a fetch, so it
- * stays as an explicit text reference rather than pretending the model can see
- * a picture it cannot. Video has no Devin field and is skipped.
+ * field #10 needs; a bounded remote https URL cannot be inlined without a fetch,
+ * so it stays as an explicit text reference rather than pretending the model can
+ * see a picture it cannot. Unsupported and oversized references become a fixed
+ * omission marker, never attacker-sized prompt text. Video has no Devin field.
  */
 function mapOcxContentToWire(content: string | OcxContentPart[] | undefined): string | ContentPart[] {
   if (typeof content === "string" || !Array.isArray(content)) return content ?? "";
@@ -274,7 +288,13 @@ function mapOcxContentToWire(content: string | OcxContentPart[] | undefined): st
     } else if (part.type === "image") {
       const m = part.imageUrl.match(/^data:([^;]+);base64,(.+)$/);
       if (m) out.push({ type: "image", mimeType: m[1]!, base64Data: m[2]! });
-      else out.push({ type: "text", text: `[image url: ${part.imageUrl}]` });
+      else {
+        const remoteReference = boundedDevinRemoteImageReference(part.imageUrl);
+        out.push({
+          type: "text",
+          text: remoteReference ? `[image url: ${remoteReference}]` : "[image omitted: unsupported or oversized URL]",
+        });
+      }
     }
   }
   return out;
@@ -310,23 +330,26 @@ function assistantText(message: OcxAssistantMessage): string {
  * clients of the same service write #11 thinking with #12 signature and #18
  * signature_type on the assistant prompt.
  *
- * The signature attests the thinking it was produced with, so a block without
- * one contributes its text and nothing else rather than borrowing a neighbour's.
+ * Field #12 attests the exact text at #11, and the wire has room for one pair.
+ * Every block that carries text is replayed, so the chain stays intact; the
+ * signature rides along only when the text being replayed IS the text it
+ * attests, which is exactly the single-block case. Several independently signed
+ * blocks send an unsigned prompt rather than pairing one block's attestation
+ * with another block's words. A signature-only block attests encrypted thinking
+ * that is not being replayed at all, so it is not one of these blocks and
+ * cannot contribute the pair.
  */
 function assistantThinking(
   message: OcxAssistantMessage,
 ): { thinking?: string; signature?: string } {
   const blocks = message.content.filter(
     (part): part is Extract<typeof part, { type: "thinking" }> => part.type === "thinking",
-  );
+  ).filter(part => Boolean(part.thinking));
   if (blocks.length === 0) return {};
-  const thinking = blocks.map(b => b.thinking).filter(Boolean).join("\n");
-  // Only one signature can ride the prompt, so take the last block that has
-  // one: that is the block the turn actually ended on.
-  const signature = blocks.filter(b => b.signature).at(-1)?.signature;
+  const signature = blocks.length === 1 ? blocks[0]!.signature : undefined;
   return {
-    ...(thinking ? { thinking } : {}),
-    ...(signature ? { signature } : {}),
+    thinking: blocks.map(part => part.thinking).join("\n"),
+    ...(isProviderIssuedThinkingSignature(signature) ? { signature } : {}),
   };
 }
 
@@ -490,6 +513,10 @@ export function createDevinAdapter(
 
   return {
     name: "devin",
+    // Every GetChatMessage send, including the first, is admitted through the shared budget and
+    // reported from the executor that dispatches it. The caller therefore leaves the first
+    // send's accounting here rather than logging it before admission can refuse it.
+    reportsPhysicalSends: true,
 
     buildRequest() {
       return {
@@ -584,6 +611,13 @@ export function createDevinAdapter(
             ...(typeof parsed.options.topP === "number" ? { topP: parsed.options.topP } : {}),
           },
           signal: incoming.abortSignal,
+        }, {
+          execution: {
+            executor: incoming.providerFetch,
+            sendBudget: incoming.sendBudget,
+            onPhysicalSend: incoming.onPhysicalSend,
+            onRecoveryWithheld: incoming.onRecoveryWithheld,
+          },
         })) {
           if (incoming.abortSignal?.aborted) {
             // Emitting nothing here left the bridge to synthesize adapter_eof.
@@ -662,6 +696,9 @@ export function createDevinAdapter(
           emit({ type: "error", message: DEVIN_CLIENT_CLOSED_MESSAGE, status: 499, retryable: false, ...(usage ? { usage } : {}) });
           return;
         }
+        // The Responses boundary already maps this local refusal to its structured 429 code.
+        // Converting it to an adapter event would make it an ordinary untyped upstream error.
+        if (error instanceof SendBudgetExhaustedError) throw error;
         const message = error instanceof CloudChatError
           ? ("Devin cloud error" + (error.code ? " " + error.code : "") + ": " + error.message)
           : error instanceof Error ? error.message : String(error);

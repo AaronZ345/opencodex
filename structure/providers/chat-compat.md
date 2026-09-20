@@ -26,6 +26,10 @@ Shared parsing and streaming follow the [request-copy](../transports/byte-accoun
 
 ## Reasoning and tool-result compatibility
 
+Google tool-declaration narrowing is observed by the Google final compiler, not this shared Chat
+compatibility layer. Its endpoint profile and privacy boundary are specified in the
+[Google provider contract](google.md#google-tool-schema-loss-reporting).
+
 Chat models sometimes return a freeform call body under a common alternate field or wrap the whole
 body in a Markdown fence. Restoration in `src/responses/apply-patch-envelope.ts` is deliberately
 narrow: only bare `exec` and `apply_patch` accept one recognized alternate field or one complete
@@ -378,7 +382,7 @@ byte-limit boundaries.
 
 Canonical Spark Lite metadata follows the final serialized model and surviving nonempty Lite tool catalog; see [Responses transport](../transports/responses.md).
 
-Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached.
+Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
 ## Anthropic parallel tool use
 
 `options.parallelToolCalls === false` maps onto Anthropic's nested

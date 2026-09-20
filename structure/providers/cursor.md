@@ -60,6 +60,12 @@ effort variants the roster carries. That is deliberate — Cursor advertises ids
 variant-level quarantine exist for — so a new family is admitted by adding its capability row,
 not by relaxing the filter.
 
+Synthetic ultra rows (`<base>-1m` markers such as `kimi-k3-1m`, kept in `configured` by legacy
+pins or retain lists) clear that base-availability check and one more: the live roster must flag
+Max Mode for the base (`GetUsableModels.maxMode`), or the row stays hidden. Base availability
+alone is not enough — an account on a plan without Max Mode would otherwise see a row whose
+ultra request it cannot serve.
+
 A seeded ladder carries only rungs supported by vendor evidence. `muse-spark-1.3` is seeded at
 `minimal` through `xhigh` even though Cursor's roster also advertises `muse-spark-1.3-max`:
 Meta publishes no `max` rung for Muse Spark and an independent probe rejected it, both already
@@ -135,6 +141,9 @@ on the freeform path.
 Namespaced tools do not acquire bare-shell behavior. Regression coverage lives in
 `tests/providers/cursor/cursor-tool-definitions.test.ts`.
 
+Google's [tool-schema loss report](google.md#google-tool-schema-loss-reporting) is confined to the
+Google final compiler and does not change Cursor's advertised or normalized schema ownership.
+
 Canonical Spark Lite metadata follows the final serialized model and surviving nonempty Lite tool catalog; see [Responses transport](../transports/responses.md).
 
 Shared raw-reasoning events retain content-channel presentation; provider-authored thinking keeps its existing summary path. See [bridge contract](chat-compat.md).
@@ -179,7 +188,7 @@ classifies as overflow. Coverage lives in
 
 An incomplete client-tool stream is fail-closed for the current turn: `finalizeTurnEvents` emits the prefix owned by `CURSOR_INCOMPLETE_TOOL_CALL_MESSAGE_PREFIX` and does not retry that send. After the error is streamed, eligible non-isolated turns remint the Cursor conversation id, persist the thread override, and invalidate the inherited checkpoint so the next turn does not resume a conversation left waiting for `mcpResult`. `src/adapters/cursor/thread-continuity.ts` permits three such rotations per retained identity-scoped thread owner in a separate bounded counter; exhaustion keeps reusing the conversation and records an `incomplete-tool-remint-exhausted` diagnostic, while a clean completed turn clears that scope's counter. This allowance never consumes or replenishes the overflow resend budget. Isolated helper and compaction turns neither remint nor change the parent's allowance or checkpoint. Native Composer replay synthesizes `[missing tool_result for this tool_use in history]` for unpaired `toolCallStep` history; external wire models skip native `mcpToolCall` replay, so conversation remint is their recovery path.
 
-Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached.
+Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
 
 ## Mid-stream envelope echo
 
@@ -219,3 +228,34 @@ Canonical Responses identity sanitation and narrowly scoped pre-output combo rec
 Upstream API-key usage follows the [physical-attempt account attribution contract](../gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
 
 Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-accounting.md#unicode-pattern-normalization) while preserving the existing schema and wire semantics.
+
+## Inbound stream-health clock ownership
+
+The T04 inbound stream-health watchdog in `src/adapters/cursor/live-transport.ts` fails a turn that
+received its first frame and then went silent for `CURSOR_STREAM_SILENCE_FAIL_MS` (30s) or
+produced only liveness frames for `CURSOR_STREAM_HEARTBEAT_ONLY_FAIL_MS` (90s), instead of waiting
+out the 300s bridge stall watchdog. One timer covers both thresholds and re-arms on every
+decoded frame, so the deadline is always recomputed from the newest frame.
+
+Those two budgets are the production contract and a test does not move them to make itself
+pass. What a test may replace is the watchdog's time source: `streamHealthClock` on
+`CursorTransportFactoryInput` supplies `now`, `setTimeout` and `clearTimeout`, defaulting to the
+globals, and the seam is deliberately scoped to T04 alone — the first-frame timer, the
+turn-ended close grace, the client-tool finalize grace and the outbound heartbeat all stay on
+the global timers, as does the `elapsedMs` diagnostic, whose `turnStartedAt` is stamped on the
+wall clock.
+
+The seam exists because the re-arming half of the contract cannot be stated against real
+timers without also asserting that the machine keeps up: showing that a deadline did NOT expire
+means keeping a synthetic server ahead of the silence budget for several multiples of it, which
+is what failed in the unsharded macOS lane while the watchdog was correct. Scaling the budget
+lengthens the window rather than shrinking the exposure. Every claim of that shape therefore lives
+under the seam in `tests/providers/cursor/cursor-stream-health.test.ts`: that meaningful frames
+re-arm both clocks, that liveness-only frames refresh the silence clock while the progress clock
+still expires, and that the silence deadline is the one that fires when it is the earlier of the
+two. That last one is load-bearing: a watchdog that dropped the `min()` and read only the progress
+deadline would relax silence detection from 30s to 90s while every real-timer case stayed green,
+because a later deadline still produces the same message. The firing half needs no seam and stays
+on real timers in the same file: silence after the first frame, the progress budget alone failing a
+turn when the silence budget is out of reach, and `turnEnded` cancelling the watchdog while the
+server holds the stream open.

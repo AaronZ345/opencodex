@@ -35,6 +35,7 @@ import { setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import type { OcxConfig } from "../../src/types";
 import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { helperPath, repoRoot } from "../helpers/repo-root";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "../helpers/test-budget";
 
@@ -106,6 +107,14 @@ function addAlternative(cfg: OcxConfig): void {
   });
 }
 
+let releaseSpendHome: (() => void) | undefined;
+// Taken by the two cases that dispatch in-process, never for the whole file. Two describes here
+// spawn a child that runs startServer against this same home, and that child takes the real
+// lease: a parent holding one turns the child's startup into SPEND_LEDGER_OWNER_BUSY, which is
+// the contract working and the case failing for a reason it is not about.
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
+const dropSpendHome = (): void => { releaseSpendHome?.(); releaseSpendHome = undefined; };
+
 beforeEach(() => {
   tokenExpiry = Math.floor(Date.now() / 1000) + 86_400;
   previousHome = process.env.OPENCODEX_HOME;
@@ -125,6 +134,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Released before this case's home is removed: an open lease inside a directory being
+  // deleted fails the removal on Windows and leaves an unlinked live database on POSIX.
+  dropSpendHome();
   mock.restore();
   clearAccountQuota();
   clearThreadAccountMap();
@@ -493,6 +505,7 @@ describe("main quota policy at native admission", () => {
         model: "fixture-model", output: [], usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
       });
     }, { preconnect() {} }));
+    takeSpendHome();
     const post = (model: string) => handleResponses(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { ...Object.fromEntries(caller()), "content-type": "application/json" },
@@ -532,6 +545,7 @@ describe("main quota policy at native admission", () => {
       sends.push({ url: request.url, authorization: request.headers.get("authorization") });
       return Response.json({ id: "cmp_policy_transport", object: "response.compaction", output: [] });
     }, { preconnect() {} }));
+    takeSpendHome();
     const post = (model: string) => handleResponsesCompact(new Request("http://localhost/v1/responses/compact", {
       method: "POST",
       headers: { ...Object.fromEntries(caller()), "content-type": "application/json" },

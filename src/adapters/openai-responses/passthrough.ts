@@ -18,6 +18,7 @@ import type { TranslatorBudget } from "../../lib/translator-budget";
 import { rewriteRoutedCustomToolsForUpstream } from "../../responses/custom-tool-compat";
 import { rewriteRoutedToolSearchForUpstream } from "../../responses/tool-search-compat";
 import { rewriteRoutedNamespaceToolsForUpstream } from "../../responses/namespace-tool-compat";
+import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-tool-name-repair";
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { openaiResponsesUrl } from "../openai-responses-url";
@@ -31,7 +32,7 @@ import {
 import {
   createAdapterTierMetadata,
 } from "../../providers/fastwire";
-import { mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
+import { dropResponsesReasoningInputItems, mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
 import { scrubOcxCompactionItems, stripCanonicalOnlyToolFields, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough, stripInvalidItemIds, stripItemIdsWhenUnstored } from "./request-strips";
 import { stripCanonicalForwardPromptCacheOptions, stripDeprecatedPromptCacheRetention } from "./prompt-cache";
 import { isPlainObject } from "./internal";
@@ -295,6 +296,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       if (forward || stateless || pairedToolResults) {
         outBody = repairOrphanedInputItems(outBody, unexpandedMiss, synthesizeMissingCallOutputs);
       }
+      if (provider.dropResponsesReasoningItems === true) {
+        outBody = dropResponsesReasoningInputItems(outBody);
+      }
       if (adjacentToolResults) {
         outBody = normalizeResponsesToolResultAdjacency(outBody);
       }
@@ -335,6 +339,12 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // every turn, and a strict parser rejects the whole request over the missing key —
       // `queries` for DeepSeek (#930), `query` for Console Go (#3071).
       outBody = backfillWebSearchQueries(outBody);
+      // #5095: a conversation that already contains a `default.`-prefixed call name is refused by
+      // the upstream `^[a-zA-Z0-9_-]+$` name pattern on every later turn that replays it, so the
+      // task cannot be compacted or continued at all. Repair the replayed item here, before the
+      // canonical-destination split below, because the reported failure was a side chat on a plain
+      // OpenAI model inheriting history a routed provider had damaged.
+      outBody = repairLegacyDottedToolCallNames(outBody);
       if (!isCanonicalOpenAiForwardProvider(provider)) {
         outBody = stripInternalChatMessageMetadataPassthrough(outBody);
         // The same class of private field, one level up, but keyed on the DESTINATION rather than
@@ -397,14 +407,16 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         // Last, so promoted namespace children are also cleared of Codex-private fields.
         outBody = stripCanonicalOnlyToolFields(outBody, provider.supportsOpenAiWebSearchToolFields === false);
       }
-      if (!forward) outBody = normalizeOpenCodeGoAdditionalTools(outBody, url);
+      if (!forward) {
+        outBody = normalizeOpenCodeGoAdditionalTools(outBody, url, parsed._replayPrefixLen);
+      }
       // Same predicate as the routedCompaction gate in handleResponses(): an authMode check would
       // let a noncanonical custom forward provider skip this rewrite while the server still routes
       // it as a summarizer turn (#422). The compaction body build removes the tool surface and must
       // therefore be the last routed transform that may depend on those declarations. Structural
       // sanitizers below can still run after it.
       outBody = normalizeResponsesCodeMode(outBody, parsed, provider);
-      if (parsed._compactionRequest === true && !isCanonicalOpenAiForwardProvider(provider)) {
+      if (parsed._compactionRequest === true && (!isCanonicalOpenAiForwardProvider(provider) || parsed._portableCompaction === true)) {
         outBody = buildRoutedCompactionBody(outBody);
       }
       // Run after routed compaction so nested input_image parts are replaced before a malformed

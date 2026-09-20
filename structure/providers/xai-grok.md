@@ -1,5 +1,7 @@
 # xAI Grok Provider
 
+The Grok client picker forwards the `meta-muse` catalog's `max` effort through its existing managed-block export; this follows the [Muse provider contract](../providers-and-adapters.md).
+
 Native result continuations and function-result injection follow [the mode-specific result and control contract](../transports/streaming-health.md#experimental-native-function-result-injection); this surface does not infer upstream support or alter its defaults.
 
 Native steering follows [the shared WebSocket contract](../transports/streaming-health.md#experimental-native-mid-turn-steering); this surface's defaults remain unchanged.
@@ -61,6 +63,9 @@ The shared Responses path follows the [bounded multipart recovery contract](../s
   force-refresh once (singleflight, generation-checked) and replay OAuth-backed xAI requests
   exactly once with a re-resolved transport; API-key/BYOK paths are excluded
   (`src/server/responses/core.ts`).
+- **Generic pool threshold:** xAI's generic OAuth fill-first selector in
+  `src/oauth/generic-account-failover.ts` treats a non-positive threshold as disabling proactive
+  usage-based account changes; reactive recovery remains independent.
 - **Header parity:** per-attempt `x-grok-req-id` (fresh UUID inside the transport fetch
   wrapper), stable session/conv affinity headers, always-set User-Agent, and a single
   compatibility profile const for the Grok client version (`src/providers/xai-transport.ts`);
@@ -76,6 +81,11 @@ unique and semantically valid raw completed items, then backfills a missing or e
 snapshot. It never promotes locally synthesized or merely repaired items. Unmarked callers continue
 to treat an explicit empty array as authoritative. Within this marked client-facing repair,
 malformed, gapped, oversized, contradictory, failed, or incomplete streams stay fail-closed.
+
+The same marked client-facing chain normalizes lexical floating-point `response.created_at` and
+`response.completed_at` values to their JSON integer spelling only for `response.*` events whose
+nested values are nonnegative safe integers. Missing, malformed, fractional, negative, unsafe, and
+byte-identical payloads pass through unchanged.
 
 > Decision record: [ADR-0059](../decisions/ADR-0059-xai-grok-hardening-official-grok-build-contract.md)
 
@@ -123,7 +133,10 @@ transport behavior.
 The first-party DeepSeek `deepseek-flash` native `text`/`image` declaration is likewise scoped to
 the DeepSeek provider and does not alter xAI metadata or transport behavior; explicit capability
 overrides remain authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and
-`deepseek-v4-flash` remain sidecar-backed by default. Zen routes are unchanged and unprobed here.
+`deepseek-v4-flash` remain sidecar-backed by default. The Zen tiers (`opencode-zen`, `opencode-free`) could not be measured (HTTP 402) and keep their existing classifications.
+OpenCode Go's `deepseek-v4.1-flash` was reclassified as native vision on 2026-09-19 (probed on
+that gateway); its sibling `deepseek-v4-flash` stays sidecar-backed. None of this alters xAI
+metadata or routing.
 The Crusoe fixed-key registry row, discovery predicate, effort ladder, and input-modality map are
 also provider-scoped and do not alter xAI model metadata, OAuth routing, or wire behavior.
 
@@ -177,3 +190,7 @@ Native steering generation overrides, explicit public-API eligibility and the co
 Shared startup provider-id migration preserves the account binding between configuration and OAuth credentials; see the [runtime contract](../runtime.md).
 
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
+
+Routed Grok compaction uses the existing adapter and summary contract after a same-provider
+[compaction routing model override](../transports/responses.md#compaction-routing-overrides); a
+cross-provider override runs the portable summarizer on the selected provider instead.

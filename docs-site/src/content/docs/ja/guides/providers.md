@@ -120,6 +120,23 @@ ocx logout <provider>
 
 Google Antigravity のアカウント・プロバイダーのクォータ確認は、モデル一覧へのフォールバックも含め、固定の Google エンドポイントを使用します。その宛先では透過 Fake-IP DNS に対応し、TLS 検証、リダイレクト拒否、プライベートアドレス検査を維持します。カスタム base URL はモデル要求にのみ適用されます。`NO_PROXY` は直接接続のポリシーを維持します。
 
+### Google ツールスキーマ損失診断
+
+Google のツール宣言は、選択されたエンドポイントクラスに合わせてコンパイルされます。
+`ocx debug provider on`、ダッシュボードの Logs トグル、または `OCX_DEBUG=1` でプロバイダー
+デバッグを有効にすると、ポリシーの省略時または `compatible` の互換性変換でのスキーマ損失は
+`[ocx:google:google-tool-schema-loss]` レコードを出力します（`ocx debug provider logs -f` で
+追跡できます）。レコードに含まれるのは、レポートのバージョン、エンドポイントクラス、
+`lossy` インジケーター、判定不能な比較の上限付き件数、上限付き件数を伴う固定の損失カテゴリ、切り詰めフラグだけです。
+ツール名、プロパティ名、パス、値、スキーマ本文は含まれません。ポリシーの省略時または
+`compatible` では変換を拒否せず観測します。`reject-lossy` では、初期コンパイルに損失がある場合、
+または上限付き比較が判定不能な場合、送信前に拒否します。拒否されたリクエストに別の損失レコードは
+出力されません。`reject-lossy` では、制約を消す Vertex または Cloud Code Assist の修復は同様に内容を含まない
+`google-tool-schema-repair` を出力し、変更送信を行わず元の 400 を返します。ポリシーの省略時または
+`compatible` では、修復済みリクエストを従来どおり再送します。直接 AI Studio は
+この修復を行いません。ネイティブ出力スキーマは両方のポリシー経路の対象外です。
+[デバッグコマンドのリファレンス](/ja/reference/cli/agents/)も参照してください。
+
 
 Nous の refresh が終端失敗した場合は、再認証に `ocx login nous` を実行してください。
 
@@ -168,7 +185,7 @@ Kiro のログインには Kiro CLI が必要です。Unix では `curl -fsSL ht
 
 ## 3. API キーカタログ
 
-opencodex には組み込みプリセットが 94 個含まれています。キー方式 78、OAuth 12、ローカル 3、
+opencodex には組み込みプリセットが 95 個含まれています。キー方式 79、OAuth 12、ローカル 3、
 デフォルト ChatGPT 転送プリセット 1 です。ダッシュボードの **Add provider** ピッカーはキー発行ページを開き、
 入力したキーを検証した後保存します(検証はプロバイダー固有です)。主な項目は以下のとおりです:
 
@@ -242,7 +259,7 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 
 大半は bearer キーと共に `openai-chat` アダプターを使い、Anthropic 互換エンドポイントのみを公開する一部
 (例: **Xiaomi MiMo**)は `anthropic` アダプター(`x-api-key`)を使います。
-Volcengine Agent Plan は `openai-responses` アダプターでネイティブ Responses エンドポイントを使用します。
+Volcengine Coding Plan と Agent Plan は `openai-responses` アダプターでネイティブ Responses エンドポイントを使用します。検証済みの Ark Coding Plan のツール継続では、前のターンが返した Responses の `reasoning` item をそのまま返すと `400 InvalidParameter` になるため、Coding Plan プリセットは継続入力を転送する前にその item を取り除きます。そのターンの reasoning 状態は失われるので、`dropResponsesReasoningItems: false` で無効にできます。すでに `openai-chat` で保存されている Coding Plan の設定は書き換えられず Chat のままです。切り替えるときは `adapter` を `openai-responses` に、`responsesPath` を `/responses` に手動で変更するか、プリセットを削除して追加し直してください。
 
 > **Volcengine の 3 つの課金経路:** `volcengine` は従量課金 Ark API、
 > `volcengine-coding-plan` は Coding Plan の割り当て、`volcengine-agent-plan` は Agent Plan

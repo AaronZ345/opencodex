@@ -12,7 +12,7 @@ runs helper features around provider requests.
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Proxy listen port. |
 | `hostname?` | `string` | `"127.0.0.1"` | Bind address. A non-loopback bind requires a data-admission token, resolved from `OPENCODEX_API_AUTH_TOKEN`, then `OCX_API_TOKEN_FILE`, then the installed owner-only `service-api-token` — nothing has to be exported by hand. See [Remote access](#remote-access). |
-| `proxy?` | `string` | — | Outbound HTTP(S) or SOCKS5 proxy URL (`socks5://host:port`), `${ENV_VAR}`, or `"auto"`. HTTP URLs apply to `HTTP_PROXY` / `HTTPS_PROXY` when those are unset. SOCKS5 URLs use OpenCodex's real SOCKS5 transport and are also exposed through `ALL_PROXY` (`ocx start --socks5`); inherited `HTTP(S)_PROXY` is cleared in this process. Loopback stays in `NO_PROXY`. `"auto"` reads the Windows system proxy (WinINET `ProxyEnable`/`ProxyServer`, `https=` then `http=` entry) once at process start and logs the host it chose. On other platforms, or when the system proxy is off, SOCKS-only, or unreadable, it uses direct egress and says so. PAC/WPAD and live proxy changes are not followed; restart the service after changing the system proxy. |
+| `proxy?` | `string` | — | Outbound HTTP(S) or SOCKS5 proxy URL (`socks5://host:port`), `${ENV_VAR}`, or `"auto"`. HTTP URLs apply to `HTTP_PROXY` / `HTTPS_PROXY` when those are unset. SOCKS5 URLs use OpenCodex's real SOCKS5 transport and are also exposed through `ALL_PROXY` (`ocx start --socks5`); inherited `HTTP(S)_PROXY` is cleared in this process. Loopback stays in `NO_PROXY`. `"auto"` reads the Windows system proxy (WinINET `ProxyEnable`/`ProxyServer`) once at process start, preserves distinct `http=` and `https=` entries, and logs the hosts it chose. A bare `ProxyServer` value applies to both schemes. On other platforms, or when the system proxy is off, SOCKS-only, or unreadable, it uses direct egress and says so. PAC/WPAD and live proxy changes are not followed; restart the service after changing the system proxy. |
 | `noProxy?` | `string \| string[]` | — | Hosts that bypass `proxy`, merged with inherited `NO_PROXY` and loopback entries. A string may use comma-separated `NO_PROXY` syntax or `${ENV_VAR}`. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Opt in to one identical Responses retry when a turn has no text or tool call, including a stream that ends before a terminal event. The retry may be billable. `OCX_EMPTY_COMPLETION_RETRY=0` disables it without changing config; combo and routed-compaction turns remain excluded. |
 | `dropCodexSafetyBuffering?` | `boolean` | `false` | Remove optional client-facing hints from canonical Codex Responses passthrough: the two `x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model` response headers, `response.metadata` events whose metadata type is `safety_buffering`, and top-level `safety_buffering` fields. Other headers, response data, policy refusals and failures are preserved. This does not disable provider safety enforcement or upstream buffering. Native `codex.response.metadata.headers` WebSocket metadata and `/responses/compact` are outside this filter. |
@@ -24,10 +24,12 @@ runs helper features around provider requests.
 | `codexNativeSteering?` | `boolean` | `false` | Experimental, native-only mid-turn steering on the Responses WebSocket endpoint. Requires `websockets: true`, a compatible upstream/client, and a pinned account/model/tool surface. Validated generation settings can change in explicit saved-result continuations. Does not enable translated models or HTTP fallback. See [native steering](/guides/codex-integration/#experimental-native-mid-turn-steering). |
 | `codexNativeInjection?` | `boolean` | `false` | Experimental saved function-result injection on compatible native multi-agent WebSocket turns. Requires `websockets: true`, explicit `multi_agent.enabled`, and an eligible provider. Separate from steering; no automatic tool rerun or recovery create. See [native injection](/guides/codex-integration/#experimental-native-function-result-injection). |
 | `corsAllowOrigins?` | `string[]` | `[]` | Additional exact origins allowed by CORS. Loopback origins are always allowed. Authority-based browser extension origins such as `chrome-extension://<extension-id>` are supported; `*` is not a wildcard. Firefox and Safari regenerate the extension UUID (per install / per browser launch), so update the entry when the origin changes. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Generated `ocx_…` credentials accepted by management and data-plane auth on non-loopback binds. Dashboard-managed. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Generated `ocx_…` data-plane admission credentials on non-loopback binds. They do not authorize management APIs; management access uses the separate credential documented in the [management reference](/reference/management-api/). Dashboard-managed. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | disabled | Opt-in archived-session cleanup policy. Never enabled implicitly. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Cap in MiB for evictable app-owned logs, caches, blobs, and continuation payloads. Range 64–4096; not an RSS cap. |
-| `spend?` | `{ root?: { maxTokens?: number }; identity?: { maxTokens?: number }; pool?: { maxTokens?: number }; retentionDays?: number }` | unset | Durable token ceilings, off unless you write one. Each scope bounds settled spend plus in-flight reservations plus unresolved spend: `root` is one task including its whole fan-out, `identity` is one account across every task it serves, and `pool` is one provider pool. They intersect, so a request is admitted only when all three have room — which is what holds a ceiling against a client that mints a new task id per request. A reservation is the request's whole input plus its enforceable output ceiling, counted as if every cached prefix misses. Spend survives a restart, so it does not roll forward the way the send-count window does; raising or removing the value is what grants more. `maxTokens` must be a positive integer (0 would refuse everything), `retentionDays` is 1–365 and defaults to 7, and an unknown key in this section is rejected rather than ignored. A refusal is a local HTTP 429 carrying `x-opencodex-local-refusal: workflow_spend_exhausted`, and its message names the scope and the ceiling; no provider is contacted. |
+| `metricsExport.enabled?` | `boolean` | `false` | Enable process-local aggregate request metrics at authenticated `GET /api/metrics`. Restart required; disabled mode returns 404 and starts no exporter activity. |
+| `spend?` | `{ root?: { maxTokens?: number }; identity?: { maxTokens?: number }; pool?: { maxTokens?: number }; retentionDays?: number }` | unset | Durable token ceilings, off unless you write one. Each scope bounds settled spend plus in-flight reservations plus unresolved spend: `root` is one task including its whole fan-out, `identity` is one account across every task it serves, and `pool` is one provider pool. They intersect, so a request is admitted only when all three have room — which is what holds a ceiling against a client that mints a new task id per request. A reservation is the request's whole input plus its enforceable output ceiling, counted as if every cached prefix misses. Observe-only mode still journals, so every server owns the state directory's single-writer lease; an explicit sibling must use a separate `OPENCODEX_HOME`. Spend survives an ordinary process restart when its writes reached the filesystem, but the journal does not promise survival across host power loss because each append is not fsynced. Raising or removing the value is what grants more. `maxTokens` must be a positive integer (0 would refuse everything), `retentionDays` is 1–365 and defaults to 7, and an unknown key in this section is rejected rather than ignored. A refusal is a local HTTP 429 carrying `x-opencodex-local-refusal: workflow_spend_exhausted`, and its message names the scope and the ceiling; no provider is contacted. |
+
 | `codexAutoStart?` | `boolean` | `true` | Let the Codex shim run `ocx ensure` before launching Codex. False makes ensure a no-op. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Restore an installed shim after a completed external Codex update replaces it. Environment opt-out: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `codexDesktopAuthless?` | `boolean` | `false` | Opt-in authless Codex Desktop routing on a loopback bind: inject the dedicated `opencodex` provider with `requires_openai_auth = false` so Desktop opens without a ChatGPT login. Ignored on non-loopback binds. `ocx system settings --desktop-authless on`. See [Codex integration](/guides/codex-integration/#authless-codex-desktop-opt-in). |
@@ -493,6 +495,68 @@ Messages admission. This setting does not add a global authorization boundary.
 Auto auth selects subscription when stored Claude auth is found, proxy when none is found, and
 subscription with a warning when detection is inconclusive. See
 [Claude Code auth mode](/guides/claude-code/#auth-mode).
+
+## Compaction routing
+
+In **Dashboard → Overview → Compaction routing**, choose a model, which triggers it applies to,
+and an optional reasoning effort, then click **Save**. Select **Use conversation model** and save
+to remove the override. Changes apply to the next compaction request without restarting the proxy.
+
+Set `compactionRouting` in OpenCodex `config.json` to override the model Codex's compaction
+requests use. The setting is disabled when omitted.
+
+```json
+{
+  "compactionRouting": {
+    "model": "provider/model-id",
+    "reasoningEffort": "low",
+    "triggers": ["manual"]
+  }
+}
+```
+
+`model` accepts native model IDs, provider-qualified model IDs, and configured combos.
+`reasoningEffort` is optional; omit it to preserve the incoming effort. Supported declarations
+are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+Existing provider effort rules still apply. The native `/responses/compact` endpoint keeps
+its existing behavior and does not forward reasoning settings.
+
+`triggers` names which compaction requests the override covers, using Codex's own
+`compaction.trigger` values: `"manual"` for a `/compact` you typed, `"auto"` for the automatic
+compaction Codex runs when a thread approaches its context limit. Omit `triggers` and the
+override applies to manual `/compact` only, leaving automatic compaction exactly where it
+routes today. Use `["auto"]` or `["manual", "auto"]` to route automatic compaction as well.
+
+Routing automatic compaction is what lets a long thread on a routed provider keep going when
+the canonical OpenAI quota is exhausted. Codex picks a bare native model for the compaction
+turn, and OpenCodex reserves that for an enabled canonical `openai` provider whenever one
+exists, so the compaction fails with a quota error before the routed turn begins even though
+the thread itself runs elsewhere. Naming `"auto"` here points the compaction at a
+provider-qualified model with its own credentials and quota.
+
+OpenCodex changes only requests with explicit `request_kind: "compaction"` metadata whose
+`compaction.trigger` is one of the values you listed, sent to `/v1/responses/compact` or to
+`/v1/responses` with a `compaction_trigger` input item. Later conversation turns keep their
+original routing and settings. Missing, malformed, or conflicting metadata does not activate the
+override, including on older clients without trigger metadata; when several copies of the
+metadata are supplied they must name the same trigger. WebSocket requests use each frame's
+metadata rather than the connection's earlier handshake metadata.
+
+The selected model's provider receives the entire conversation for summarization, including
+conversations that normally run on another provider. A combo selector sends it to every combo
+target, including failover targets. The dashboard panel states this next to the model picker
+and names the destination provider, or the combo's target providers, once a model is chosen.
+When the override covers automatic compaction, that transfer happens without you asking for it,
+at whatever point Codex decides to compact; the dashboard panel says so as well.
+The override reuses the existing compaction handlers and summary formats. When the selected
+model shares the conversation model's provider and account-routing identity (provider name,
+Codex account mode, and account namespace), the request keeps the caller's credential and may
+use that backend's native compact endpoint. Otherwise, including when either side is a combo or
+the conversation model is remembered as a combo target, OpenCodex runs the portable summarizer
+instead, so the summary stays readable when the conversation resumes on its own model, and the
+caller's credential does not cross to the other provider. The selected model must support the
+input size and content. Restart the proxy after editing
+`config.json` by hand. Dashboard saves apply immediately.
 
 ## Shadow calls
 

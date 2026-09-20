@@ -117,6 +117,20 @@ ocx logout <provider>
 
 Google Antigravity 帳戶與供應商的配額查詢（包括模型清單備援）使用固定的 Google 計量端點。這些目標支援透明 Fake-IP DNS，同時保留 TLS 驗證、重新導向拒絕與私有位址檢查。自訂 base URL 只改變模型請求，不改變配額目標；`NO_PROXY` 仍使用直連政策。
 
+### Google 工具結構描述損失診斷
+
+Google 工具宣告會依所選端點類別進行編譯。透過 `ocx debug provider on`、儀表板 Logs 開關或
+`OCX_DEBUG=1` 啟用供應商偵錯後，在省略政策或使用 `compatible` 的路徑上，相容性轉換中的結構描述損失會輸出一筆
+`[ocx:google:google-tool-schema-loss]` 記錄（可用 `ocx debug provider logs -f` 持續查看），
+其中只包含報告版本、端點類別、`lossy` 指標、有上限的不確定比較計數、帶有上限計數的固定損失類別與截斷旗標，
+絕不包含工具名稱、屬性名稱、路徑、值或結構描述文字。省略政策或使用 `compatible` 時只觀察
+轉換。在 `reject-lossy` 下，若初始編譯有損或有界比較結果不確定，會在傳送前拒絕；被拒絕的
+請求不會另外輸出損失記錄。在 `reject-lossy` 下，會移除限制的
+Vertex 或 Cloud Code Assist 修復會輸出同樣不含內容的 `google-tool-schema-repair` 記錄，並在不傳送
+修改請求的情況下回傳原始 400；省略政策或使用 `compatible` 時，會像以前一樣重播修復後的請求。
+直接 AI Studio 不執行此修復。原生輸出結構描述不屬於這兩條政策路徑。請參閱
+[偵錯命令參考](/zh-tw/reference/cli/agents/)。
+
 
 終端 Nous refresh 失敗後，執行 `ocx login nous` 重新認證。
 
@@ -225,7 +239,7 @@ database 並移除目前的 WAL、SHM 與 journal sidecar，再發布先前的 s
 
 ## 3. API 金鑰目錄
 
-opencodex 內建 94 個 preset：78 個 key-based、12 個 OAuth、3 個 local，以及 1 個預設 ChatGPT-forward
+opencodex 內建 95 個 preset：79 個 key-based、12 個 OAuth、3 個 local，以及 1 個預設 ChatGPT-forward
 preset。儀表板的 **Add provider** picker 會開啟 key provider 的 dashboard、驗證金鑰並儲存；驗證方式
 依 provider 而異。主要條目如下。
 
@@ -311,7 +325,7 @@ key，走帶 key 的 **`opencode-zen`** preset。若 OpenCode 日後公布 keyle
 跟進；在此之前，這個 preset 的作用是記錄該限制。上游條款：[opencode.ai/docs/zen](https://opencode.ai/docs/zen/)。
 
 大多數 provider 使用帶 bearer key 的 `openai-chat` adapter；少數只提供 Anthropic-compatible endpoint 的
-provider，例如 **Xiaomi MiMo**，使用 `anthropic` adapter（`x-api-key`）。Volcengine Agent Plan 透過
+provider，例如 **Xiaomi MiMo**，使用 `anthropic` adapter（`x-api-key`）。在已驗證的 Ark Coding Plan 工具 continuation 中，把上一輪 Responses 回傳的 `reasoning` item 原樣送回會得到 `400 InvalidParameter`，因此 Coding Plan preset 會在轉送 continuation input 前移除這類 item；該輪的 reasoning 狀態會因此遺失，可用 `dropResponsesReasoningItems: false` 關閉。已經以 `openai-chat` 儲存的 Coding Plan 設定不會被改寫，仍走 Chat；要切換請手動把 `adapter` 改成 `openai-responses`、`responsesPath` 設為 `/responses`，或刪除後重新加入該 preset。Volcengine Coding Plan 與 Agent Plan 透過
 `openai-responses` 使用原生 Responses endpoint。內建 DeepSeek preset 也會把 `deepseek-v4-flash` 路由到
 原生 Responses endpoint，並保持上游 SSE streaming。若該模型完成所有 output item 卻省略最後的
 Responses event，opencodex 會套用 5 秒、model-scoped 的 grace repair；malformed 或 partial stream 會以

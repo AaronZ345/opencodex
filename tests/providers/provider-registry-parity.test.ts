@@ -16,6 +16,12 @@ import {
   providerConfigSeed,
 } from "../../src/providers/derive";
 import { PROVIDER_REGISTRY, registryEntryForProviderDestination } from "../../src/providers/registry";
+import {
+  REGISTRY_FIELD_MODEL_ID_ROLES,
+  registryModelIdKeys,
+} from "../../src/providers/registry/model-ids";
+import type { ProviderRegistryEntry } from "../../src/providers/registry/types";
+import { META_MUSE_MODELS } from "../../src/providers/registry/model-seeds";
 import { FREE_PROVIDER_DIRECTORY } from "../../src/providers/free-directory";
 import { applyProviderConfigHints } from "../../src/codex/catalog";
 import { routeModel } from "../../src/router";
@@ -58,6 +64,120 @@ describe("provider registry parity", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  test("every field carried by the shipped registry has a model-id role classification", () => {
+    // This is the runtime half. The module's satisfies clause is the compile-time half, so
+    // together they catch both a new interface field and a shipped entry carrying an unclassified field.
+    const classifiedFields = new Set(Object.keys(REGISTRY_FIELD_MODEL_ID_ROLES));
+    for (const entry of PROVIDER_REGISTRY) {
+      for (const field of Object.keys(entry)) {
+        expect(classifiedFields.has(field), `${entry.id}.${field}`).toBe(true);
+      }
+    }
+  });
+
+  test("every direct model-id map is collected independently", () => {
+    const cases = [
+      ["modelWireDefaults", "openai-chat"],
+      ["modelResponsesUpstreamStreaming", false],
+      ["modelResponsesTerminalRepair", { graceMs: 25 }],
+      ["modelSupportsServiceTier", true],
+      ["modelSupportsReasoningSummaries", false],
+      ["modelSupportsVerbosity", true],
+      ["modelContextWindows", 100_000],
+      ["modelDisplayNames", "Synthetic display name"],
+      ["modelInputModalities", ["text"]],
+      ["modelMaxOutputTokens", 8_000],
+      ["modelReasoningEfforts", ["low"]],
+      ["modelDefaultReasoningEfforts", "low"],
+      ["modelReasoningEffortMap", { low: "low" }],
+      ["virtualModels", { wireModelId: "wire-target", reasoningMode: "pro" }],
+      ["modelMaxInputTokens", 90_000],
+    ] as const;
+
+    for (const [field, value] of cases) {
+      const modelId = `vendor/${field}`;
+      const entry = {
+        id: `fixture-${field}`,
+        label: `Fixture ${field}`,
+        adapter: "openai-chat",
+        baseUrl: "https://registry-model-id.fixture.example/v1",
+        authKind: "key",
+        [field]: { [modelId]: value },
+      } as ProviderRegistryEntry;
+      expect(registryModelIdKeys(entry), field).toEqual([modelId]);
+    }
+  });
+
+  test("non-model records contribute no selector identities", () => {
+    const entry = {
+      id: "fixture-non-model-records",
+      label: "Fixture non-model records",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      staticHeaders: { "x-model/header": "value" },
+      reasoningEffortMap: { "effort/label": "high" },
+      responsesItemIdRepair: {
+        message: ["message/value"],
+        reasoning: ["reasoning/value"],
+        repairMissingTerminalIds: true,
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual([]);
+  });
+
+  test("virtual models contribute selectable keys but never wire target values", () => {
+    const entry = {
+      id: "fixture-virtual-model",
+      label: "Fixture virtual model",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      virtualModels: {
+        "client/selectable": { wireModelId: "wire/target", reasoningMode: "pro" },
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual(["client/selectable"]);
+    expect(registryModelIdKeys(entry)).not.toContain("wire/target");
+  });
+
+  test("deduplication keeps registry-field order and the first occurrence", () => {
+    const entry = {
+      id: "fixture-stable-deduplication",
+      label: "Fixture stable deduplication",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      modelWireDefaults: {
+        "first/model": "openai-chat",
+        "shared/model": "openai-chat",
+      },
+      modelResponsesUpstreamStreaming: {
+        "shared/model": false,
+        "second/model": false,
+      },
+      modelContextWindows: {
+        "third/model": 100_000,
+        "shared/model": 100_000,
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual([
+      "first/model",
+      "shared/model",
+      "second/model",
+      "third/model",
+    ]);
+  });
+
+  test("a shipped entry's ids are recovered from its classified maps, not its models list", () => {
+    const metaMuse = PROVIDER_REGISTRY.find(entry => entry.id === "meta-muse")!;
+    // meta-muse declares these ids in BOTH its models list and its context-window, modality and
+    // effort maps. The helper never reads models, so recovering them here is evidence the maps
+    // were read. Compared against the seed the entry is built from rather than a copied literal,
+    // so adding a Muse model does not fail this case for the wrong reason.
+    expect(registryModelIdKeys(metaMuse)).toEqual([...META_MUSE_MODELS]);
+  });
+
   test("key-login export is derived from the registry", () => {
     expect(KEY_LOGIN_PROVIDERS).toEqual(deriveKeyLoginMap());
     expect(Object.keys(KEY_LOGIN_PROVIDERS)).toEqual(EXPECTED_KEY_PROVIDER_IDS);
@@ -71,15 +191,20 @@ describe("provider registry parity", () => {
       escapeBuiltinToolNames: true,
     });
     expect(KEY_LOGIN_PROVIDERS.umans.noVisionModels).toContain("umans-glm-5.2");
-    // Zen Go text-only models are vision-sidecar covered; Kimi K2.7 Code is multimodal and must NOT be listed.
+    // Zen Go text-only models are vision-sidecar covered; Kimi K2.7 Code is multimodal and must NOT
+    // be listed. deepseek-v4.1-flash was removed on 2026-09-19 after it was probed natively
+    // multimodal on this gateway; its sibling deepseek-v4-flash still rejects image_url upstream.
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).toEqual([
       "glm-5.3",
       "glm-5.2", "glm-5", "glm-5.1",
-      "deepseek-v4.1-flash", "deepseek-v4-flash",
+      "deepseek-v4-flash",
       "mimo-v2-pro", "mimo-v2.5-pro",
       "minimax-m2.5", "minimax-m2.7",
       "qwen3.7-max",
     ]);
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).not.toContain("deepseek-v4.1-flash");
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].modelInputModalities?.["deepseek-v4.1-flash"])
+      .toEqual(["text", "image"]);
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).not.toContain("kimi-k2.7-code");
     // #1338 / #1415: the Zen gateway rejects json_schema on its DeepSeek routes. The three
     // presets that share that gateway carry the narrow opt-out as a registry-only seed, so
@@ -120,7 +245,11 @@ describe("provider registry parity", () => {
 
     const zenGo = PROVIDER_REGISTRY.find(entry => entry.id === "opencode-go");
     expect(zenGo?.preserveReasoningContentModels).toContain("deepseek-v4.1-flash");
-    expect(zenGo?.noVisionModels).toContain("deepseek-v4.1-flash");
+    // Reclassified 2026-09-19: this route reads images natively on the Zen Go gateway, so it left
+    // the sidecar list and gained a positive image declaration. Its sibling stays behind.
+    expect(zenGo?.noVisionModels).not.toContain("deepseek-v4.1-flash");
+    expect(zenGo?.noVisionModels).toContain("deepseek-v4-flash");
+    expect(zenGo?.modelInputModalities?.["deepseek-v4.1-flash"]).toEqual(["text", "image"]);
     expect(Object.keys(zenGo?.modelReasoningEfforts ?? {})).toContain("deepseek-v4.1-flash");
     expect(zenGo?.modelContextWindows?.["deepseek-v4.1-flash"]).toBe(1_048_576);
 
@@ -477,11 +606,15 @@ describe("provider registry parity", () => {
     for (const model of ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]) {
       expect(isModelVisionSidecarConsumer(provider, model)).toBe(true);
     }
-    for (const id of ["opencode-go", "opencode-zen"]) {
-      const gateway = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === id)!);
-      expect(isModelVisionSidecarConsumer(gateway, "deepseek-v4.1-flash")).toBe(true);
-      expect(isModelVisionSidecarConsumer(gateway, "deepseek-v4-flash")).toBe(true);
-    }
+    // Only the Go tier was probed (2026-09-19) and only for deepseek-v4.1-flash. The sibling
+    // id on the same tier still rejects image_url, and the Zen tiers could not be measured at
+    // all (HTTP 402), so an unverified tier keeps its existing classification.
+    const goGateway = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-go")!);
+    expect(isModelVisionSidecarConsumer(goGateway, "deepseek-v4.1-flash")).toBe(false);
+    expect(isModelVisionSidecarConsumer(goGateway, "deepseek-v4-flash")).toBe(true);
+    const zenGateway = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-zen")!);
+    expect(isModelVisionSidecarConsumer(zenGateway, "deepseek-v4.1-flash")).toBe(true);
+    expect(isModelVisionSidecarConsumer(zenGateway, "deepseek-v4-flash")).toBe(true);
     const free = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-free")!);
     expect(isModelVisionSidecarConsumer(free, "deepseek-v4-flash-free")).toBe(true);
     // Saved providers without explicit modality overrides inherit the fix during routing.
