@@ -251,6 +251,9 @@ function contentPartToText(part: OcxContentPart | OcxAssistantContentPart): stri
   switch (part.type) {
     case "text":
       return part.text;
+    case "document":
+      // Cursor has no document carrier; the marker keeps the turn from serializing to nothing.
+      return part.text;
     case "thinking":
       return part.thinking;
     case "image":

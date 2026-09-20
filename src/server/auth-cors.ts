@@ -1024,6 +1024,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   pinParallelToolCallsFalse: "editor",
   terminalContinuationGuard: "editor",
   openaiChatEofTolerance: "editor",
+  foldDeveloperRoleToSystem: "editor",
   promptCacheKey: "editor",
   chatServiceTier: "editor",
   responsesItemIdRepair: "editor",

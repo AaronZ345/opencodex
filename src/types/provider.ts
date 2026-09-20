@@ -817,6 +817,19 @@ export interface OcxProviderConfig {
    */
   openaiChatEofTolerance?: boolean;
   /**
+   * Opt-in: fold a `developer` message into a `system` message instead of forwarding the role.
+   *
+   * `developer` is part of the Chat Completions message role set, so forwarding it is the
+   * default. The role used to be decided by testing the base URL host against
+   * `api.openai.com`, which assumed every OpenAI-compatible gateway rejects a standard role
+   * until proven otherwise — including gateways that proxy OpenAI itself — and quietly gave the
+   * instruction `system` precedence instead (#5213). This flag exists for a destination that
+   * genuinely rejects the role, so the conversion is a recorded decision about that destination
+   * rather than an inference from its hostname. Position is unaffected either way: the message
+   * keeps its slot in the conversation.
+   */
+  foldDeveloperRoleToSystem?: boolean;
+  /**
    * Opt-in: forward `prompt_cache_key` to the upstream `/chat/completions` body.
    * OpenAI-specific extension; strict backends (Groq, Cerebras, etc.) reject unknown
    * fields. Default off; only enable for providers that document this parameter.
