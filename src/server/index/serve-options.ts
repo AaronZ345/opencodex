@@ -1270,7 +1270,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         };
         const endpoint = url.pathname.endsWith("/edits") ? "edits" as const : "generations" as const;
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
-          const response = await handleImages(req, config, endpoint, logCtx, turnAdmissionLease);
+          const response = await handleImages(req, config, endpoint, logCtx, turnAdmissionLease, admission);
           addFinalRequestLog(requestId, start, logCtx, response.status, response.status === 499 ? { closeReason: "client_cancel" } : undefined);
           return withCors(response, req, policy);
         }, { requestId, start, logCtx });
@@ -1558,7 +1558,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
           const response = audioClient
             ? await handleExternalLive(req, config, logCtx, { client: audioClient, lease: turnAdmissionLease, bindings: liveCallBindings })
-            : await handleLive(req, config, logCtx, turnAdmissionLease);
+            : await handleLive(req, config, logCtx, turnAdmissionLease, admission);
           addFinalRequestLog(
             requestId,
             start,
@@ -1633,7 +1633,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             : liveSidebandTarget && audioClient
               ? await resolveExternalLiveSocket(audioClient, config, logCtx, liveSidebandTarget, { lease: turnAdmissionLease, bindings: liveCallBindings, signal: acquisition?.signal })
               : liveSidebandTarget
-                ? await resolveLiveSidebandUpgrade(req, config, logCtx, liveSidebandTarget, turnAdmissionLease)
+                ? await resolveLiveSidebandUpgrade(req, config, logCtx, liveSidebandTarget, turnAdmissionLease, admission)
                 : formatErrorResponse(401, "authentication_error", "opencodex API key required");
         } catch (error) {
           try { releaseAcquisition(); }
