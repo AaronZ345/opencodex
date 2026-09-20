@@ -15,6 +15,7 @@ import { DataSurfaceSkeleton } from "../components/data-surface";
 import { SectionTabs } from "../components/section-tabs";
 import { sectionAnchorId } from "../section-anchors";
 import { parseUsageTimeRange, type UsageRangeError, type UsageTimeWindow } from "../usage-time-range";
+import UsageCompanionPanel from "./usage-companion-panel";
 
 type Range = "all" | "30d" | "7d";
 type UsageSurface = "all" | "codex" | "claude" | "grok";
@@ -906,6 +907,7 @@ function UsageWorkspaceBody({
   range,
   locale,
   t,
+  apiBase,
 }: {
   data: UsageResponse | null;
   heatmap: ReturnType<typeof buildHeatmap>;
@@ -918,8 +920,10 @@ function UsageWorkspaceBody({
   range: Range | null;
   locale: Locale;
   t: TFn;
+  apiBase: string;
 }) {
   const empty = !!data && data.summary.requests === 0;
+  const [companionMetric, setCompanionMetric] = useState<string | null>(null);
   const sections = [
     {
       id: "overview",
@@ -953,6 +957,20 @@ function UsageWorkspaceBody({
       label: t("usage.section.coverage"),
       meta: data ? formatPct(data.summary.coverageRatio) : "—",
       body: data ? <UsageCoveragePanel summary={data.summary} t={t} workspace /> : null,
+    },
+    {
+      id: "companion",
+      label: t("usage.section.companion"),
+      meta: companionMetric
+        ? t(`usage.companion.menu${companionMetric[0]!.toUpperCase()}${companionMetric.slice(1)}` as never)
+        : "—",
+      body: (
+        <UsageCompanionPanel
+          apiBase={apiBase}
+          providers={data?.providers ?? []}
+          onSettingsLoaded={setCompanionMetric}
+        />
+      ),
     },
   ];
   return (
@@ -1224,6 +1242,7 @@ export default function Usage({ apiBase, connected = false, apiKeyId }: { apiBas
             range={customWindow ? null : range}
             locale={locale}
             t={t}
+            apiBase={apiBase}
           />
         </>
       )}
