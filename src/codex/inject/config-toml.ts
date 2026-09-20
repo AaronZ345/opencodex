@@ -609,3 +609,32 @@ export function chooseCatalogPathForInjection(
 
   return existsSync(DEFAULT_CATALOG_PATH) ? DEFAULT_CATALOG_PATH : null;
 }
+
+/**
+ * The effective `model_catalog_json` is one of ours and the file is gone.
+ *
+ * Codex does not degrade on this: a catalog path it cannot read stops it loading its
+ * configuration at all, which looks exactly like the routing lockout in #5261 and is what the
+ * reporter's machine was left in after the catalog file was deleted by hand.
+ *
+ * Injection already repairs it — the chooser refuses a missing owned path and the caller strips
+ * the stale line. That only helps someone who runs opencodex again, and the whole difficulty of
+ * this state is that Codex is the thing that stopped working, so nothing prompts them to. This
+ * predicate exists so the CLI can say it out loud.
+ *
+ * A user-owned catalog assignment wins here exactly as it does during injection: if they named
+ * the file, its absence is theirs to explain, and we do not claim it.
+ *
+ * Ownership is decided by basename, which is a weak test — a file the user happens to name
+ * `opencodex-catalog.json` is read as ours wherever it sits. That is deliberate rather than
+ * overlooked: it is the same test injection already applies, and a detector that drew the line
+ * somewhere else would report a state injection would then treat differently. Tightening it is a
+ * change to injection, not to this.
+ */
+export function missingOwnedCatalogPath(content: string): string | null {
+  const existing = readRootModelCatalogPath(content);
+  if (!existing) return null;
+  const resolved = resolveCodexConfigPath(existing);
+  if (!isOpencodexCatalogPath(resolved)) return null;
+  return existsSync(resolved) ? null : existing;
+}

@@ -63,7 +63,7 @@ import {
   pendingTeardownsAreExactly,
   quarantinePendingTeardown,
 } from "../config/pending-teardown";
-import { collectStatus, deadProxyRoutingAdviceLines, hubStatusLines, remoteHubBannerLine, remoteHubStatusLines, unusedProxyWarningLines } from "./status";
+import { collectStatus, deadProxyRoutingAdviceLines, detectMissingCodexCatalogPath, hubStatusLines, missingCodexCatalogLines, remoteHubBannerLine, remoteHubStatusLines, unusedProxyWarningLines } from "./status";
 import { endpointsToProve, everyEndpointProvenDown, sharedTeardownAuthorized, type UninstallObservation } from "./uninstall-plan";
 import { takeFlag } from "./runtime-api";
 import { parseStartOptions, StartArgsError } from "./start-args";
@@ -1614,6 +1614,12 @@ async function handleStatus() {
   console.log(`   Codex autostart: ${status.json.codexAutostart ? "enabled" : "disabled"}${local}`);
   console.log(`   Restart safety: ${startupHealthSummary(status.json.startup)}${local}`);
   console.log(`   ${formatStartupRoutingDetail(status.json.startup)}${local}`);
+  // Independent of whether the proxy is up: a catalog pointer whose file is gone stops Codex
+  // loading its config at all, and presents as the same blank wall as dead routing (#5261).
+  // Tagged `(local)` on its header like every other local-state line, so a connected client
+  // cannot read a finding about its own Codex home as something the hub reported.
+  missingCodexCatalogLines(detectMissingCodexCatalogPath())
+    .forEach((line, index) => console.log(`   ${line}${index === 0 ? local : ""}`));
   if (status.json.startup.routingKind === "native") {
     let retainedProviderTable = false;
     try {
