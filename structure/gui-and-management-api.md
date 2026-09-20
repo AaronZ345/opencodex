@@ -638,6 +638,16 @@ once it exceeds 200) with the upstream content-type, body kind (`sse / json / ot
 body sample, and the extracted usage. Off by default; the hot path is guarded so production stays
 untouched.
 
+For diagnosing cache-read instability without capturing content, set `OPENCODEX_CACHE_DEBUG=1`
+before start. `src/usage/cache-diagnostic.ts` then writes one record per finalized request to
+`~/.opencodex/cache-debug.jsonl` (same `0o600` file, same 200-to-100 rolling bound) holding only
+presence booleans, counts, closed enums, the raw upstream cache counter before defaulting, and
+process-local HMAC equality tags for the prompt-cache key, allowlisted session headers, the account
+log label, and ordered instruction/tool/message blocks (capped at 128 per section, first divergent
+section/index only). The signing key is created at process start and never persisted, so tags
+compare values within one proxy process and never become a durable correlation key; no prompt
+text, tool name, raw identifier, or header value is recorded. Off by default.
+
 ## Z.ai quota destination ownership
 
 `src/providers/quota/vendor-probes-key.ts` uses one exact normalized-base mapping for both Z.ai quota

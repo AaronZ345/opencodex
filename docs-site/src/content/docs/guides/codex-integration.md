@@ -720,6 +720,22 @@ See [The parser and bridge](/reference/architecture/#the-parser) for the explici
 There is no provider-level setting that can add a missing `tool_search` declaration; ordinary
 code-mode discovery remains a separate path.
 
+### Cache-read diagnostics
+
+Set `OPENCODEX_CACHE_DEBUG=1` before starting the proxy to write one diagnostic record per
+finalized request to `<config-dir>/cache-debug.jsonl`. The switch is off by default; set it to `0`
+or remove it to disable capture. The file is owner-only (`0600`) in the hardened config directory
+and rolls after 200 lines, retaining the newest 100.
+
+Each JSONL record contains the protocol, routed provider/model, cache-counter presence and
+provenance, process-local equality tags for the account, prompt-cache key, and allowlisted session
+headers, plus ordered fingerprints for instructions, tools, and message/input blocks. Prefix
+sections retain at most 128 tags and identify only the first divergent section/index. The
+diagnostic never stores prompt or message text, tool names, raw headers, raw cache/session/account
+identifiers, or a durable tag derived from them. Its random HMAC key is created at process start,
+separate from other debug keys, and is never persisted; tags therefore compare values only within
+one proxy process.
+
 ### Catalog troubleshooting
 
 If a model is missing from Codex, or the catalog order/visibility looks wrong, check in order:
