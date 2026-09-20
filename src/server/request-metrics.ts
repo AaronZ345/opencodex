@@ -1,13 +1,26 @@
 import type { ResponsesTerminalStatus } from "../bridge";
 import type { AttemptRecoveryKind } from "../usage/log";
+import { type RequestFailureCause, causeForRecoveryKind } from "../lib/request-failure-model";
 
 export const REQUEST_METRICS_PROTOCOLS = Object.freeze(["responses", "chat", "messages", "unknown"] as const);
 export const REQUEST_METRICS_RESULTS = Object.freeze(["completed", "failed", "incomplete", "aborted"] as const);
+/**
+ * Closed recovery classes exported as Prometheus label values.
+ *
+ * Bounded by construction: the label can only ever take one of these strings, so no user, model,
+ * account or request identifier can reach a series name. `quota`, `policy` and `ciphertext` are
+ * separate members because an operator seeing a spike needs to know which one it is -- waiting
+ * out a rate limit, changing accounts, changing the prompt and dropping stale ciphertext are
+ * four different responses, and collapsing them is what made the existing counter unactionable.
+ */
 export const REQUEST_METRICS_RECOVERY_CLASSES = Object.freeze([
   "transient",
   "connection",
   "credential",
   "rate_limit",
+  "quota",
+  "policy",
+  "ciphertext",
   "payload",
   "empty_completion",
   "effort_downgrade",
@@ -83,23 +96,34 @@ function classifyResult(fact: RequestMetricFinalFact): RequestMetricsResult {
   return "failed";
 }
 
+/**
+ * Metrics class for each shared failure cause.
+ *
+ * Keyed on the cause rather than on the recovery kind so this projection and the durable log
+ * speak one vocabulary. Total by construction: the previous switch ended in `default: "other"`,
+ * which meant a recovery kind added later compiled cleanly and then disappeared into an
+ * unactionable bucket. A missing member is now a typecheck failure.
+ */
+const CAUSE_METRICS_CLASS = {
+  "transport-unsent": "connection",
+  "transport-ambiguous": "connection",
+  "upstream-declined": "transient",
+  "rate-limit": "rate_limit",
+  "quota-exhausted": "quota",
+  "credential-rejected": "credential",
+  "policy-refusal": "policy",
+  "parameter-rejected": "effort_downgrade",
+  "ciphertext-refusal": "ciphertext",
+  "payload-too-large": "payload",
+  "payload-rejected": "payload",
+  "upstream-fault": "transient",
+  "empty-output": "empty_completion",
+  "client-cancelled": "other",
+  "local-refusal": "other",
+} as const satisfies Record<RequestFailureCause, RequestMetricsRecoveryClass>;
+
 function recoveryClass(kind: AttemptRecoveryKind): RequestMetricsRecoveryClass {
-  switch (kind) {
-    case "transient-5xx": return "transient";
-    case "connection-reset": return "connection";
-    case "oauth-401":
-    case "key-401": return "credential";
-    case "key-429":
-    case "rate-limit-429":
-    case "anthropic-oauth-429":
-    case "oauth-account-429": return "rate_limit";
-    case "image-413":
-    case "console-go-upload-retry":
-    case "opaque-blob-rejection": return "payload";
-    case "empty-completion": return "empty_completion";
-    case "reasoning-effort-downgrade": return "effort_downgrade";
-    default: return "other";
-  }
+  return CAUSE_METRICS_CLASS[causeForRecoveryKind(kind)];
 }
 
 function observeHistogram(cell: HistogramCell, bounds: readonly number[], value: number): void {

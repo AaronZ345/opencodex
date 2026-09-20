@@ -61,21 +61,30 @@ export function isCodexPoolAccountLogLabel(value: unknown): value is "main" | `p
 /**
  * Recovery kinds recorded per attempt in the usage log; the GUI renders localized labels
  * for these wire values.
+ *
+ * The roster is the single statement of this vocabulary and the type is derived from it. It used
+ * to be written twice -- once as a union here, once as the read-back whitelist below -- and the
+ * two are not interchangeable: a member added only to the union is accepted by the compiler,
+ * written to disk, and then silently dropped by `normalizedAttempt`, so the row loses its reason
+ * on the next read. One declaration cannot drift from itself.
  */
-export type AttemptRecoveryKind =
-  | "transient-5xx"
-  | "connection-reset"
-  | "oauth-401"
-  | "key-401"
-  | "key-429"
-  | "rate-limit-429"
-  | "anthropic-oauth-429"
-  | "oauth-account-429"
-  | "image-413"
-  | "console-go-upload-retry"
-  | "opaque-blob-rejection"
-  | "empty-completion"
-  | "reasoning-effort-downgrade";
+export const ATTEMPT_RECOVERY_KIND_ROSTER = Object.freeze([
+  "transient-5xx",
+  "connection-reset",
+  "oauth-401",
+  "key-401",
+  "key-429",
+  "rate-limit-429",
+  "anthropic-oauth-429",
+  "oauth-account-429",
+  "image-413",
+  "console-go-upload-retry",
+  "opaque-blob-rejection",
+  "empty-completion",
+  "reasoning-effort-downgrade",
+] as const);
+
+export type AttemptRecoveryKind = typeof ATTEMPT_RECOVERY_KIND_ROSTER[number];
 
 /**
  * Why a recovery this request was otherwise willing to make did not happen.
@@ -92,10 +101,15 @@ export type AttemptRecoveryKind =
  *
  * Bounded vocabulary on purpose: it is a wire value a maintainer reads, never a credential, an
  * account id, an upstream body, prompt content, or exception text.
+ *
+ * Declared as a roster for the same reason as {@link ATTEMPT_RECOVERY_KIND_ROSTER}.
  */
-export type AttemptRecoveryWithheld =
-  | "retry-send-budget"
-  | "rotation-send-budget";
+export const ATTEMPT_RECOVERY_WITHHELD_ROSTER = Object.freeze([
+  "retry-send-budget",
+  "rotation-send-budget",
+] as const);
+
+export type AttemptRecoveryWithheld = typeof ATTEMPT_RECOVERY_WITHHELD_ROSTER[number];
 
 /** Request-time upstream credential class, never a credential or account identifier. */
 export type UsageCredentialSource = "grok-oauth" | "xai-api-key";
@@ -497,25 +511,8 @@ function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined 
   };
 }
 
-const ATTEMPT_RECOVERY_KINDS = new Set<AttemptRecoveryKind>([
-  "transient-5xx",
-  "connection-reset",
-  "oauth-401",
-  "key-401",
-  "key-429",
-  "rate-limit-429",
-  "anthropic-oauth-429",
-  "oauth-account-429",
-  "image-413",
-  "console-go-upload-retry",
-  "opaque-blob-rejection",
-  "empty-completion",
-  "reasoning-effort-downgrade",
-]);
-const ATTEMPT_RECOVERY_WITHHELD = new Set<AttemptRecoveryWithheld>([
-  "retry-send-budget",
-  "rotation-send-budget",
-]);
+const ATTEMPT_RECOVERY_KINDS: ReadonlySet<AttemptRecoveryKind> = new Set(ATTEMPT_RECOVERY_KIND_ROSTER);
+const ATTEMPT_RECOVERY_WITHHELD: ReadonlySet<AttemptRecoveryWithheld> = new Set(ATTEMPT_RECOVERY_WITHHELD_ROSTER);
 const USAGE_STATUSES = new Set<UsageStatus>([
   "reported",
   "unreported",

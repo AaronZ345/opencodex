@@ -620,7 +620,10 @@ log scan, or persistence. Restart creates a fresh owner, resets every counter/hi
 `opencodex_metrics_process_start_time_seconds`.
 
 The label vocabularies are closed: protocol is `responses`, `chat`, `messages`, or `unknown`; result
-is `completed`, `failed`, `incomplete`, or `aborted`; recovery is one of eight coarse classes. A
+is `completed`, `failed`, `incomplete`, or `aborted`; recovery is one of the coarse classes listed in
+`REQUEST_METRICS_RECOVERY_CLASSES`, which is the roster the exporter itself iterates. The count is
+deliberately not restated here: it was written as eight, a bounded label value was added, and the
+documentation then contradicted the output it describes. A
 logical request increments once, physical sends sum the finalized attempt counts, and each distinct
 recovery kind already retained on an attempt contributes once to its coarse class. HTTP 200 never
 overrides a failed terminal event. Duration observes every valid finalized duration; TTFT observes
