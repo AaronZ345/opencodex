@@ -206,7 +206,10 @@ export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps =
       const args = [...rest];
       const wantsJson = takeFlag(args, "--json");
       const yes = takeFlag(args, "--yes");
-      if (!yes) throw new CliUsageError("system codex-restart requires --yes: this fully quits and relaunches the Codex desktop app and restarts its app-servers", USAGE);
+      if (!yes) throw new CliUsageError(
+        "system codex-restart requires --yes: this fully quits and relaunches the Codex desktop app, so unsaved composer drafts, model-picker selections, and pending approval prompts may be lost; it also restarts the app-servers",
+        USAGE,
+      );
       rejectArgs(args, USAGE);
       printData(await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps), wantsJson, ["Codex desktop app and app-server restart requested."]);
     } else if (sub === "update") await update(rest, deps);

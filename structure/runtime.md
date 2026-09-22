@@ -62,7 +62,7 @@ Catalog-derived reasoning-level diagnostics are escaped only at the human-output
 
 ## CLI Codex restart scope
 
-`ocx system codex-restart` requests a full Codex desktop-app restart and app-server restarts through the management endpoint. `src/cli/capabilities.ts` names that scope in its summary and `--yes` description; `src/cli/system-command.ts` explains the desktop interruption when confirmation is missing and sends no restart request. Human output says the restart was requested, while `--json` preserves the complete server result, including skipped or refused desktop outcomes.
+`ocx system codex-restart` requests a full Codex desktop-app restart and app-server restarts through the management endpoint. `src/cli/capabilities.ts` names that scope and warns that unsaved composer drafts, model-picker selections, and pending approval prompts may be discarded. `src/cli/system-command.ts` repeats that concrete state-loss warning when confirmation is missing and sends no restart request. Human output says the restart was requested, while `--json` preserves the complete server result, including skipped or refused desktop outcomes.
 
 After a CLI catalog/cache write, advisory restart guidance compares each running Codex app-server's
 start time with the written catalog mtime. It reports only processes proven stale; a fresh or
