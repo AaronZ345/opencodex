@@ -858,6 +858,74 @@ describe("server combo failover 030 activation matrix", () => {
     }
   });
 
+  test("zero-output undeclared adapter tool call hops to the next combo target", async () => {
+    const hits: string[] = [];
+    const toolCatalogs: string[] = [];
+    customRunTurn = async (parsed, _incoming, emit) => {
+      hits.push(parsed.modelId);
+      toolCatalogs.push(JSON.stringify((parsed._rawBody as { tools?: unknown }).tools));
+      if (parsed.modelId === "m1") {
+        emit({ type: "tool_call_start", id: "call_stale", name: "stale_tool" });
+        emit({ type: "tool_call_delta", arguments: "{}" });
+        emit({ type: "tool_call_end" });
+        emit({ type: "done" });
+        return;
+      }
+      emit({ type: "text_delta", text: "tool-safe backup" });
+      emit({ type: "done" });
+    };
+    const config = comboConfig({
+      a: provider("test-run-turn", "https://a.test/v1", "key-a"),
+      b: provider("test-run-turn", "https://b.test/v1", "key-b"),
+    });
+
+    const response = await postLogged(config, {
+      stream: true,
+      tools: [{ type: "function", name: "current_tool", parameters: { type: "object" } }],
+    });
+    expect(response.status).toBe(200);
+    const body = JSON.stringify(await collectSse(response));
+    expect(body).toContain("tool-safe backup");
+    expect(body).not.toContain("stale_tool");
+    expect(hits).toEqual(["m1", "m2"]);
+    expect(toolCatalogs).toEqual([
+      '[{"type":"function","name":"current_tool","parameters":{"type":"object"}}]',
+      '[{"type":"function","name":"current_tool","parameters":{"type":"object"}}]',
+    ]);
+  });
+
+  test("undeclared adapter tool call after output never replays on backup", async () => {
+    const hits: string[] = [];
+    customRunTurn = async (parsed, _incoming, emit) => {
+      hits.push(parsed.modelId);
+      if (parsed.modelId === "m1") {
+        emit({ type: "text_delta", text: "already visible" });
+        emit({ type: "tool_call_start", id: "call_stale", name: "stale_tool" });
+        emit({ type: "tool_call_delta", arguments: "{}" });
+        emit({ type: "tool_call_end" });
+        emit({ type: "done" });
+        return;
+      }
+      emit({ type: "text_delta", text: "must not replay" });
+      emit({ type: "done" });
+    };
+    const config = comboConfig({
+      a: provider("test-run-turn", "https://a.test/v1", "key-a"),
+      b: provider("test-run-turn", "https://b.test/v1", "key-b"),
+    });
+
+    const response = await post(config, {
+      stream: true,
+      tools: [{ type: "function", name: "current_tool", parameters: { type: "object" } }],
+    });
+    expect(response.status).toBe(200);
+    const frames = await collectSse(response);
+    expect(JSON.stringify(frames)).toContain("already visible");
+    expect(JSON.stringify(frames)).not.toContain("must not replay");
+    expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
+    expect(hits).toEqual(["m1"]);
+  });
+
   for (const scenario of [
     {
       name: "quota incomplete", status: "incomplete", logStatus: 429,
