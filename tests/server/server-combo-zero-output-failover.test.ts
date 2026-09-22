@@ -186,4 +186,77 @@ describe("combo zero-output bare Responses error failover", () => {
       ],
     });
   });
+
+  test("undeclared first adapter tool call hops without changing the request catalog", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const upstream = (content: string) => serve(async request => {
+      requests.push(await request.json() as Record<string, unknown>);
+      return new Response([
+        `data: ${JSON.stringify({ choices: [{ delta: JSON.parse(content) }] })}`,
+        "data: [DONE]",
+        "",
+      ].join("\n"), { headers: { "content-type": "text/event-stream" } });
+    });
+    const a = upstream(JSON.stringify({
+      tool_calls: [{ index: 0, id: "call_stale", function: { name: "stale_tool", arguments: "{}" } }],
+    }));
+    const b = upstream(JSON.stringify({ content: "tool-safe backup" }));
+    const config = comboConfig({
+      a: provider("openai-chat", baseUrl(a), "key-a"),
+      b: provider("openai-chat", baseUrl(b), "key-b"),
+    });
+    const tools = [{ type: "function", name: "current_tool", parameters: { type: "object" } }];
+
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "combo/free", input: "hello", stream: true, tools }),
+    }), config, { model: "", provider: "" });
+    const body = await response.text();
+    expect(body).toContain("tool-safe backup");
+    expect(body).not.toContain("stale_tool");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.tools).toEqual(requests[1]?.tools);
+    expect(JSON.stringify(requests[0]?.tools)).toContain("current_tool");
+  });
+
+  test("undeclared adapter tool call after text never replays on backup", async () => {
+    const hits: string[] = [];
+    const a = serve(() => {
+      hits.push("a");
+      return new Response([
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "already visible" } }] })}`,
+        `data: ${JSON.stringify({ choices: [{ delta: {
+          tool_calls: [{ index: 0, id: "call_stale", function: { name: "stale_tool", arguments: "{}" } }],
+        } }] })}`,
+        "data: [DONE]",
+        "",
+      ].join("\n"), { headers: { "content-type": "text/event-stream" } });
+    });
+    const b = serve(() => {
+      hits.push("b");
+      return new Response("data: [DONE]\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    const config = comboConfig({
+      a: provider("openai-chat", baseUrl(a), "key-a"),
+      b: provider("openai-chat", baseUrl(b), "key-b"),
+    });
+
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "combo/free",
+        input: "hello",
+        stream: true,
+        tools: [{ type: "function", name: "current_tool", parameters: { type: "object" } }],
+      }),
+    }), config, { model: "", provider: "" });
+    const body = await response.text();
+    expect(body).toContain("already visible");
+    expect(body).toContain("response.failed");
+    expect(hits).toEqual(["a"]);
+  });
 });
