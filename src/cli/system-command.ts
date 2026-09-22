@@ -202,7 +202,7 @@ export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps =
       printData(await runtimeRequest("/api/system/codex-app-server", {}, deps), wantsJson);
     } else if (sub === "codex-restart") {
       // --yes required: this fully quits and relaunches the user's Codex desktop app as well as
-      // restarting app-servers; an agent guessing a subcommand must not interrupt that session.
+      // restarting app-servers, which can discard unsaved drafts, selections, and approval prompts.
       const args = [...rest];
       const wantsJson = takeFlag(args, "--json");
       const yes = takeFlag(args, "--yes");
@@ -211,7 +211,11 @@ export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps =
         USAGE,
       );
       rejectArgs(args, USAGE);
-      printData(await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps), wantsJson, ["Codex desktop app and app-server restart requested."]);
+      printData(
+        await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps),
+        wantsJson,
+        ["Codex desktop app and app-server restart requested. Unsaved composer drafts, model-picker selections, and pending approval prompts may be lost."],
+      );
     } else if (sub === "update") await update(rest, deps);
     else throw new CliUsageError(`unknown system command ${sub}`, USAGE);
   });

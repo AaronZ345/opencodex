@@ -51,6 +51,9 @@ describe("ocx system codex-restart confirmation", () => {
       else {
         expect(text).toContain("Codex desktop app");
         expect(text).toContain("restart requested.");
+        expect(text).toContain("Unsaved composer drafts");
+        expect(text).toContain("model-picker selections");
+        expect(text).toContain("pending approval prompts");
         expect(text).not.toContain("restarted");
       }
     } finally { output.mockRestore(); }
