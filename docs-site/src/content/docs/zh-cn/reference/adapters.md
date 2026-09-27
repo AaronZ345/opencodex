@@ -133,6 +133,7 @@ interface ProviderAdapter {
 token。
 
 - 构建 Kiro `conversationState`，映射 Codex 工具和工具结果，并发送 Kiro wire 支持的 image block。
+- 内联图片的 data URL 缺少逗号或图片字节时，会省略该图片，并在对应用户消息或工具结果中留下文字标记；远端图片引用使用另一种标记，两者都不会回显 URL。
 - 解码 `application/vnd.amazon.eventstream`，重建 text/thinking/tool event，检测被截断的工具
   JSON。上游不返回 token 数量，因此 usage 采用估算值。
 - 经 `fetchResponse` 负责有界重试和分类/脱敏后的错误；非流式 parser 会排空同一 event stream，
