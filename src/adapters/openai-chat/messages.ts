@@ -346,10 +346,10 @@ export function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProv
             type: "function",
             function: { name: namespacedToolName(tc.namespace, tc.name), arguments: JSON.stringify(tc.arguments) },
           }));
-          if (!chatMsg.content) chatMsg.content = emptyAssistantContent(provider);
+          if (!chatMsg.content) chatMsg.content = emptyAssistantContent(provider, parsed.modelId);
         }
         if (hasReplayedReasoning && chatMsg.content === undefined && chatMsg.tool_calls === undefined) {
-          chatMsg.content = emptyAssistantContent(provider);
+          chatMsg.content = emptyAssistantContent(provider, parsed.modelId);
         }
         out.push(chatMsg);
         pendingToolCalls = wireToolCalls.map(({ tc, id }) => ({ id, name: namespacedToolName(tc.namespace, tc.name) }));
@@ -403,7 +403,7 @@ export function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProv
               : { reasoning_content: orphanReasoning };
           out.push({
             role: "assistant",
-            content: emptyAssistantContent(provider),
+            content: emptyAssistantContent(provider, parsed.modelId),
             ...orphanReasoningFields,
             tool_calls: [{
               id: toolCallId,
@@ -438,8 +438,10 @@ export function safeToolName(name: string | undefined): string {
   return sanitized;
 }
 
-export function emptyAssistantContent(provider: OcxProviderConfig): string | { type: "text"; text: string }[] {
-  return isVolcengineArkPaygChatTarget(provider) ? [{ type: "text", text: "" }] : "";
+export function emptyAssistantContent(provider: OcxProviderConfig, modelId = ""): string | { type: "text"; text: string }[] {
+  // Kimi K3.1 Pro rejects Ark's legacy empty-text array during tool continuations.
+  const kimi31Pro = /^kimi-k3-1-pro(?:-\d{6})?$/.test(modelId);
+  return isVolcengineArkPaygChatTarget(provider) && !kimi31Pro ? [{ type: "text", text: "" }] : "";
 }
 
 /** Reconstruct completed text-only thinking; never invent signatures or placeholder reasoning. */
