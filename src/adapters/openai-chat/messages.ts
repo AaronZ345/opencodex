@@ -440,7 +440,8 @@ export function safeToolName(name: string | undefined): string {
 
 export function emptyAssistantContent(provider: OcxProviderConfig, modelId = ""): string | { type: "text"; text: string }[] {
   // Kimi K3.1 Pro rejects Ark's legacy empty-text array during tool continuations.
-  const kimi31Pro = /^kimi-k3-1-pro(?:-\d{6})?$/.test(modelId);
+  const upstreamModelId = provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(modelId) : modelId;
+  const kimi31Pro = /^kimi-k3-1-pro(?:-\d{6})?$/.test(upstreamModelId);
   return isVolcengineArkPaygChatTarget(provider) && !kimi31Pro ? [{ type: "text", text: "" }] : "";
 }
 
