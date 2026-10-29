@@ -53,6 +53,7 @@ let _corsOrigin = "http://localhost:10100";
 // Listener identity is process-local. Never infer this trust from forwarded headers: the
 // request handler marks a Request only after resolving the actual Bun Server instance.
 const trustedHubManagementRequests = new WeakSet<Request>();
+export function isTrustedHubManagementRequest(req: Request): boolean { return trustedHubManagementRequests.has(req); }
 
 export function markTrustedHubManagementRequest(req: Request): void {
   trustedHubManagementRequests.add(req);
@@ -511,6 +512,28 @@ export function resolveContextPrincipal(req: Request, config: OcxConfig, admissi
     if (principal) return principal;
   }
   return undefined;
+}
+
+/** Stable structural replay identity. This does not replace process-local opaque-state ownership. */
+export function resolveDurableReplayPrincipal(
+  req: Request,
+  config: Pick<OcxConfig, "apiKeys">,
+  admission: DataPlaneAdmission | undefined,
+  signingKey: Uint8Array,
+): string | undefined {
+  if (!admission || signingKey.length !== 32) return undefined;
+  // The managed client sends this dedicated local credential; a thread id, User-Agent,
+  // loopback address or upstream bearer never establishes structural replay ownership.
+  const token = req.headers.get("x-opencodex-api-key")?.trim();
+  if (!token) return undefined;
+  const resolved = resolveDataPlaneAdmissionSecret(token, config, "dedicated");
+  if (!resolved) return undefined;
+  if (admission.kind !== "loopback" && (admission.kind !== resolved.kind
+    || (admission.kind === "configured" && (resolved.kind !== "configured" || admission.keyId !== resolved.keyId)))) return undefined;
+  return createHmac("sha256", signingKey)
+    .update("opencodex.structural-replay-principal.v1\0")
+    .update(JSON.stringify([resolved.kind, resolved.kind === "configured" ? resolved.keyId : "", token]))
+    .digest("hex");
 }
 
 /** Whether `token` is a data-plane admission secret. */
