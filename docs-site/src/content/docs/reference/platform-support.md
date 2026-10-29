@@ -51,17 +51,44 @@ directly.
 
 ### Meta Muse Code
 
-On macOS, OpenCodex imports the API key the Muse Code CLI already stored after
-`muse login`, so you are not asked to provision a second one.
+On macOS, a plain login first tries the API key already stored by `muse login`.
+If none is available, or on another platform, OpenCodex starts device approval
+without launching the Muse CLI. Add-account and reauthentication skip import.
+A failed, uncancelled device login can fall back to a manual key when the caller
+offers an input surface. Pasted keys use the same format and Model API validation
+as imported ones. Management login requires a dashboard session before either
+credential-acquisition path; see the [provider guide](/guides/providers/).
 
-Elsewhere it asks you to paste the key instead. Meta ships no native Windows
-CLI, and on Linux the CLI exists but where it keeps its credential has not been
-verified, so OpenCodex declines to guess at a credential store. The same key is
-visible in [Meta's developer console](https://dev.meta.ai), and a pasted key
-faces the same format check and the same live validation against the Model API
-as an imported one.
+The macOS Keychain prompt appears on the machine running the proxy, which may be
+separate from your dashboard browser. OpenCodex allows up to 120 seconds to approve
+it. Cancel the dashboard login to stop the pending read. Missing entries, denied
+access, unavailable Keychain interaction, timeout, malformed credentials, and
+Model API validation failures have separate recovery messages. If import is
+blocked, the dashboard offers a paste field for an existing Muse Code API key; it
+does not automatically start another device grant. To use browser sign-in instead,
+choose **Add account** on an already configured provider. OpenCodex does not change
+Keychain access controls.
+
+If login still fails, report the exact displayed Muse error (including any HTTP
+status), OpenCodex version, `muse --version`, whether the dashboard is remote from
+the proxy, and how long the prompt was visible. In browser developer tools →
+Network, copy only the `error` field from `/api/oauth/login` or
+`/api/oauth/status?provider=meta-muse`. Do not share a HAR, request headers,
+auth files, Keychain output, account details, or the rest of the status response.
+These safe diagnostics distinguish local import from Meta validation failures;
+no credential dump is needed.
+
+For Responses requests to Meta, omitted or `auto` tool selection is supported.
+Explicit `none` sends `tools: []` and removes `additional_tools` items from the
+input. Forced, named, and `allowed_tools` selections return HTTP 400 before the
+request reaches Meta because Muse accepts only `auto`. Other Responses
+destinations keep their existing tool-selection behavior.
 
 ## Windows notes
+
+The Node launcher's npm self-update requires Windows 10 or later with Job List
+process-creation attributes. If atomic process supervision is unavailable, it
+reports `EINSTALLJOIN` and does not start npm; update Windows before retrying.
 
 The Windows service can run under Task Scheduler or as a native WinSW service,
 and those are mutually exclusive. `ocx service repair` refuses to proceed when
@@ -78,4 +105,3 @@ OpenCodex states the actual reason rather than disabling a control silently. If
 a capability is unavailable on your platform, the error or the dashboard says
 which mechanism is missing and what the supported alternative is. If you hit one
 that does not, that is a bug worth reporting.
-

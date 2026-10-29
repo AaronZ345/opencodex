@@ -1,5 +1,6 @@
 # Adapter Registry Authority
 
+`workbuddy-ai` inherits the `openai-chat` contract with a fixed-origin subscription adapter; see [WorkBuddy AI](../providers/workbuddy.md).
 Native result continuations and function-result injection follow [the mode-specific result and control contract](../transports/streaming-health.md#experimental-native-function-result-injection); this surface does not infer upstream support or alter its defaults.
 
 Native steering follows [the shared WebSocket contract](../transports/streaming-health.md#experimental-native-mid-turn-steering); this surface's defaults remain unchanged.
@@ -10,14 +11,15 @@ Request-local adapter bindings are separate from registry authority in the Respo
 The configuration-only [plaintext V2 contract](../subagents.md#plaintext-v2-agent-messages)
 is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged. Cursor's localized native-shell names follow the [routing-commentary guard contract](../providers/cursor.md#cursor-native-exec).
 
-Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses.md#passthrough-sse-stream-shapes-314).
+Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses-wire-shapes.md#passthrough-sse-stream-shapes-314).
 
 ## Decision
 
 Runtime adapter construction has one authority: `src/adapters/registry.ts`.
 
-The OpenCode Go [chronological instruction exception](../providers/chat-compat.md#opencode-go-chronological-instructions)
-uses the provider registry's destination identity inside the Chat adapter; it adds no adapter factory.
+[Chronological instruction ordering](../providers/chat-compat.md#chronological-in-conversation-instructions)
+is now uniform across destinations, so the Chat adapter no longer consults the provider registry's
+destination identity for it; it adds no adapter factory.
 
 `src/server/adapter-resolve.ts` may resolve a provider/model onto an adapter id, but it does not maintain a second adapter factory inventory. The selected persisted/configured adapter id remains an untrusted string until the registry lookup succeeds. Unknown ids fail with the existing `Unknown adapter: <id>` error instead of widening configuration types around a closed compile-time union.
 
@@ -28,7 +30,26 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
 - `azure` and `azure-openai` inherit the `openai-responses` contract.
   The inherited contract includes Meta Muse's host-gated 64-character tool-name alias when the
   constructed send URL is `api.meta.ai` (`src/responses/muse-tool-name-alias.ts`).
-- `mimo-free` inherits the `openai-chat` contract.
+- `mimo-free` inherits the `openai-chat` contract. Its registry entry is `deprecated`: saved
+  providers keep resolving to this adapter with their stored configuration, while new-provider
+  discovery (presets, the init menu, the featured list, and key logins) excludes it and
+  `provider add` warns before creating one.
+- `claude-cli` inherits the `codebuddy` contract. Claude Code speaks the same stream-json
+  protocol this repository already parses for CodeBuddy and Qoder, so the wire is inherited and the
+  family module (`src/adapters/claude-cli/`) supplies only its own arguments and child environment.
+  That profile is the first credentialless one: it omits `tokenEnv`, the CLI reads the operator's
+  own Claude Code sign-in, and the turn neither requires nor injects an API key. The proxy-safety
+  controls are set per invocation, through CLI arguments and the child environment, and
+  `tests/providers/claude-cli-adapter.test.ts` pins them: `--tools ""`, `--strict-mcp-config`,
+  `--setting-sources ""`, `--no-session-persistence`, no permission bypass, a folded prompt staged
+  in a 0600 per-turn file and passed as `--system-prompt-file` rather than as a world-readable
+  argument, and a child environment that carries no inherited `ANTHROPIC_*` value.
+  Its registry row is `authKind: "key"` with `keyOptional: true`, NOT `local`: the turn leaves the
+  machine for `api.anthropic.com`, and `local` (Ollama, vLLM, LM Studio) is the classification for
+  traffic that never does. `keyOptional` is the existing exemption from key enforcement, and key
+  rows are what `deriveProviderPresets` lists, so the entry needs no `dashboardPreset` flag either.
+The shared `src/adapters/coding-agent/turn.ts` calls the synchronous `IncomingMeta.beforePhysicalSend` fence after awaited tool-bridge setup and before spending its dispatch permit or spawning. Cancellation and stale selections produce no child process; cleanup still returns permits and removes temporary tool files.
+
 - `cursor` stays direct because its `runTurn` transport and gated native-file fallback are distinct.
 - `devin` is direct for a related reason. It streams Cognition's
   `ApiServerService/GetChatMessage` over Connect-RPC from `runTurn` with hand-written protobuf
@@ -39,8 +60,8 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
   does not. `devin-cli` survives only as a deprecated alias — `ocx login devin-cli` routes to
   `devin`, and a startup merge migration rewrites any saved row still keyed under the old
   provider id, so the registry carries one Devin provider, not two.
-  Its `GetChatMessage` inference POSTs, including the two bounded pre-output stated-reset
-  replays, pass through the request's provider executor and shared physical-send budget.
+  Its `GetChatMessage` inference POSTs pass through the provider executor and shared send budget.
+  The adapter allows no reset wait; the shared helper retains bounded replays for opted-in callers.
   Catalog and JWT RPCs remain adapter support traffic rather than inference sends.
   `AdapterFactoryContext.providerId` still tells the shared adapter which configured row it is
   serving: the Cognition tenant is recorded on the credential, not in the registry, so the
@@ -84,6 +105,9 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
   rows each base model's collapsed UID gathers — the EFFORT_TOKENS suffixes, tier rows
   like `-1m` included: unmeasured rows abstain, unanimous measured rows advertise
   `["text"]` or `["text", "image"]`, and measured disagreement stays unadvertised.
+  The degraded static roster includes `grok-4-7` with its catalog-measured ladder but
+  omits `grok-4-6` until a Devin-specific ladder is measured; live discovery can still
+  return 4.6 for an account that offers it.
 
   At dispatch the adapter reads the same per-account/host cache once more for the
   exact selected wire UID and forwards `completionOpts.maxInputTokens`: the smallest
@@ -91,10 +115,18 @@ Some adapters share another adapter's routed-tool semantics while retaining inde
   hints, so `CompletionConfiguration` field #3 no longer serializes the encoder's
   128000 fallback. Smaller operator hints cap live evidence and never enlarge it;
   with no evidence the adapter hint is omitted and the encoder still serializes
-  its own 128000 fallback for field #3. Investigation and limits:
-  `devlog/_plan/260917_devin_input_ceiling/000_review.md`.
+  its own 128000 fallback for field #3. Connect trailer diagnostics expose only an
+  allowlisted error code, hexadecimal trace id and typed `retryAfterSeconds`, optionally rendered as
+  generated `retry after ~Ns` wording; the shared retry-delay parser accepts that generated
+  approximation marker and preserves the same lower-bound delay when the diagnostic returns as an
+  outer error message. Each bounded replay evaluates its own typed delay or compatible message, so
+  a later refusal may change between the raw reset sentence and the generated diagnostic without
+  losing the next wait. Raw text stays internal because it can reflect credentials. Investigation and limits:
+  `devlog/_fin/260917_devin_input_ceiling/000_review.md`.
 
 The registry records those relationships with `contractParent`. A parent relationship does **not** mean the registry recursively constructs a parent adapter and injects it into the child. Azure and MiMo keep owning their existing internal composition. This avoids making production constructors depend on test/conformance needs and keeps this authority refactor behavior-neutral.
+
+Behavior that belongs to a wire asks the registry for the adapter's resolved wire (`effectiveAdapterContract()`, or `resolvedAdapterWire()` in `src/responses/continuation-ownership.ts`) instead of comparing adapter names, so a wrapper inherits it by declaring its parent. Responses opaque-blob recovery is one such consumer: Azure recovers from another provider's reasoning state because `azure-openai` declares `contractParent: "openai-responses"` (#5583).
 
 Codex Spark retirement removes model-specific exceptions from the Responses adapter, without
 changing contract inheritance or generic Responses Lite handling; see
@@ -125,6 +157,24 @@ owned by the selected adapter's final compiler and cannot affect adapter selecti
 
 The shared Responses path follows the [bounded multipart recovery contract](../subagents.md#multipart-encrypted-task-recovery); credential admission and retry policy remain unchanged.
 
+## Empty assistant history
+
+`src/adapters/openai-chat/messages.ts` omits an assistant turn whose joined text is empty and
+that carries neither tool calls nor serialized reasoning while earlier tool calls still await
+their results, so the empty turn cannot split a call from its result. Outside that window, a
+standalone answer made of explicit blank text parts keeps `content: ""`, because dropping it
+would put two user turns next to each other on chat templates that require strict alternation.
+A message with no text parts at all (`content: ""` or `[]` on input) is still omitted, as it
+was before. Whitespace and nonempty answer text stay byte-exact; tool-call and reasoning-only
+continuations keep their existing content shape.
+
+On native Responses, `src/adapters/openai-responses/empty-assistant.ts` removes only explicit
+content-empty assistant message items sent to `api.kimi.com/coding/v1/responses`. Refusals,
+nonempty annotations, unknown parts/fields, reasoning and tools are retained. A same-input `item_reference` keeps its target message, even
+when empty, so filtering cannot create a dangling reference. Independent
+reasoning/call/result items, caller-owned raw history and other destinations are unchanged.
+`tests/adapters/openai/openai-empty-assistant-history.test.ts` covers both final wires.
+
 ## Moonshot `$ref`-with-siblings normalization
 
 Moonshot/Kimi enforce the draft-07 reading where `$ref` must stand alone and 400 the whole
@@ -133,9 +183,9 @@ so the schema is not something a user can fix from configuration (issue #2673).
 
 > Decision record: [ADR-0093](../decisions/ADR-0093-moonshot-ref-with-siblings-normalization.md)
 
-Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../gui-and-management-api.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
+Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../dashboard-and-usage.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
-Connected CLI usage follows the [client-scoped hub usage contract](../gui-and-management-api.md#usage-accounting); local management and account data remain separate.
+Connected CLI usage follows the [client-scoped hub usage contract](../dashboard-and-usage.md#usage-accounting); local management and account data remain separate.
 
 Remote Workspace uses a separate, explicitly enabled server surface with structural WebSocket callbacks and awaited per-server cleanup; [its contract](../remote-workspace.md) owns that integration.
 
@@ -146,16 +196,23 @@ The bridge keeps an open function, custom, or tool-search call incomplete when a
 
 A provider web search still in flight at that truncated terminal is finalized as `failed`, the same status it already receives from the error and explicit-incomplete terminals. It never returned results, so reporting it as `completed` would leave the client showing a finished search for a turn the provider cut short.
 
-`src/adapters/anthropic.ts` maps a `refusal` or `content_filter` stop reason to an explicit `incomplete` adapter event with `reason: "content_filter"` and `retryable: false` instead of `done` with that stopReason (#4312). Codex otherwise treats a filter incomplete without retryable as a dropped stream and retries a refusal that cannot succeed. Partial output, tool-call integrity, and usage are preserved; `max_tokens` remains a `done` so a legitimate truncation can continue.
+`src/adapters/anthropic.ts` maps a `refusal` or `content_filter` stop reason to an explicit `incomplete` adapter event with `reason: "content_filter"` and `retryable: false` instead of `done` with that stopReason (#4312). A `done` with that stopReason would reach the client as an incomplete with no verdict at all. `src/adapters/kiro/stream.ts` emits the same event for a `CONTENT_FILTERED` or `GUARDRAIL_INTERVENED` stop. The verdict alone does not stop Codex, which retries every `response.incomplete`; the Responses bridge turns the Anthropic and Kiro event into a terminal `response.failed` for a Responses client ([Adapter-to-Responses bridge](../transports/responses.md#adapter-to-responses-bridge)). Partial output, tool-call integrity, and usage are preserved; `max_tokens` remains a `done` so a legitimate truncation can continue.
+
+The translated Anthropic stream ends at `message_stop` after emitting its existing terminal
+classification and usage. The parser does not inspect later records in that response body;
+pre-terminal named pings, data-only pings and SSE comments remain heartbeats. Iterator closure
+releases decoder reservations, attempts reader cancellation and unlocking on a best-effort basis,
+and closes any remaining tool-call budget entry. A never-settling cancellation can delay direct-parser
+cleanup. `src/web-search/progress-stream.ts` continues to reject post-terminal adapter events.
 
 Chat helper admission in `src/server/responses/core.ts` follows the
 [deferred stored-main contract](../providers/openai-tiers.md): only a needed Direct OpenAI helper
 claims stored main, after terminal vision, routed vision and search exclusions.
 
 The management quota DTO keeps Combo editing aligned with scoped inference evidence;
-see [Combo editor routing quota](../gui-and-management-api.md#combo-editor-routing-quota).
+see [Combo editor routing quota](../dashboard-and-usage.md#combo-editor-routing-quota).
 
-Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
+Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-accounts.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
 
 Canonical Spark Lite metadata follows the final serialized model and surviving nonempty Lite tool catalog; see [Responses transport](../transports/responses.md).
 
@@ -169,11 +226,11 @@ privately to final dispatch; preliminary route selection does not inject Go-only
 
 Native Chat applies qualifying effort ceilings independently of model pins; pin selection precedes the cap and only pins or cap rewrites enter wire mapping. The [catalog effort contract](../catalog.md#ultra-reasoning-level) records the V1/compaction exemptions and caller-preservation boundary.
 
-Pool quota producers and account commands follow the [bounded raw-observation contract](../providers/openai-tiers.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
+Pool quota producers and account commands follow the [bounded raw-observation contract](../providers/openai-accounts.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
 
 Account quota surfaces use [safe probe diagnostics](../transports/inventory.md#account-quota-failure-diagnostics) separately from quota validity, credential health and routing authority.
 
-Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat removes effort only for an explicit empty declaration or no-reasoning model.
+Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary. Translated and native Chat builders share explicit gateway-object and tool-bearing effort-omission policy after provider resolution; native Chat otherwise preserves caller controls and removes effort for an explicit empty declaration or no-reasoning model.
 
 Live sideband admission and its bounded upstream handshake follow the [runtime contract](../runtime.md#live-sideband-handshake); the ordinary Responses WebSocket exchange remains separate.
 
@@ -195,16 +252,40 @@ variant; unrelated model families retain their existing suffix precedence.
 ## Untranslated input media
 
 `src/responses/input-media.ts` inspects actual content blocks and typed tool-output arrays
-without parsing text or function arguments, copying attachment payloads, resolving file IDs,
-or fetching URLs. Audio, files/documents and file-ID-only images have no lossless normalized
-carrier. The scanner returns only an input-kind name, never client content.
+without parsing text or function arguments, resolving file IDs, or fetching URLs. It returns only
+an input-kind name, never client content. For the Chat audio path it calls the same
+`audioContentFromRaw` predicate as the parser to decide whether an inline attachment has a
+lossless carrier; the payload is not returned, logged, or included in an error.
+
+Inline WAV/MP3 audio is supported only on the effective `openai-chat` wire, in user message
+content and tool output. `src/responses/audio.ts` accepts a data URL, or raw base64 with an
+explicit `wav`/`mp3` format, and produces an `OcxAudioContent` part. The parser in
+`src/responses/parser-content.ts` preserves that part, and
+`src/adapters/openai-chat/messages.ts` emits it as an `input_audio` content part. A tool-result
+audio part cannot ride the text-only `role:"tool"` message; the adapter promotes it into a
+follow-up user message after the paired tool results, including audio from orphan tool results.
+Remote audio, unsupported formats, the
+top-level `audio` spelling, developer audio, and audio in system or assistant content are
+refused. Native Responses, including both Azure aliases, forwards the original body; native Chat
+keeps its existing wire; the separate Chat-to-Responses projection still rejects audio/file
+parts, as described in the inbound compatibility contract.
+
+A document that carries its own base64 bytes is the other lossless carrier, and only in user or
+developer message content: `src/responses/inline-document.ts` decodes it into the
+`OcxDocumentContent` part, which the Anthropic, OpenAI Chat and Gemini wires emit as a native
+document, file part and `inline_data` respectively. Every other position — tool output, system
+and assistant content — is still refused, because those converters reduce their content to text
+and exempting them would restore the silent drop the scanner exists to prevent. The scanner and
+the decoder share one predicate so a request cannot be exempted here and reduced to a marker
+there.
 
 `src/adapters/input-media-guard.ts` guards adapters created by the registry after effective
-wire selection. A translated `buildRequest` refuses these inputs through the existing 400
-error path; `runTurn` emits one nonretryable `unsupported_input_modality` error without
-starting its underlying transport. `localTerminal` declines a success shortcut for such a
-request, letting the guarded builder return the error instead. The original raw body stays
-unchanged, including when another final adapter is selected after a failed attempt.
+wire selection. It enables the audio exemption only for `openai-chat`. A translated
+`buildRequest` refuses unsupported inputs through the existing 400 error path; `runTurn` emits
+one nonretryable `unsupported_input_modality` error without starting its underlying transport.
+`localTerminal` declines a success shortcut for such a request, letting the guarded builder
+return the error instead. The original raw body stays unchanged, including when another final
+adapter is selected after a failed attempt.
 
 The effective Responses wire, including both Azure aliases, is excluded: it forwards the
 original body and leaves native media acceptance to its upstream. This exception does not
@@ -213,9 +294,16 @@ existing wire; only an actual Chat-to-Responses projection rejects audio/file bl
 losing them. Legacy function-result images fail explicitly because that projection does not
 implement legacy call/result pairing. Modern tool-image carriers are unchanged.
 
-`tests/adapters/adapter-input-media-guard.test.ts` covers hook ordering, error events and
+`src/server/responses/input-admission.ts` charges supported inline audio by decoded payload
+size at a conservative 256-bytes-per-token proxy. That is an admission estimate, not an
+upstream token formula; base64 inflation is not charged, and the scanner and guard never log
+the payload.
+
+`tests/adapters/openai/openai-chat-audio.test.ts` covers user and tool-result audio mapping;
+`tests/adapters/adapter-input-media-guard.test.ts` covers hook ordering, refusal positions and
 raw passthrough; `tests/responses/chat-media-translation.test.ts` reaches the real HTTP
-translation boundary and verifies that rejection sends no upstream request.
+translation boundary and verifies that supported audio is forwarded while unsupported media
+sends no upstream request; `tests/server/input-admission.test.ts` covers decoded-byte charging.
 Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
 
 Shared response-log retention and native SSE inspection pacing follow the [bounded inspection contract](../transports/byte-accounting.md#response-log-inspection); other subsystem behavior remains unchanged.
@@ -232,4 +320,23 @@ Dashboard Fast-row persistence and client refresh follow the [Fast selector rows
 
 The registered Devin implementation in `src/adapters/devin.ts` maps data URLs to its native image field. Its textual fallback accepts only bounded HTTPS references and emits a fixed-size omission marker for unsupported or oversized values.
 
-A [compaction routing override](../transports/responses.md#compaction-routing-overrides) selects its target before adapter resolution and uses the existing registry factory.
+A [compaction routing override](../transports/responses-failover.md#compaction-routing-overrides) selects its target before adapter resolution and uses the existing registry factory.
+
+## Devin consecutive tool results
+
+`mapOcxMessagesToDevin` in `src/adapters/devin.ts` combines only consecutive original-message
+tool results with the same call ID into one history prompt. Chunks retain arrival order, image
+parts and each in-band error marker; any failed chunk sets the combined prompt's error flag.
+Any intervening message, including one omitted by mapping, or a different call ID ends the run,
+so later results keep their chronological slots. The parsed request remains unchanged. Structured
+parts append to mapper-owned arrays; text-only runs join once at their boundary or first
+structured transition. Accumulation does not re-copy its growing prefix. The signed send reuses
+the initially mapped history; signature-withheld retries still build their separate variant.
+This is linear accumulation, not a global request-memory or execution-time bound.
+`tests/providers/devin-chat-wire-fixes.test.ts` covers these boundaries and protobuf fields #7,
+#9 and #10. This normalization addresses duplicate consecutive tool prompts, not every
+upstream `invalid_argument`.
+
+`src/adapters/unique-tool-call-ids.ts` forwards optional per-exchange stream context while
+retaining tool-call ID reminting; [completed tool blocks](../providers/completed-tool-blocks.md)
+require that context independently of request construction.

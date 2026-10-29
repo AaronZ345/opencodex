@@ -230,6 +230,16 @@ describe("ocx export --json (accept criterion 1)", () => {
     expect(ids).not.toContain("banned/hidden");
     expect(ids).toEqual(["anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna"]);
   });
+
+  test("Pi uses the selected catalog without changing its provenance", async () => {
+    const proxy = fakeProxy();
+    const pi = await run(["--client", "pi", "--json"], { baseUrl: proxy.baseUrl });
+    expect(pi.code).toBe(0);
+    const piRows = JSON.parse(pi.stdout) as { providers: { opencodex: { models: Array<{ id: string }> } } };
+    expect(piRows.providers.opencodex.models.map(row => row.id)).toEqual([
+      "anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna",
+    ]);
+  });
 });
 
 describe("ocx export human output (accept criterion 2)", () => {
@@ -239,6 +249,10 @@ describe("ocx export human output (accept criterion 2)", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout.startsWith("{\n")).toBe(true);
+    logs.length = 0;
+    const structured = await run(["--client", "opencode", "--json"], { baseUrl: proxy.baseUrl });
+    expect(structured.code).toBe(0);
+    expect(JSON.parse(result.stdout.split("\n\n")[0]!)).toEqual(JSON.parse(structured.stdout));
     expect(result.stdout).toContain(join("opencode", "opencode.json"));
     expect(result.stdout).toContain("Merge this generated configuration into that file; do not replace it.");
     expect(result.stdout).toContain("export OPENCODEX_OPENCODE_API_KEY=");
@@ -369,24 +383,22 @@ describe("ocx export with no live proxy (accept criterion 5)", () => {
    * would be discovered and the assertion would pass for the wrong reason.
    */
   test("fails through the runtime-api error naming ocx start, emitting no config", () => {
-    const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
-    const deadPort = probe.port;
-    probe.stop(true);
-
     const home = tempDir();
     // Must pass config validation: a rejected config falls back to the DEFAULT config, whose
     // port 10100 may host the developer's own proxy — the test would then probe a live one.
     writeFileSync(
       join(home, "config.json"),
       JSON.stringify({
-        port: deadPort,
+        // The child preload injects ECONNREFUSED at this exact endpoint.
+        port: 42101,
         defaultProvider: "mock",
         providers: { mock: { adapter: "openai-chat", baseUrl: "http://127.0.0.1/v1", allowPrivateNetwork: true } },
       }),
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [cliPath, "export", "--client", "opencode", "--json"], {
+    const preload = join(repoRoot, "tests", "fixtures", "refused-local-probe-preload.ts");
+    const result = spawnSync(process.execPath, ["--preload", preload, cliPath, "export", "--client", "opencode", "--json"], {
       cwd: repoRoot,
       env: { ...process.env, OPENCODEX_HOME: home },
       encoding: "utf8",
@@ -394,6 +406,7 @@ describe("ocx export with no live proxy (accept criterion 5)", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("[refused-probe] ECONNREFUSED");
     expect(result.stderr).toContain("ocx start");
     // Routed by the dispatcher, not swallowed by the unknown-command branch.
     expect(result.stderr).not.toContain("Unknown command");
@@ -562,9 +575,9 @@ describe("export allowlist parity", () => {
   });
 });
 
-describe("Raycast export uses the live management admission policy", () => {
-  for (const secondary of [false, true]) {
-    test(`live wildcard bind with secondary=${secondary} wins over saved loopback config`, async () => {
+describe("keyless exports use the live management admission policy", () => {
+  for (const client of ["raycast", "droid", "qoder"] as const) for (const secondary of [false, true]) {
+    test(`${client} live wildcard bind with secondary=${secondary} wins over saved loopback config`, async () => {
       const oldHome = process.env.OPENCODEX_HOME;
       const oldCodexHome = process.env.CODEX_HOME;
       const root = tempDir();
@@ -583,15 +596,17 @@ describe("Raycast export uses the live management admission policy", () => {
         const proxy = managementProxy(liveConfig);
         const out = join(root, "providers.yaml");
         writeFileSync(out, "keep existing export\n");
-        const result = await run(["--client", "raycast", "--json", "--out", out, "--force"], {
+        const result = await run(["--client", client, "--json", "--out", out, "--force"], {
           baseUrl: proxy.baseUrl,
           // Deliberately contradict both live bind and secondary port.
           config: config({ unauthenticatedLoopbackListener: { enabled: true, port: 10999 } }),
         });
         if (secondary) {
           expect(result.code).toBe(0);
-          const document = JSON.parse(result.stdout) as { providers: Array<{ base_url: string }> };
-          expect(document.providers[0]!.base_url).toBe("http://127.0.0.1:10237/v1");
+          const document = JSON.parse(result.stdout) as { providers?: Array<{ base_url: string }> & { opencodex?: { baseUrl: string } }; customModels?: Array<{ baseUrl: string }> };
+          expect(client === "raycast" ? document.providers?.[0]?.base_url
+            : client === "qoder" ? document.providers?.opencodex?.baseUrl : document.customModels?.[0]?.baseUrl)
+            .toBe("http://127.0.0.1:10237/v1");
           expect(readFileSync(out, "utf8")).toContain("10237/v1");
           expect(readFileSync(out, "utf8")).not.toContain("10999");
         } else {
@@ -608,4 +623,30 @@ describe("Raycast export uses the live management admission policy", () => {
       }
     });
   }
+});
+
+describe("ocx export with an unresolvable client destination", () => {
+  test("exports and writes --out once, reporting the destination as unknown", async () => {
+    const proxy = fakeProxy();
+    const oldDataDir = process.env.ZCODE_DATA_DIR;
+    // A relative override is a ClientPathError, the same class the ZCode bootstrap
+    // resolver raises for malformed or relative dataBaseDir settings (#6932).
+    process.env.ZCODE_DATA_DIR = "relative-zcode-root";
+    try {
+      const target = join(tempDir(), "zcode-config.json");
+      const result = await run(["--client", "zcode", "--out", target], { baseUrl: proxy.baseUrl });
+      expect(result.code).toBe(0);
+      expect(existsSync(target)).toBe(true);
+      expect(result.stdout).toContain("Destination: unknown (");
+      expect(result.stdout).toContain("ZCODE_DATA_DIR");
+
+      logs = [];
+      const json = await run(["--client", "zcode", "--json"], { baseUrl: proxy.baseUrl });
+      expect(json.code).toBe(0);
+      expect(() => JSON.parse(json.stdout)).not.toThrow();
+    } finally {
+      if (oldDataDir === undefined) delete process.env.ZCODE_DATA_DIR;
+      else process.env.ZCODE_DATA_DIR = oldDataDir;
+    }
+  });
 });

@@ -1,3 +1,4 @@
+import { normalizeAccountAutoPauseRevisions, observeAccountAutoPauseRevisions, observeLoadedAutoPauseConfig } from "./config/account-auto-pause-revisions";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OcxConfig } from "./types";
@@ -8,9 +9,10 @@ import {
   adoptCustomModelCatalogMigration,
   projectCustomModelCatalogMigration,
 } from "./codex/custom-model-catalog-migration";
-import { refreshUserCostOverlays } from "./usage/user-cost-overlays";
+import { refreshConfigDerivedRegistries } from "./config/derived-registries";
 import {
-  clearPendingConfigTopLevelDeletions,
+  clearPendingConfigDeletions,
+  recordFileBackedConfig,
   projectConfigRebaseProvenance,
 } from "./config/rebase-provenance";
 import { getConfigDir, getConfigPath, hardenConfigDir } from "./config/paths";
@@ -53,6 +55,12 @@ export {
   type RuntimePortState,
 } from "./config/process-state";
 export { deleteConfigTopLevelKey } from "./config/rebase-provenance";
+export {
+  mutatePersistedConfig,
+  setPersistedConfigMutationBeforeCommitForTests,
+  type PersistedConfigMutation,
+  type PersistedConfigMutationOutcome,
+} from "./config/persisted-mutation";
 export { isValidProviderName, hasOwnProvider } from "./config/provider-name";
 export {
   apiKeyTransportConfigError,
@@ -110,7 +118,7 @@ export {
   sanitizeModelCostsForDisplay,
   modelPreferHostedToolsConfigError,
 } from "./config/schema/leaf-validators";
-export { hardenExistingSecret, retryOn429PolicyConfigError } from "./config/load-degrade";
+export { hardenExistingSecret, retryOn429PolicyConfigError, retryOnResetPolicyConfigError } from "./config/load-degrade";
 export { backupInvalidConfig } from "./config/salvage";
 export type { ConfigDiagnostics, ConfigAdmissionSnapshot } from "./config/diagnostics";
 export {
@@ -133,8 +141,8 @@ export {
   withExpectedConfigGenerationSync,
 } from "./config/mutation-lock";
 export {
-  armClaudeCodeBaseline,
-  adoptPersistedProviderIntoLiveConfig,
+  armClaudeCodeBaseline, armDetachedConfigBaseline,
+  adoptPersistedClaudeCode, adoptPersistedProviderIntoLiveConfig,
   claudeCodeBaselineArmed,
   reconcileLiveConfigFromDisk,
   saveConfigPreservingClaudeCode,
@@ -146,17 +154,15 @@ import { observeInitialConfigState } from "./config/diagnostics";
 import {
   configDiagnosticsFromRaw,
   mergeConfigDefaults,
-  readConfigFileSnapshot,
   validateConfigCandidate,
-  type ConfigFileSnapshot,
 } from "./config/diagnostics";
-
 // replace path — never publishInitialConfigNoReplace
 import { persistConfigUnlocked, readRawConfigJson } from "./config/persist-unlocked";
-
 import { withConfigMutationLockSync, bumpGenerationForCooperatingConfigWrite } from "./config/mutation-lock";
 import { getDefaultConfig } from "./config/proxy-env";
 import { configSchema } from "./config/schema/config-schema";
+import { sanitizeOpenCodeOverridesForLoad } from "./config/opencode-wire-upgrade";
+import { projectRemovedOpenCodeFreeSnapshot } from "./config/removed-opencode-free-backup";
 import {
   hardenExistingSecret,
   normalizeApiKeyIds,
@@ -167,6 +173,7 @@ import {
   sanitizeModelDisplayNamesForLoad,
   sanitizeAutoReviewForLoad,
   sanitizeRetryOn429ForLoad,
+  sanitizeAnthropicSidecarInstanceForLoad,
   sanitizeModelCostsForLoad,
   sanitizeCapabilityDeclarationsForLoad,
   warnInheritedFastWireConflicts,
@@ -204,7 +211,7 @@ import {
  * until a valid config or a genuinely missing file is observed. A partially-
  * invalid config is merged with defaults so providers and pool accounts survive.
  */
-export function loadConfig(): OcxConfig {
+function loadConfigUnobserved(): OcxConfig {
   const dir = getConfigDir();
   const configPath = getConfigPath();
   hardenConfigDir();
@@ -214,13 +221,16 @@ export function loadConfig(): OcxConfig {
     return withRefreshedCostOverlays(getDefaultConfig());
   }
   try {
-    const raw = readFileSync(configPath, "utf-8").replace(/^\uFEFF/, "");
-    const parsed = JSON.parse(raw);
+    const bytes = readFileSync(configPath);
+    const parsed = JSON.parse(bytes.toString("utf-8").replace(/^\uFEFF/, ""));
+    projectRemovedOpenCodeFreeSnapshot(parsed, { path: configPath, bytes });
+    sanitizeOpenCodeOverridesForLoad(parsed);
     sanitizeAliasesForLoad(parsed);
     sanitizeReasoningPinsForLoad(parsed);
     sanitizeModelDisplayNamesForLoad(parsed);
     sanitizeAutoReviewForLoad(parsed);
     sanitizeRetryOn429ForLoad(parsed);
+    sanitizeAnthropicSidecarInstanceForLoad(parsed);
     sanitizeModelCostsForLoad(parsed);
     sanitizeCapabilityDeclarationsForLoad(parsed);
     const result = configSchema.safeParse(parsed);
@@ -245,7 +255,14 @@ export function loadConfig(): OcxConfig {
       warnDegradedCatalogAutoRefresh(parsed);
       warnDegradedCodexPool(parsed);
       warnDegradedCredentialGroups(parsed);
-      return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+      return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
+    }
+    // Only object-shaped configs are repairable. Spreading another JSON value
+    // into defaults can manufacture a valid config and bypass the invalid-file
+    // backup.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warnAndBackupInvalidConfig(configPath, result.error);
+      return getDefaultConfig();
     }
     // Schema validation failed — merge defaults into the raw object instead of
     // discarding it entirely, so pool accounts and providers survive a missing
@@ -256,6 +273,7 @@ export function loadConfig(): OcxConfig {
       warnConfigRepaired(configPath, result.error);
       const config = normalizeApiKeyIds(retryResult.data as OcxConfig);
       warnInheritedFastWireConflicts(configPath, config);
+      warnDegradedTopLevelOptIns(parsed, config);
       warnDegradedHostname(parsed, config);
       warnDegradedListeners(parsed, config);
       warnDegradedApiKeys(parsed, config);
@@ -273,7 +291,7 @@ export function loadConfig(): OcxConfig {
       warnDegradedCatalogAutoRefresh(parsed);
       warnDegradedCodexPool(parsed);
       warnDegradedCredentialGroups(parsed);
-      return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+      return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
     }
     // Still failing, but if every complaint is about one or more named entries
     // in an independent section, drop exactly those and keep the rest. Falling
@@ -285,6 +303,7 @@ export function loadConfig(): OcxConfig {
         warnDroppedConfigSections(configPath, salvaged.dropped, salvaged.issues);
         const config = normalizeApiKeyIds(salvaged.parsed);
         warnInheritedFastWireConflicts(configPath, config);
+        warnDegradedTopLevelOptIns(parsed, config);
         warnDegradedHostname(parsed, config);
         warnDegradedListeners(parsed, config);
         warnDegradedApiKeys(parsed, config);
@@ -302,7 +321,7 @@ export function loadConfig(): OcxConfig {
         warnDegradedCatalogAutoRefresh(parsed);
         warnDegradedCodexPool(parsed);
         warnDegradedCredentialGroups(parsed);
-        return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+        return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
       }
     }
     // Merge couldn't fix it — truly broken config
@@ -312,6 +331,10 @@ export function loadConfig(): OcxConfig {
     warnAndBackupInvalidConfig(configPath, error);
     return getDefaultConfig();
   }
+}
+
+export function loadConfig(): OcxConfig {
+  return observeLoadedAutoPauseConfig(loadConfigUnobserved());
 }
 
 export type PersistedConfigInitializationOutcome = "created" | "exists" | "invalid";
@@ -330,11 +353,13 @@ export function initializePersistedConfigIfMissing(
       const current = observeInitialConfigState();
       if (current !== "missing") return current;
       const projected = projectCustomModelCatalogMigration(undefined, projectConfigRebaseProvenance(config));
+      normalizeAccountAutoPauseRevisions(undefined, projected);
       if (!validateConfigCandidate(projected).ok) throw new Error("Initial configuration is invalid.");
       if (!publishInitialConfigNoReplace(getConfigPath(), JSON.stringify(projected, null, 2) + "\n", io)) {
         return observeInitialConfigState() === "exists" ? "exists" : "invalid";
       }
       published = true;
+      observeAccountAutoPauseRevisions(projected);
       recordOwnedConfigPath(getConfigDir(), getConfigPath());
       bumpGenerationForCooperatingConfigWrite();
       return projected;
@@ -343,8 +368,8 @@ export function initializePersistedConfigIfMissing(
     adoptCustomModelCatalogMigration(config, persisted);
     if (persisted.configRebaseProvenance === undefined) delete config.configRebaseProvenance;
     else config.configRebaseProvenance = structuredClone(persisted.configRebaseProvenance);
-    clearPendingConfigTopLevelDeletions(config);
-    refreshUserCostOverlays(persisted);
+    clearPendingConfigDeletions(config);
+    refreshConfigDerivedRegistries(persisted);
     return "created";
   } catch (cause) {
     if (published) throw new InitialConfigPublicationError("published", false, false, { cause });
@@ -367,94 +392,6 @@ export function saveConfig(config: OcxConfig): void {
     adoptCustomModelCatalogMigration(config, withProvenance);
     if (withProvenance.configRebaseProvenance === undefined) delete config.configRebaseProvenance;
     else config.configRebaseProvenance = structuredClone(withProvenance.configRebaseProvenance);
-    clearPendingConfigTopLevelDeletions(config);
-  });
-}
-
-export type PersistedConfigMutation<T> = {
-  changed: boolean;
-  value: T;
-};
-
-export type PersistedConfigMutationOutcome<T> =
-  | { status: "committed" | "unchanged"; value: T }
-  | { status: "unavailable"; reason: "missing" | "invalid" | "conflict" };
-
-const CONFIG_MUTATION_MAX_REBASE_ATTEMPTS = 3;
-let persistedConfigMutationBeforeCommitForTests: (() => void) | null = null;
-
-/** Test-only one-shot seam: inject a competing mutation after the first decision, before freshness revalidation. */
-export function setPersistedConfigMutationBeforeCommitForTests(hook: (() => void) | null): void {
-  persistedConfigMutationBeforeCommitForTests = hook;
-}
-
-function unavailableConfigMutationReason(snapshot: ConfigFileSnapshot): "missing" | "invalid" {
-  return snapshot.diagnostics.source === "default" ? "missing" : "invalid";
-}
-
-/**
- * Patch a schema-valid on-disk config under the shared mutation lock. Cooperating writers are
- * serialized; the callback is rerun on the newest snapshot so observed direct byte changes rebase
- * and credential predicates are re-evaluated immediately before the atomic commit. A writer that
- * ignores the coordinator can still change bytes after the final check because the filesystem has
- * no portable conditional rename. Missing or malformed config always fails closed and is never
- * recreated from a prior snapshot.
- */
-export function mutatePersistedConfig<T>(
-  mutate: (config: OcxConfig) => PersistedConfigMutation<T>,
-): PersistedConfigMutationOutcome<T> {
-  // Avoid creating/opening the coordinator database for a read-path update that already knows
-  // there is no valid config. The same check runs again under the transaction for authority.
-  const observed = readConfigFileSnapshot();
-  if (observed.diagnostics.source !== "file" || observed.raw === undefined) {
-    return { status: "unavailable", reason: unavailableConfigMutationReason(observed) };
-  }
-  return withConfigMutationLockSync(() => {
-    let base = readConfigFileSnapshot();
-    for (let attempt = 0; attempt < CONFIG_MUTATION_MAX_REBASE_ATTEMPTS; attempt += 1) {
-      if (base.diagnostics.source !== "file" || base.raw === undefined) {
-        return { status: "unavailable", reason: unavailableConfigMutationReason(base) };
-      }
-
-      const tentativeConfig = structuredClone(base.diagnostics.config);
-      const tentative = mutate(tentativeConfig);
-      if (!tentative.changed) return { status: "unchanged", value: tentative.value };
-
-      const hook = persistedConfigMutationBeforeCommitForTests;
-      persistedConfigMutationBeforeCommitForTests = null;
-      hook?.();
-
-      const latest = readConfigFileSnapshot();
-      if (latest.diagnostics.source !== "file" || latest.raw === undefined) {
-        return { status: "unavailable", reason: unavailableConfigMutationReason(latest) };
-      }
-      if (latest.raw !== base.raw) {
-        base = latest;
-        continue;
-      }
-
-      // Re-run against a fresh clone even when config bytes are unchanged: a Codex credential
-      // generation lives in a separate file and may have changed at the injected seam.
-      const confirmedConfig = structuredClone(latest.diagnostics.config);
-      const confirmed = mutate(confirmedConfig);
-      if (!confirmed.changed) return { status: "unchanged", value: confirmed.value };
-
-      const commitBase = readConfigFileSnapshot();
-      if (commitBase.diagnostics.source !== "file" || commitBase.raw === undefined) {
-        return { status: "unavailable", reason: unavailableConfigMutationReason(commitBase) };
-      }
-      if (commitBase.raw !== latest.raw) {
-        base = commitBase;
-        continue;
-      }
-
-      const projected = projectCustomModelCatalogMigration(
-        commitBase.diagnostics.config,
-        projectConfigRebaseProvenance(confirmedConfig),
-      );
-      if (persistConfigUnlocked(projected)) bumpGenerationForCooperatingConfigWrite();
-      return { status: "committed", value: confirmed.value };
-    }
-    return { status: "unavailable", reason: "conflict" };
+    clearPendingConfigDeletions(config);
   });
 }

@@ -14,14 +14,19 @@ import {
   type RuntimeApiDeps,
 } from "./runtime-api";
 import { isModelsRuntimeSubcommand } from "./models-runtime-subcommands";
+import { MODELS_CONTEXT_USAGE } from "./help-models-context";
 import { isValidProviderName } from "../config/provider-name";
 import { isValidModelDiscoveryModelId } from "../providers/model-discovery-limits";
 import { redactSecretString } from "../lib/redact";
 import type { ProviderCostOverlay } from "../types";
+import { resolveMatchedPrice } from "../usage/cost";
 import { MAX_COST4_RATE } from "../usage/expected-prices";
-import { isValidCost4Rate } from "../usage/user-cost-overlays";
+import { isValidCost4Rate, validCost4 } from "../usage/user-cost-overlays";
 
 const USAGE = `Usage:
+  ocx models display-name <provider/raw-model> (--set <text> | --clear) [--json]
+  ocx models order status|reset [--json]
+  ocx models order set (--models <csv> | --mode <default|alphabetical|provider|most-used>) [--json]
   ocx models live [--provider <name>] [--free-only] [--json]
   ocx models price <provider/model> [--json]
   ocx models set-price <provider/model> --input N --output N [--cache-read N] [--cache-write N] [--json]
@@ -30,6 +35,10 @@ const USAGE = `Usage:
       [--context-window <tokens|0>] [--modalities <text,image,audio|->]
       [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra|->]
       [--default-reasoning-effort <level|->] [--json]
+  ocx models set <provider/model> [--context-window <tokens|0|->]
+      [--modalities <text,image,audio|->]
+      [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra|"">|->]
+      [--default-reasoning-effort <level|->] [--reset] [--json]
   ocx models <enable|disable> <provider/model|native-model> [--native] [--json]
   ocx models provider <name> <on|off> [--json]
   ocx models selected <provider> [--set <id,id...>|--clear] [--json]
@@ -37,8 +46,9 @@ const USAGE = `Usage:
   ocx models preset apply <provider> [--all] [--json]
   ocx models new-policy [on|off] [--provider <name>] [--json]
   ocx models new-arrivals [--json]
-  ocx models context <status|value <tokens> [--set-all]|provider <name> on [--value <tokens>]|provider <name> off|all <on|off>> [--json]
+${MODELS_CONTEXT_USAGE}
   ocx models shadow <status|set> [model|-] [--enabled <on|off>] [--json]
+  ocx models auto-review <status|set> [model|-] [--enabled <on|off>] [--json]
 
 Prices are USD per 1M tokens. Omitted cache rates default to 0.
 Price selectors use the exact upstream model ID after the first slash.`;
@@ -80,8 +90,8 @@ function priceRecord(value: unknown): value is Record<string, unknown> {
 const PRICE_RATE_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
 
 function validPriceCost(value: unknown): value is ProviderCostOverlay {
-  return priceRecord(value) && Object.keys(value).length === PRICE_RATE_KEYS.length
-    && PRICE_RATE_KEYS.every(key => Object.hasOwn(value, key) && isValidCost4Rate(value[key]));
+  return priceRecord(value) && validCost4(value)
+    && Object.keys(value).every(key => key === "promptLengthPricing" || (PRICE_RATE_KEYS as readonly string[]).includes(key));
 }
 
 async function price(write: boolean, argv: string[], deps: RuntimeApiDeps): Promise<void> {
@@ -124,8 +134,14 @@ async function priceRequest(write: boolean, argv: string[], deps: RuntimeApiDeps
       if (!validPriceCost(stored)) throw new Error("Invalid model price response");
       cost = { ...stored };
     }
-    printData({ provider, modelId, cost }, wantsJson, [
-      cost === null ? `${selector}: automatic pricing` : `${selector}: ${JSON.stringify(cost)} USD per 1M tokens`,
+    // The API map owns manual overrides; bundled defaults remain derived rather
+    // than being persisted as overrides that would mask later catalog updates.
+    const effectiveCost = cost
+      ? { input: cost.input, output: cost.output, cacheRead: cost.cacheRead, cacheWrite: cost.cacheWrite }
+      : resolveMatchedPrice(provider, modelId, undefined, [])?.cost4 ?? null;
+    printData({ provider, modelId, cost, effectiveCost }, wantsJson, [
+      effectiveCost === null ? `${selector}: automatic pricing (unknown)`
+        : `${selector}: ${JSON.stringify(effectiveCost)} USD per 1M tokens${cost === null ? " (automatic estimate)" : ""}`,
     ]);
     return;
   }
@@ -148,17 +164,42 @@ async function priceRequest(write: boolean, argv: string[], deps: RuntimeApiDeps
     }
     return value;
   };
-  const cost: ProviderCostOverlay | null = auto ? null : {
+  // Validate every rate before any request, so a bad flag never reaches the management plane.
+  const rates: ProviderCostOverlay | undefined = auto ? undefined : {
     input: rate(input!, "--input"),
     output: rate(output!, "--output"),
     cacheRead: rate(cacheRead ?? "0", "--cache-read"),
     cacheWrite: rate(cacheWrite ?? "0", "--cache-write"),
   };
+  // A base-rate write replaces the whole row, so read the current row first and carry the
+  // stored prompt-length policy for exactly this model forward instead of silently deleting it.
+  let carriedPromptLengthPricing: ProviderCostOverlay["promptLengthPricing"];
+  if (rates) {
+    const current = await runtimeRequest<unknown>(path, {}, deps);
+    if (!priceRecord(current) || current.provider !== provider || !priceRecord(current.modelCosts)
+      || !Object.values(current.modelCosts).every(validPriceCost)) {
+      throw new Error("Invalid model price response");
+    }
+    if (Object.hasOwn(current.modelCosts, modelId)) {
+      carriedPromptLengthPricing = (current.modelCosts[modelId] as ProviderCostOverlay).promptLengthPricing;
+    }
+  }
+  const cost: ProviderCostOverlay | null = rates
+    ? { ...rates, ...(carriedPromptLengthPricing ? { promptLengthPricing: carriedPromptLengthPricing } : {}) }
+    : null;
   const result = await runtimeRequest(path, { method: "PUT", body: JSON.stringify({ modelId, cost }) }, deps);
+  // Absent and { mode: "automatic" } are the same policy (the server stores automatic as
+  // absent), and key order carries no meaning in a JSON receipt, so compare canonically.
+  const canonicalPolicy = (policy: ProviderCostOverlay["promptLengthPricing"]): string =>
+    policy === undefined || policy.mode === "automatic" ? `{"mode":"automatic"}`
+      : JSON.stringify(policy, (_key, item: unknown) => (item && typeof item === "object" && !Array.isArray(item)
+        ? Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+        : item));
   const receivedCost = priceRecord(result) ? result.cost : undefined;
   if (!priceRecord(result) || result.ok !== true || result.provider !== provider || result.modelId !== modelId
     || (cost === null ? receivedCost !== null : !validPriceCost(receivedCost)
-      || !PRICE_RATE_KEYS.every(key => receivedCost[key] === cost[key]))) {
+      || !PRICE_RATE_KEYS.every(key => receivedCost[key] === cost[key])
+      || canonicalPolicy(receivedCost.promptLengthPricing) !== canonicalPolicy(cost.promptLengthPricing))) {
     throw new Error("Invalid model price persistence receipt");
   }
   // Project the acknowledged fields only; unrelated response fields are not CLI output.
@@ -199,7 +240,7 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   if (displayName !== undefined) patch.displayName = displayName === "-" ? "" : displayName;
   if (contextRaw !== undefined) {
     const value = Number(contextRaw.replace(/[_,]/g, ""));
-    if (!Number.isInteger(value) || value < 0) throw new CliUsageError("--context-window must be an integer >= 0", USAGE);
+    if (!Number.isSafeInteger(value) || value < 0) throw new CliUsageError("--context-window must be a safe integer >= 0", USAGE);
     patch.contextWindow = value === 0 ? null : value;
   }
   if (modalitiesRaw !== undefined) patch.inputModalities = modalitiesRaw === "-" ? [] : csv(modalitiesRaw);
@@ -238,6 +279,98 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     throw error;
   }
   printData(result, wantsJson, [`Updated custom model ${id}.`]);
+}
+
+/**
+ * Per-model overrides on a routed row: the twin of `ocx models edit` for rows that already
+ * exist, rather than for a custom definition.
+ *
+ * Every option has a clear spelling instead of an empty-value sentinel, because the API treats
+ * `null` as "hand this fact back to the registry, the catalog and the provider default". That is
+ * a different intent from storing a value that merely looks blank, and collapsing the two is how
+ * an override outlives the data it was copied from.
+ */
+async function setModelSettings(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const selector = args.shift()?.trim();
+  const wantsJson = takeFlag(args, "--json");
+  const reset = takeFlag(args, "--reset");
+  if (!selector) throw new CliUsageError("model selector is required", USAGE);
+  const contextRaw = takeOption(args, "--context-window");
+  const modalitiesRaw = takeOption(args, "--modalities");
+  const reasoningEffortsRaw = takeOption(args, "--reasoning-efforts");
+  const defaultEffortRaw = takeOption(args, "--default-reasoning-effort");
+  rejectArgs(args, USAGE);
+  const target = parseSelector(selector, false);
+  if (target.native) {
+    throw new CliUsageError(
+      "model settings address a routed model; use provider/model (the native openai lane has no per-model overrides)",
+      USAGE,
+    );
+  }
+  const patch: Record<string, unknown> = {};
+  if (contextRaw !== undefined) {
+    const raw = contextRaw.trim();
+    if (raw === "-") patch.contextWindow = null;
+    else {
+      const value = Number(raw.replace(/[_,]/g, ""));
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new CliUsageError("--context-window must be a safe integer >= 0 (0 or - clears the override)", USAGE);
+      }
+      patch.contextWindow = value === 0 ? null : value;
+    }
+  }
+  if (modalitiesRaw !== undefined) {
+    // "-" is the one spelling that clears. A blank value or a blank member would otherwise
+    // become [] after CSV normalization, which the server also reads as "clear".
+    const trimmed = modalitiesRaw.trim();
+    if (trimmed === "-") patch.inputModalities = null;
+    else {
+      const members = trimmed.split(",").map(item => item.trim());
+      if (members.some(item => !["text", "image", "audio"].includes(item))) {
+        throw new CliUsageError("--modalities must list text, image or audio (comma-separated), or - to clear", USAGE);
+      }
+      patch.inputModalities = [...new Set(members)];
+    }
+  }
+  if (reasoningEffortsRaw !== undefined) {
+    // "-" restores inheritance by clearing the stored ladder (null); "" stores an explicit empty
+    // ladder, which is the "this model does not reason" override. Embedded blank CSV members
+    // (`low,,high`) are malformed and rejected rather than normalized away.
+    const trimmed = reasoningEffortsRaw.trim();
+    if (trimmed === "-") {
+      patch.reasoningEfforts = null;
+    } else if (trimmed === "") {
+      patch.reasoningEfforts = [];
+    } else {
+      const values = trimmed.split(",").map(value => value.trim());
+      if (values.some(value => value === "")) {
+        throw new CliUsageError("--reasoning-efforts must be comma-separated values from none, minimal, low, medium, high, xhigh, max, ultra (\"\" for no reasoning, \"-\" to inherit)", USAGE);
+      }
+      patch.reasoningEfforts = values;
+    }
+  }
+  if (defaultEffortRaw !== undefined) patch.defaultReasoningEffort = defaultEffortRaw.trim() === "-" ? null : defaultEffortRaw.trim();
+  if (reset) {
+    if (Object.keys(patch).length > 0) {
+      throw new CliUsageError("--reset clears every override and cannot be combined with other options", USAGE);
+    }
+    for (const key of ["contextWindow", "inputModalities", "reasoningEfforts", "defaultReasoningEffort"]) patch[key] = null;
+  }
+  if (Object.keys(patch).length === 0) throw new CliUsageError("at least one setting or --reset is required", USAGE);
+  const result = await runtimeRequest<{ changed?: boolean; hasOverrides?: boolean; saved?: boolean; catalogRefresh?: { status?: string; retryable?: boolean } }>("/api/model-settings", {
+    method: "PUT",
+    body: JSON.stringify({ provider: target.provider, modelId: target.id, ...patch }),
+  }, deps);
+  const message = result?.changed === false
+    ? (reset && result.hasOverrides === false ? "Nothing to restore for " + selector + "." : "No settings changed for " + selector + ".")
+    : "Updated model settings for " + selector + ".";
+  printData(result, wantsJson, [message,
+    // A non-retryable skip means there is no managed Codex catalog to refresh, which is normal.
+    ...(result?.saved && (result.catalogRefresh?.status === "failed"
+      || (result.catalogRefresh?.status === "skipped" && result.catalogRefresh.retryable === true))
+      ? ["Settings saved, but the Codex model catalog did not refresh. Run `ocx sync` so Codex picks up the change."] : []),
+  ]);
 }
 
 function parseSelector(selector: string, forceNative: boolean): { provider: string; id: string; native: boolean } {
@@ -410,7 +543,7 @@ async function context(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     const raw = args.shift();
     if (!raw) throw new CliUsageError("context value is required", USAGE);
     const value = Number(raw.replace(/[_,]/g, ""));
-    if (!Number.isInteger(value) || value <= 0) throw new CliUsageError("context value must be a positive integer", USAGE);
+    if (!Number.isSafeInteger(value) || value <= 0) throw new CliUsageError("context value must be a positive safe integer", USAGE);
     body = { value };
     // Explicit apply-to-all switch for headless use: re-points every routed provider to
     // the new value, mirroring the dashboard's "apply to every routed provider" toggle.
@@ -461,15 +594,53 @@ async function shadow(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   printData(result, wantsJson, ["Shadow-call settings updated."]);
 }
 
+async function autoReview(argv: string[], deps: RuntimeApiDeps): Promise<number | void> {
+  const args = [...argv];
+  const action = (args.shift() ?? "status").toLowerCase();
+  const wantsJson = takeFlag(args, "--json");
+  if (action === "status") {
+    rejectArgs(args, USAGE);
+    const result = await runtimeRequest("/api/auto-review-settings", {}, deps);
+    printData(result, wantsJson);
+    return;
+  }
+  if (action !== "set") throw new CliUsageError("unknown auto-review action " + action, USAGE);
+  const modelRaw = args[0] && !args[0].startsWith("--") ? args.shift() : undefined;
+  const enabled = takeBooleanOption(args, "--enabled");
+  rejectArgs(args, USAGE);
+  const body: Record<string, unknown> = {};
+  if (modelRaw !== undefined) body.model = modelRaw === "-" ? "" : modelRaw;
+  if (enabled !== undefined) body.enabled = enabled;
+  if (Object.keys(body).length === 0) throw new CliUsageError("model and/or --enabled is required", USAGE);
+  const result = await runtimeRequest<{ catalogRefresh?: { status?: string; retryable?: boolean } }>(
+    "/api/auto-review-settings", { method: "PUT", body: JSON.stringify(body) }, deps,
+  );
+  const refresh = result.catalogRefresh;
+  printData(result, wantsJson, [
+    "Auto-review settings updated.",
+    ...(refresh?.status === "failed"
+      ? ["Settings saved, but the Codex model catalog refresh failed. Resolve the refresh issue before running ocx sync."]
+      : refresh?.status === "skipped" && refresh.retryable === true
+        ? ["Settings saved, but the Codex model catalog refresh is pending. Run ocx sync to retry."]
+        : []),
+  ]);
+  if (refresh?.status === "failed") return 1;
+}
+
 export async function handleModelsRuntimeCommand(sub: string, argv: string[], deps: RuntimeApiDeps = {}): Promise<number | null> {
+  if (sub === "order" || sub === "display-name") {
+    const { handleModelsOrderCommand, handleModelsDisplayNameCommand } = await import("./models-order");
+    return sub === "order" ? handleModelsOrderCommand(argv, deps) : handleModelsDisplayNameCommand(argv, deps);
+  }
   // The dispatch below and MODELS_RUNTIME_SUBCOMMANDS must name the same set;
   // tests/cli/cli-models-runtime-dispatch.test.ts fails if they drift (#3094).
   if (!isModelsRuntimeSubcommand(sub)) return null;
-  let action: (() => Promise<void>) | undefined;
+  let action: (() => Promise<number | void>) | undefined;
   if (sub === "live") action = () => live(argv, deps);
   else if (sub === "price") action = () => price(false, argv, deps);
   else if (sub === "set-price") action = () => price(true, argv, deps);
   else if (sub === "edit") action = () => edit(argv, deps);
+  else if (sub === "set") action = () => setModelSettings(argv, deps);
   else if (sub === "enable") action = () => visibility(true, argv, deps);
   else if (sub === "disable") action = () => visibility(false, argv, deps);
   else if (sub === "provider") action = () => providerVisibility(argv, deps);
@@ -479,8 +650,11 @@ export async function handleModelsRuntimeCommand(sub: string, argv: string[], de
   else if (sub === "new-arrivals") action = () => newArrivals(argv, deps);
   else if (sub === "context") action = () => context(argv, deps);
   else if (sub === "shadow") action = () => shadow(argv, deps);
+  else if (sub === "auto-review") action = () => autoReview(argv, deps);
   if (!action) return null;
-  return runCliAction(action);
+  let outcome: number | void = 0;
+  const exit = await runCliAction(async () => { outcome = await action(); });
+  return exit || outcome || 0;
 }
 
 export const MODELS_RUNTIME_USAGE = USAGE;

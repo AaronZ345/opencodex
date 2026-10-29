@@ -7,13 +7,14 @@ import { handleAccessCommand } from "../../src/cli/access";
 import { handleAgentCommand } from "../../src/cli/agent";
 import { handleComboCommand } from "../../src/cli/combo";
 import { handleConfigCommand } from "../../src/cli/config-command";
-import { handleClientIntegrationCommand, handleGrokCommand } from "../../src/cli/integrations";
+import { handleClientIntegrationCommand, handleGrokCommand, handleClaudeInterceptCommand } from "../../src/cli/integrations";
 import { handleModelsRuntimeCommand } from "../../src/cli/models-runtime";
 import { handleProviderRuntimeCommand } from "../../src/cli/provider-runtime";
 import { providerQuotaLine } from "../../src/cli/account-extended";
 import { formatAccountTable } from "../../src/cli/account";
 import { handleConnectCommand } from "../../src/cli/connect";
-import { handleSystemCommand } from "../../src/cli/system-command";
+import { CAPABILITIES, capabilityInvocation } from "../../src/cli/capabilities";
+import { codexRestartLines, handleSystemCommand } from "../../src/cli/system-command";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
 
@@ -29,7 +30,12 @@ describe("ocx system codex-restart confirmation", () => {
       expect(requests).toHaveLength(0);
       const warning = errors.mock.calls.flat().join(" ");
       expect(warning).toContain("requires --yes");
+      expect(warning).toContain("restarts the Codex app-servers");
+      expect(warning).toContain("model picker predates the current catalog");
       expect(warning).toContain("fully quits and relaunches the Codex desktop app");
+      expect(warning).toContain("unsaved composer drafts");
+      expect(warning).toContain("model-picker selections");
+      expect(warning).toContain("pending approval prompts");
     } finally { errors.mockRestore(); }
   });
 
@@ -46,11 +52,30 @@ describe("ocx system codex-restart confirmation", () => {
       const text = output.mock.calls.flat().join("\n");
       if (wantsJson) expect(JSON.parse(text)).toEqual(result);
       else {
-        expect(text).toContain("Codex desktop app");
-        expect(text).toContain("restart requested.");
-        expect(text).not.toContain("restarted");
+        expect(text).toContain("No Codex app-server needed stopping.");
+        expect(text).toContain("The Codex desktop app was not restarted (self_ancestry).");
+        expect(text).not.toContain("relaunched");
       }
     } finally { output.mockRestore(); }
+  });
+
+  test.each([
+    [{ code: "stopped", stopped: [1, 2], desktopApp: { attempted: false, relaunch: "skipped", reason: "picker_current" } },
+      ["Stopped 2 Codex app-server(s)", "left running", "unsaved drafts and pending approvals were kept"], ["may have been lost"]],
+    [{ code: "stopped", stopped: [1], desktopApp: { attempted: true, relaunch: "started", stopped: [9], surviving: [], pickerState: "stale" } },
+      ["quit and relaunched", "predated the current catalog", "may have been lost"], ["left running", "could not be confirmed"]],
+    [{ code: "stopped", stopped: [1], desktopApp: { attempted: true, relaunch: "started", stopped: [9], surviving: [], pickerState: "unknown" } },
+      ["quit and relaunched", "could not be confirmed current", "may have been lost"], ["predated"]],
+    [{ code: "stopped", stopped: [1], desktopApp: { attempted: true, relaunch: "started", stopped: [9], surviving: [] } },
+      ["quit and relaunched", "could not be confirmed current"], ["predated"]],
+    [{ code: "nothing_running", stopped: [], desktopApp: { attempted: true, relaunch: "skipped", reason: "relaunch_failed" } },
+      ["restart did not complete (relaunch_failed)", "may have been lost"], ["left running"]],
+    [{ code: "enumeration_unavailable", stopped: [], desktopApp: { attempted: false, relaunch: "skipped", reason: "no_targets" } },
+      ["Could not list Codex app-servers", "is not running"], ["may have been lost"]],
+  ])("reports whether unsaved desktop state survived (%#)", (result, present, absent) => {
+    const text = codexRestartLines(result).join("\n");
+    for (const fragment of present) expect(text).toContain(fragment);
+    for (const fragment of absent) expect(text).not.toContain(fragment);
   });
 });
 
@@ -135,12 +160,74 @@ describe("ocx system settings desktop switches", () => {
     }
   });
 
+  test("reports externally owned switch and authentication state without claiming a rewrite", async () => {
+    const { deps } = fakeRuntime(() => ({
+      ok: true,
+      codexDesktopSwitches: {
+        codexDesktopAuthless: { stored: true, effective: null },
+        codexClientCompaction: { stored: false, effective: null },
+        apply: { applied: false, reason: "external_provider", retryable: false },
+        authSource: {
+          presentsCodexAccount: null,
+          summary: "An external model provider owns Codex sign-in behavior; its account requirement was not changed.",
+        },
+      },
+    }));
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleSystemCommand(["settings", "--desktop-authless", "on"], deps)).toBe(0);
+      const output = logSpy.mock.calls.flat().join("\n");
+      expect(output).toContain("effective state is controlled by the external model provider");
+      expect(output).toContain("was not rewritten because an external model provider owns config.toml");
+      expect(output).toContain("Auth source: An external model provider owns Codex sign-in behavior");
+      expect(output).not.toContain("was rewritten.");
+      expect(output).not.toContain("ocx sync");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   test("keeps the legacy success line when an older server omits the switch report", async () => {
     const { deps } = fakeRuntime((_req, body) => ({ ok: true, ...body }));
     const logSpy = spyOn(console, "log").mockImplementation(() => {});
     try {
       expect(await handleSystemCommand(["settings", "--desktop-authless", "on"], deps)).toBe(0);
       expect(logSpy.mock.calls.flat().join("\n")).toBe("System settings updated.");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("reports undetermined ownership without claiming external control", async () => {
+    const { deps } = fakeRuntime(() => ({
+      ok: true,
+      codexDesktopSwitches: {
+        codexDesktopAuthless: { stored: true, effective: null },
+        codexClientCompaction: { stored: false, effective: null },
+        apply: {
+          applied: false,
+          reason: "ownership_undetermined",
+          retryable: true,
+          detail: "config.toml ownership could not be determined: EACCES",
+        },
+        authSource: {
+          presentsCodexAccount: null,
+          summary: "Whether the Codex app requires its own account sign-in is undetermined; config.toml ownership could not be read.",
+        },
+      },
+    }));
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleSystemCommand(["settings", "--desktop-authless", "on"], deps)).toBe(0);
+      const output = logSpy.mock.calls.flat().join("\n");
+      expect(output).toContain("effective state could not be determined");
+      expect(output).toContain("was not rewritten because config.toml ownership could not be determined");
+      expect(output).toContain("Auth source: Whether the Codex app requires its own account sign-in is undetermined");
+      expect(output).not.toContain("controlled by the external model provider");
+      // Observation can recover while integration stays disabled; sync cannot inject then.
+      expect(output).not.toContain("ocx sync");
+      expect(output).toContain("ocx system settings --json");
+      expect(output).toContain("Resolve the reported config.toml read error");
     } finally {
       logSpy.mockRestore();
     }
@@ -306,16 +393,103 @@ describe("ocx agent sidecar --list (#2188)", () => {
       logSpy.mockRestore();
     }
   });
+
+  test("web --enabled off stores the switch and reports the Codex-side write in the Desktop switches' words", async () => {
+    const { requests, deps } = fakeRuntime((req, body) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "PUT") {
+        expect(body).toEqual({ webSearch: { enabled: false } });
+        return {
+          ok: true,
+          webSearch: { enabled: false },
+          // The route reports the injection it ran; a refusal has to read like every other one.
+          codexWebSearch: {
+            applied: false,
+            reason: "write_lock_busy",
+            retryable: true,
+            detail: "another Codex config writer owns the lock",
+          },
+        };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "web", "--enabled", "off"], deps)).toBe(0);
+      expect(requests).toEqual([
+        { path: "/api/sidecar-settings", method: "PUT", body: { webSearch: { enabled: false } } },
+      ]);
+      const out = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(out).toContain("web sidecar settings updated.");
+      expect(out).toContain("Codex config: ~/.codex/config.toml was not rewritten because the Codex config write lock is busy.");
+      expect(out).toContain("Details: another Codex config writer owns the lock");
+      expect(out).toContain("Run 'ocx sync' to apply the stored settings.");
+      // The internal reason code stays out of the human line.
+      expect(out).not.toContain("write_lock_busy");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("a report the server did not treat as a switch move adds no Codex line", async () => {
+    const { deps } = fakeRuntime((req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "PUT") {
+        return { ok: true, webSearch: { enabled: false }, codexWebSearch: { applied: false, reason: "not_requested", retryable: false } };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "web", "--enabled", "off"], deps)).toBe(0);
+      const out = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(out).toBe("web sidecar settings updated.");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("an externally owned Codex config gets no 'ocx sync' retry advice", async () => {
+    const { deps } = fakeRuntime((req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "PUT") {
+        return {
+          ok: true,
+          webSearch: { enabled: false },
+          codexWebSearch: {
+            applied: false,
+            reason: "external_provider",
+            retryable: false,
+            detail: 'config.toml selects the external model_provider "custom".',
+          },
+        };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "web", "--enabled", "off"], deps)).toBe(0);
+      const out = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(out).toContain("was not rewritten because an external model provider owns config.toml");
+      expect(out).not.toContain("ocx sync");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
 
-afterEach(() => {
-  for (const server of servers.splice(0)) server.stop(true);
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map(server => server.stop(true)));
   process.exitCode = 0;
 });
 
 function fakeRuntime(responder?: (req: Request, body: unknown) => unknown) {
   const requests: Recorded[] = [];
   const server = Bun.serve({
+    // Bind the exact address the CLI dials (#7416). A wildcard bind lets another process on a
+    // loaded host bind 127.0.0.1 on the same port; it then receives this fake's requests, and a
+    // real proxy there answers the management call with 404.
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
@@ -324,6 +498,13 @@ function fakeRuntime(responder?: (req: Request, body: unknown) => unknown) {
       const custom = responder?.(req, body);
       if (custom instanceof Response) return custom;
       if (custom !== undefined) return Response.json(custom);
+      if (req.method === "PATCH" && url.pathname === "/api/providers") return Response.json({ success: true, name: url.searchParams.get("name"), disabled: false, hasApiKey: false, catalogRefresh: null });
+      if (req.method === "PUT" && url.pathname === "/api/combos") {
+        const saved = body as { id: string; combo: Record<string, unknown> };
+        const combo = Object.fromEntries(Object.entries(saved.combo).filter(([key, value]) => value !== null || key === "defaultEffort"));
+        return Response.json({ success: true, id: saved.id, model: typeof combo.alias === "string" && combo.alias.trim() ? combo.alias.trim() : `combo/${saved.id}`, combo,
+          catalogRefresh: { status: "committed", changed: true, degraded: false, notices: [] } });
+      }
       return Response.json({ ok: true });
     },
   });
@@ -375,6 +556,7 @@ describe("headless GUI parity CLI", () => {
       ["/api/combos", "ocx combo"],
       ["/api/client-config", "ocx export"],
       ["/api/client-integrations", "ocx integration client"],
+      ["/api/codex-agent-roles", "ocx agent roles"],
       // #2463: both read and write reach the CLI. `ocx alias list` reads /api/aliases,
       // `ocx alias defaults` writes /api/default-aliases, and the per-provider writes sit
       // under /api/providers/:name/alias, already covered by the /api/providers prefix.
@@ -386,6 +568,7 @@ describe("headless GUI parity CLI", () => {
       // the Claude flag flips through `ocx claude config` — so a dedicated
       // `ocx integration native` verb would duplicate existing commands rather
       // than add a capability. Listed so the sweep stays exhaustive.
+      ["/api/claude-intercept/start", "ocx claude intercept start"],
       ["/api/native-integrations", "(none — GUI-only)"],
       // #3417: the dashboard's native main login disclosure reads and writes the same
       // routes as `ocx account main` — list/doctor, register, switch and recover — so the
@@ -401,9 +584,12 @@ describe("headless GUI parity CLI", () => {
       ["/api/keys/rotate/commit", "ocx access key rotate commit"],
       ["/api/machine", "ocx connect/status/sync/disconnect"],
       ["/api/session/logout", "(none — GUI current-session logout)"],
+      ["/api/session/remember", "(none — GUI remembered-device exchange; the CLI holds no browser cookie jar)"],
       ["/api/logs", "ocx observe"],
       ["/api/lab", "ocx lab"],
       ["/api/config", "ocx config"],
+      ["/api/advisor", "ocx advisor"],
+      ["/api/companion", "ocx companion"],
       // The client machine plane. These are served by the connected client's own loopback
       // listener rather than the hub, and each one mirrors a connect-family command:
       // status/clients -> `ocx connect status`, sync -> `ocx sync`, shim -> the client
@@ -415,11 +601,20 @@ describe("headless GUI parity CLI", () => {
       // inventory and writes one config key. There is no headless equivalent
       // today, and claiming one would be worse than saying so here.
       ["/api/codex-prompt", "(none — GUI prompt-layer surface; keys live in config.toml)"],
+      // Claude reset grants: reading is an owed CLI verb (deferred-verb in the route
+      // registry) and spending is dashboard-session-only by design.
+      ["/api/anthropic/reset-grants", "(none — GUI reset-grant dialog; spend requires a dashboard session)"],
+      // The registry records read-only status as an owed CLI verb; trust, launch,
+      // settings and the account-wide trial intentionally require local GUI consent.
+      ["/api/codex/desktop-compatibility", "(none — local GUI confirmation; status CLI deferred in clients/codex-desktop.md)"],
+      ["/api/protocols", "ocx api protocols/explain/policy"],
       ["/api/settings", "ocx system"],
+      ["/api/native-reasoning-retention", "(none — dedicated live CLI deferred; local policy via ocx config)"],
       // Routing Intelligence (RI-04..RI-10): profiles + dry-run are mirrored by
       // `ocx route policy`. Analytics is GUI-first for now; the same request
       // history remains available through observe/index tooling.
       ["/api/routing-profiles", "ocx route policy"],
+      ["/api/fallback", "ocx fallback"],
       ["/api/routing-analytics", "(none — GUI analytics surface; history via ocx observe/logs)"],
       // Remote Workspace is one product family in both surfaces. The current CLI owns
       // executor pairing, presence, and local status; Hub/device/session inspection is
@@ -427,7 +622,12 @@ describe("headless GUI parity CLI", () => {
       // the management route registry land. Naming the family here does not claim those
       // local and Hub status payloads are equivalent.
       ["/api/remote-workspace", "ocx remote-workspace"],
+      // Remote Link: status and revoke are `ocx link status|revoke`. Candidates, probe, host
+      // confirmation, and apply are the dashboard's guided pairing; the headless route is
+      // `ocx link port|issue` plus `ocx connect --link`, which the apply flow drives over SSH.
+      ["/api/link", "ocx link"],
       ["/api/shadow", "ocx models"],
+      ["/api/auto-review-settings", "ocx models auto-review"],
       ["/api/sidecar", "ocx agent"],
       ["/api/startup", "ocx system"],
       ["/api/stop", "ocx stop"],
@@ -440,6 +640,20 @@ describe("headless GUI parity CLI", () => {
       ["/api/v2", "ocx v2/agent"],
       ["/api/windows-tray", "ocx tray"],
     ];
+    // These commands share local owners with the GUI routes; declaring HTTP routes
+    // on the capabilities would falsely claim the CLI sends management requests.
+    // Resolve real capability declarations and require their documented counterpart.
+    for (const [resource, verb, mutates] of [
+      ["/api/codex/cli-update/plan", "plan", false],
+      ["/api/codex/cli-update/apply", "apply", true],
+      ["/api/codex/cli-update/jobs", "status", false],
+    ] as const) {
+      const capability = CAPABILITIES.find(cap => cap.command.join(" ") === `system codex-cli-update ${verb}`);
+      expect(capability, resource).toBeDefined();
+      expect(capability!.mutates).toBe(mutates);
+      expect(capability!.details?.some(detail => detail.includes(resource)), resource).toBe(true);
+      coverage.push([resource, capabilityInvocation(capability!)]);
+    }
     const uncovered = [...endpoints].filter(endpoint => !coverage.some(([prefix]) => endpoint === prefix || endpoint.startsWith(prefix)));
     expect(uncovered).toEqual([]);
   });
@@ -471,6 +685,16 @@ describe("headless GUI parity CLI", () => {
     const runtime = fakeRuntime();
     expect(await handleProviderRuntimeCommand("edit", args, runtime.deps)).toBe(2);
     expect(runtime.requests).toHaveLength(0);
+  });
+
+  test("provider edit sends only validated Copilot context tiers", async () => {
+    const { requests, deps } = fakeRuntime();
+    expect(await handleProviderRuntimeCommand("edit", ["github-copilot", "--model-context-tier", "gpt-5.6-luna=long_context", "--model-context-tier", "gpt-5.5=default"], deps)).toBe(0);
+    expect(requests).toEqual([{ path: "/api/providers?name=github-copilot", method: "PATCH",
+      body: { modelContextTiers: { "gpt-5.6-luna": "long_context", "gpt-5.5": "default" } } }]);
+    expect(await handleProviderRuntimeCommand("edit", ["github-copilot", "--model-context-tier", "gpt-5.5=wide"], deps)).toBe(2);
+    expect(await handleProviderRuntimeCommand("edit", ["openai", "--model-context-tier", "gpt-5.5=default"], deps)).toBe(2);
+    expect(requests).toHaveLength(1);
   });
 
   test("provider edit --headers sends the parsed block and - clears it", async () => {
@@ -640,6 +864,58 @@ describe("headless GUI parity CLI", () => {
     });
   });
 
+  test("combo set accepts the jev strategy without changing target order", async () => {
+    const runtime = fakeRuntime();
+    const code = await handleComboCommand([
+      "set", "jev-auto", "--targets", "openai/gpt-6-astra,openai/gpt-5.6-sol", "--strategy", "jev", "--json",
+    ], runtime.deps);
+    expect(code).toBe(0);
+    expect(runtime.requests.find(request => request.method === "PUT")?.body).toMatchObject({
+      id: "jev-auto",
+      combo: {
+        strategy: "jev",
+        targets: [
+          { provider: "openai", model: "gpt-6-astra" },
+          { provider: "openai", model: "gpt-5.6-sol" },
+        ],
+      },
+    });
+  });
+
+  test("combo set forwards a JEV decision provider and timeout, clears them with -, and rejects other strategies", async () => {
+    const runtime = fakeRuntime();
+    expect(await handleComboCommand([
+      "set", "jev-local", "--targets", "openai/gpt-6-astra,openai/gpt-5.6-sol", "--strategy", "jev",
+      "--decision-provider", "ollama-tev1", "--decision-timeout", "60000", "--json",
+    ], runtime.deps)).toBe(0);
+    expect(await handleComboCommand([
+      "set", "jev-local", "--targets", "openai/gpt-6-astra", "--strategy", "jev",
+      "--decision-provider", "-", "--decision-timeout", "-", "--json",
+    ], runtime.deps)).toBe(0);
+    const puts = runtime.requests.filter(request => request.method === "PUT").map(request => request.body);
+    expect(puts[0]).toMatchObject({
+      id: "jev-local",
+      combo: { strategy: "jev", decisionProvider: "ollama-tev1", decisionTimeoutMs: 60_000 },
+    });
+    expect(puts[1]).toMatchObject({ combo: { decisionProvider: null, decisionTimeoutMs: null } });
+
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Without --strategy the stored strategy decides (#7579), so only the read may precede the refusal.
+      for (const [args, methods] of [
+        [["--decision-provider", "ollama-tev1"], ["GET"]],
+        [["--strategy", "jev", "--decision-timeout", "999"], []],
+        [["--decision-timeout", "5000"], ["GET"]],
+      ] as const) {
+        const rejected = fakeRuntime();
+        expect(await handleComboCommand(["set", "demo", "--targets", "a/m1", ...args], rejected.deps)).toBe(2);
+        expect(rejected.requests.map(request => request.method)).toEqual([...methods]);
+      }
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   test("combo set exposes the opt-in force-default policy", async () => {
     const runtime = fakeRuntime();
     expect(await handleComboCommand([
@@ -655,6 +931,8 @@ describe("headless GUI parity CLI", () => {
     const runtime = fakeRuntime(req => req.method === "GET" ? {
       combos: [{
         id: "deep",
+        strategy: "failover",
+        stickyLimit: 1,
         defaultEffort: "max",
         defaultEffortMode: "force",
         targets: [{ provider: "ark", model: "old-model" }],
@@ -729,7 +1007,8 @@ describe("headless GUI parity CLI", () => {
       if (req.method === "PUT") {
         const update = body as { id: string; combo: Record<string, unknown> };
         persisted = { id: update.id, ...update.combo };
-        return { combo: persisted };
+        return { success: true, id: update.id, model: `combo/${update.id}`, combo: update.combo,
+          catalogRefresh: { status: "committed", changed: true, degraded: false, notices: [] } };
       }
       return undefined;
     });
@@ -757,6 +1036,196 @@ describe("headless GUI parity CLI", () => {
     ]);
   });
 
+  test("agent roles reads and sets through the role-model routes, --json in any position", async () => {
+    const runtime = fakeRuntime(req => req.method === "GET" ? { lazycodex: { detected: true }, omoJsonc: { state: "absent" }, roles: [] } : undefined);
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["roles", "--json"], runtime.deps)).toBe(0);
+      expect(await handleAgentCommand(["roles", "set", "ocx explorer", "xai/grok-4.5", "--json"], runtime.deps)).toBe(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/codex-agent-roles", method: "GET", body: null },
+      { path: "/api/codex-agent-roles/ocx%20explorer", method: "PUT", body: { model: "xai/grok-4.5" } },
+    ]);
+  });
+
+  test("agent roles set forwards --effort and refuses an empty one before any request", async () => {
+    const runtime = fakeRuntime(() => ({ toml: { status: "written" }, omoJsonc: { status: "written" } }));
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["roles", "set", "explorer", "a/model", "--effort", "high", "--json"], runtime.deps)).toBe(0);
+      expect(await handleAgentCommand(["roles", "set", "explorer", "b/model", "--effort", ""], runtime.deps)).toBe(2);
+      expect(errorSpy.mock.calls.map(call => String(call[0]))).toContain("Error: --effort needs a reasoning level");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/codex-agent-roles/explorer", method: "PUT", body: { model: "a/model", effort: "high" } },
+    ]);
+  });
+
+  test("agent roles suggest prints proposals, and --apply writes only proposed roles through PUT", async () => {
+    const proposals = {
+      sizingModel: "gpt-5.5",
+      proposals: [
+        { role: "explorer", model: "gpt-5.5", status: "proposed", tier: "fast", effortIntent: "glance", proposedModel: "a/small", proposedEffort: "low" },
+        { role: "worker", model: null, status: "proposed", tier: "standard", effortIntent: "measured", rationale: "Use \x1b]52;c;cG9pc29uZWQ=\x07 carefully.", proposedModel: "a/mid", proposedEffort: null },
+        { role: "vague", model: null, status: "unsized", reason: "no JSON" },
+      ],
+    };
+    const runtime = fakeRuntime(req => req.method === "POST" ? proposals : { ok: true });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    let output = "";
+    try {
+      expect(await handleAgentCommand(["roles", "suggest", "--model", "a/sizer", "--json"], runtime.deps)).toBe(0);
+      expect(JSON.parse(logSpy.mock.calls.flat().join("\n"))).toEqual(proposals);
+      logSpy.mockClear();
+      expect(await handleAgentCommand(["roles", "suggest", "--apply"], runtime.deps)).toBe(0);
+      output = logSpy.mock.calls.flat().join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/codex-agent-roles/auto-assign", method: "POST", body: { model: "a/sizer" } },
+      { path: "/api/codex-agent-roles/auto-assign", method: "POST", body: {} },
+      { path: "/api/codex-agent-roles/explorer", method: "PUT", body: { model: "a/small", effort: "low" } },
+      { path: "/api/codex-agent-roles/worker", method: "PUT", body: { model: "a/mid" } },
+    ]);
+    expect(output).not.toMatch(/[\x07\x1b]/);
+    expect(output).toContain("Use \\x1b]52;c;cG9pc29uZWQ=\\x07 carefully.");
+  });
+
+  test("agent roles suggest --apply skips proposals that already match the role's pin and says so", async () => {
+    const proposals = {
+      sizingModel: "gpt-5.5",
+      proposals: [
+        { role: "explorer", model: "a/small", effort: "low", status: "proposed", tier: "fast", effortIntent: "glance", proposedModel: "a/small", proposedEffort: "low" },
+        { role: "reviewer", model: "a/mid", effort: null, status: "proposed", tier: "standard", effortIntent: "measured", proposedModel: "a/mid", proposedEffort: null },
+        { role: "planner", model: "a/mid", effort: "low", status: "proposed", tier: "standard", effortIntent: "thorough", proposedModel: "a/mid", proposedEffort: "high" },
+        { role: "worker", model: null, effort: null, status: "proposed", tier: "standard", effortIntent: "measured", proposedModel: "a/mid", proposedEffort: null },
+      ],
+    };
+    const runtime = fakeRuntime(req => req.method === "POST" ? proposals : { ok: true });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    let output = "";
+    try {
+      expect(await handleAgentCommand(["roles", "suggest", "--apply"], runtime.deps)).toBe(0);
+      output = logSpy.mock.calls.flat().join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/codex-agent-roles/auto-assign", method: "POST", body: {} },
+      { path: "/api/codex-agent-roles/planner", method: "PUT", body: { model: "a/mid", effort: "high" } },
+      { path: "/api/codex-agent-roles/worker", method: "PUT", body: { model: "a/mid" } },
+    ]);
+    expect(output).toContain("Applied 2 of 4 roles. Skipped 2 already set: explorer, reviewer.");
+  });
+
+  test("agent roles suggest --apply names each role whose omo.jsonc mirror was not written", async () => {
+    const proposals = {
+      sizingModel: "gpt-5.5",
+      proposals: ["explorer", "reviewer", "planner", "worker"].map(role => ({
+        role, model: null, effort: null, status: "proposed", tier: "standard", effortIntent: "measured", proposedModel: "a/mid", proposedEffort: null,
+      })),
+    };
+    const mirror: Record<string, string> = { explorer: "written", reviewer: "write_failed", planner: "invalid", worker: "skipped_comments" };
+    const runtime = fakeRuntime(req => req.method === "POST"
+      ? proposals
+      : { ok: true, toml: { status: "written" }, omoJsonc: { status: mirror[new URL(req.url).pathname.split("/").pop()!] } });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    let output = "";
+    let json: { applied?: unknown[]; omoJsoncNotWritten?: unknown } = {};
+    try {
+      expect(await handleAgentCommand(["roles", "suggest", "--apply"], runtime.deps)).toBe(0);
+      output = logSpy.mock.calls.flat().join("\n");
+      logSpy.mockClear();
+      expect(await handleAgentCommand(["roles", "suggest", "--apply", "--json"], runtime.deps)).toBe(0);
+      json = JSON.parse(String(logSpy.mock.calls.flat().join("")));
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(output).toContain("Applied 4 of 4 roles.");
+    expect(output).toContain("reviewer: omo.jsonc not written (write_failed)");
+    expect(output).toContain("planner: omo.jsonc not written (invalid)");
+    expect(output).toContain("worker: omo.jsonc not written (skipped_comments)");
+    expect(output).not.toContain("explorer: omo.jsonc");
+    expect(json.applied).toHaveLength(4);
+    expect(json.omoJsoncNotWritten).toEqual([
+      { role: "reviewer", status: "write_failed" },
+      { role: "planner", status: "invalid" },
+      { role: "worker", status: "skipped_comments" },
+    ]);
+  });
+
+  test("agent roles suggest --apply stops at the lazycodex_not_detected refusal and writes nothing", async () => {
+    const runtime = fakeRuntime(req => req.method === "POST"
+      ? Response.json({ error: "omo (Codex / LazyCodex) is not installed in this CODEX_HOME", code: "lazycodex_not_detected" }, { status: 409 })
+      : { ok: true });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    let output = "";
+    try {
+      expect(await handleAgentCommand(["roles", "suggest", "--apply"], runtime.deps)).not.toBe(0);
+      output = errorSpy.mock.calls.flat().join("\n");
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([{ path: "/api/codex-agent-roles/auto-assign", method: "POST", body: {} }]);
+    expect(output).toContain("omo (Codex / LazyCodex) is not installed");
+  });
+
+  test("agent injection suggest prints the proposal, and --apply writes it through PUT /api/injection-model", async () => {
+    const suggestion = {
+      sizingModel: "gpt-5.5",
+      proposal: { model: "a/big", effort: "high", status: "proposed", tier: "fast", effortIntent: "glance", rationale: "Bounded\x1b]52;c;payload\x07 edits.", moveUpIf: "It crosses\rmodules.", moveDownIf: "Never\u009b31m.", proposedModel: "a/small", proposedEffort: "low", reason: null },
+    };
+    const runtime = fakeRuntime(req => req.method === "POST" ? suggestion : { ok: true });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["injection", "suggest", "rename", "symbols", "--model", "a/sizer", "--json"], runtime.deps)).toBe(0);
+      expect(JSON.parse(logSpy.mock.calls.flat().join("\n"))).toEqual(suggestion);
+      logSpy.mockClear();
+      expect(await handleAgentCommand(["injection", "suggest", "rename symbols", "--apply"], runtime.deps)).toBe(0);
+      const output = logSpy.mock.calls.flat().join("\n");
+      expect(output).not.toMatch(/[\x07\x1b\r\u009b]/);
+      expect(output).toContain("Bounded\\x1b]52;c;payload\\x07 edits.");
+      expect(output).toContain("It crosses\\x0dmodules.");
+      expect(output).toContain("Never\\u009b31m.");
+      expect(await handleAgentCommand(["injection", "suggest"], runtime.deps)).not.toBe(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/injection-model/suggest", method: "POST", body: { work: "rename symbols", model: "a/sizer" } },
+      { path: "/api/injection-model/suggest", method: "POST", body: { work: "rename symbols" } },
+      { path: "/api/injection-model", method: "PUT", body: { model: "a/small", effort: "low" } },
+    ]);
+  });
+
+  test("agent injection suggest --apply skips a proposal that already matches the delegation model and effort and says so", async () => {
+    const suggestion = {
+      sizingModel: "gpt-5.5",
+      proposal: { model: "a/small", effort: "low", status: "proposed", tier: "fast", effortIntent: "glance", rationale: "Bounded edits.", moveUpIf: "It crosses modules.", moveDownIf: "Never.", proposedModel: "a/small", proposedEffort: "low", reason: null },
+    };
+    const runtime = fakeRuntime(req => req.method === "POST" ? suggestion : { ok: true });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    let output = "";
+    try {
+      expect(await handleAgentCommand(["injection", "suggest", "rename symbols", "--apply"], runtime.deps)).toBe(0);
+      output = logSpy.mock.calls.flat().join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(runtime.requests).toEqual([
+      { path: "/api/injection-model/suggest", method: "POST", body: { work: "rename symbols" } },
+    ]);
+    expect(output).toContain("Already set to a/small (low); nothing applied.");
+  });
+
   test("API key create returns the one-time key through the access command", async () => {
     const runtime = fakeRuntime((req) => new URL(req.url).pathname === "/api/keys"
       ? { id: "key-1", name: "deploy", key: "ocx_secret" }
@@ -767,13 +1236,17 @@ describe("headless GUI parity CLI", () => {
 
   test("remote connect status is headless and revoke refuses disconnected state before hub traffic", async () => {
     let requests = 0;
+    const lockRoot = mkdtempSync(join(tmpdir(), "ocx-connect-parity-lock-"));
+    const lifecycleLockDeps = { lockPath: join(lockRoot, "client-lifecycle.sqlite") };
     const logSpy = spyOn(console, "log").mockImplementation(() => {});
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
     try {
       expect(await handleConnectCommand(["status", "--json"], {
+        lifecycleLockDeps,
         fetchImpl: async () => { requests += 1; return new Response(); },
       })).toBe(0);
       expect(await handleConnectCommand(["revoke", "--admin-token-stdin", "--json"], {
+        lifecycleLockDeps,
         stdinImpl: Readable.from(["ocx_admin_test\n"]),
         fetchImpl: async () => { requests += 1; return new Response(); },
       })).toBe(1);
@@ -781,6 +1254,7 @@ describe("headless GUI parity CLI", () => {
     } finally {
       logSpy.mockRestore();
       errorSpy.mockRestore();
+      removeTreeWithRetry(lockRoot);
     }
   });
 
@@ -1194,6 +1668,44 @@ test("Aside status prints the empty-profile diagnostic for humans", async () => 
   } finally { log.mockRestore(); }
 });
 
+test("Aside status names preview-then-enable commands only for off (stale) profiles", async () => {
+  const profiles = [
+    { clientId: "aside", profileId: 0, name: "A", enabled: false, state: "stale" },
+    { clientId: "aside", profileId: 1, name: "B", enabled: true, state: "stale" },
+    { clientId: "aside", profileId: 2, name: "C", enabled: false, state: "conflict" },
+    { clientId: "aside", profileId: 3, name: "D", enabled: false, state: "current" },
+    { clientId: "aside", profileId: 4, name: "E", enabled: false, state: "stale" },
+  ];
+  const runtime = fakeRuntime(() => ({ clientId: "aside", profiles }));
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    expect(await handleClientIntegrationCommand(["status", "--client", "aside"], runtime.deps)).toBe(0);
+    const text = log.mock.calls.flat().join("\n");
+    expect(text).toContain("0  A: off (stale)");
+    expect(text.match(/--operation apply --profile \d+/g)).toEqual(["--operation apply --profile 0", "--operation apply --profile 4"]);
+    expect(text.match(/enable --client aside --profile \d+/g)).toEqual(["enable --client aside --profile 0", "enable --client aside --profile 4"]);
+    expect(text).toContain("Then, if the preview permits the change and you accept it:");
+    log.mockClear();
+    expect(await handleClientIntegrationCommand(["status", "--client", "aside", "--json"], runtime.deps)).toBe(0);
+    expect(JSON.parse(log.mock.calls.flat().join("\n"))).toEqual({ clientId: "aside", profiles });
+    expect(runtime.requests.map(row => row.method)).toEqual(["GET", "GET"]);
+  } finally { log.mockRestore(); }
+});
+
+test("single Aside profile status adds recovery commands only when off (stale)", async () => {
+  let profile: Record<string, unknown> = { clientId: "aside", profileId: 4, enabled: false, state: "stale", installed: true };
+  const runtime = fakeRuntime(() => profile);
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    expect(await handleClientIntegrationCommand(["status", "--client", "aside", "--profile", "4"], runtime.deps)).toBe(0);
+    expect(log.mock.calls.flat().join("\n")).toContain("ocx integration client enable --client aside --profile 4");
+    profile = { ...profile, state: "conflict" }; log.mockClear();
+    expect(await handleClientIntegrationCommand(["status", "--client", "aside", "--profile", "4"], runtime.deps)).toBe(0);
+    expect(log.mock.calls.flat().join("\n")).not.toContain("enable --client aside");
+    expect(runtime.requests.map(row => row.path)).toEqual(["/api/client-integrations/aside/profiles/4", "/api/client-integrations/aside/profiles/4"]);
+  } finally { log.mockRestore(); }
+});
+
 describe("Aside CLI recovery metadata", () => {
   test.each([
     { name: "a long POSIX backup path", snapshotPath: `/tmp/aside-recovery/${"profile-2-snapshot/".repeat(80)}models.json.bak` },
@@ -1296,4 +1808,47 @@ test("provider edit rejects incomplete text-only targeting before contacting the
     }
     expect(requests).toHaveLength(0);
   } finally { error.mockRestore(); }
+});
+
+describe("ownership recovery advice does not assume injection is enabled", () => {
+  for (const reason of ["ownership_undetermined", "integration_disabled"]) {
+    test(`sidecar ${reason} does not promise sync will apply settings`, async () => {
+      const { requests, deps } = fakeRuntime(() => ({
+        ok: true, codexWebSearch: { applied: false, reason, retryable: true },
+      }));
+      const log = spyOn(console, "log").mockImplementation(() => {});
+      try {
+        expect(await handleAgentCommand(["sidecar", "web", "--enabled", "on"], deps)).toBe(0);
+        expect(requests).toHaveLength(1);
+        const text = log.mock.calls.flat().join("\n");
+        expect(text).toContain("was not rewritten");
+        expect(text).not.toContain("ocx sync");
+        if (reason === "ownership_undetermined") expect(text).toContain("Resolve the reported config.toml read error");
+        expect(text).toContain(reason === "ownership_undetermined"
+          ? "ocx system settings --json" : "Enable Codex integration");
+      } finally { log.mockRestore(); }
+    });
+  }
+});
+
+test("the fake runtime owns the loopback address the CLI dials", async () => {
+  const { deps } = fakeRuntime();
+  const port = Number(new URL(deps.baseUrl).port);
+  let intruder: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    intruder = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response(null, { status: 404 }) });
+  } catch (error) {
+    expect((error as { code?: string }).code).toBe("EADDRINUSE");
+  }
+  await intruder?.stop(true);
+  expect(intruder).toBeUndefined();
+});
+
+test("Claude intercept start uses the management POST and preserves refusal exit status", async () => {
+  const success = fakeRuntime();
+  expect(await handleClaudeInterceptCommand(["start", "--json"], success.deps)).toBe(0);
+  expect(success.requests).toEqual([{ path: "/api/claude-intercept/start", method: "POST", body: null }]);
+  const refused = fakeRuntime(() => Response.json({ ok: false, reason: "port_in_use" }, { status: 409 }));
+  expect(await handleClaudeInterceptCommand(["start", "--json"], refused.deps)).not.toBe(0);
+  expect(refused.requests).toHaveLength(1);
 });

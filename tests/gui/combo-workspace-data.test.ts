@@ -11,6 +11,7 @@ import {
   groupCombos,
   intersectComboEfforts,
   isValidComboId,
+  jevAutoDraft,
   parseComboList,
   providerQuotaStatesFromReports,
   nextProviderQuotaStateExpiration,
@@ -18,7 +19,7 @@ import {
   updateComboAliasDraft,
   validateComboDraft,
 } from "../../gui/src/combo-workspace-data";
-import { comboImagesSupported } from "../../gui/src/combo-capabilities";
+import { comboImageBlockedTargets, comboImagesSupported, comboVisionSidecarTargets } from "../../gui/src/combo-capabilities";
 
 const configuredProviders = {
   a: {},
@@ -104,6 +105,125 @@ function validate(
 }
 
 describe("combo-workspace-data", () => {
+  test("parse and PUT preserve the JEV strategy", () => {
+    const parsed = parseComboList({
+      combos: [{
+        id: "jev-auto",
+        alias: "jev-auto",
+        strategy: "jev",
+        reasoningEffortMode: "adaptive",
+        targets: [{ provider: "openai", model: "gpt-6-astra" }],
+      }],
+    })[0]!;
+
+    expect(parsed.strategy).toBe("jev");
+    expect(toPutBody(parsed)).toEqual({
+      id: "jev-auto",
+      combo: {
+        targets: [{ provider: "openai", model: "gpt-6-astra" }],
+        strategy: "jev",
+        defaultEffort: null,
+        imageInput: "auto",
+        reasoningEffortMode: "adaptive",
+        alias: "jev-auto",
+        decisionProvider: null,
+        decisionModel: null,
+        decisionTimeoutMs: null,
+      },
+    });
+  });
+
+  test("parse, edit and PUT round-trip a target-specific model note", () => {
+    const parsed = parseComboList({ combos: [{
+      id: "jev-auto", strategy: "jev",
+      targets: [{ provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context." }],
+    }] })[0]!;
+    expect(parsed.targets[0]?.modelProfile).toBe("Low marginal subscription cost; 1M context.");
+    expect(draftEquals(parsed, { ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Different" }] })).toBe(false);
+    expect(toPutBody(parsed).combo.targets[0]).toEqual({
+      provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context.",
+    });
+    const switched = { ...parsed, strategy: "failover" as const };
+    expect(toPutBody(switched).combo.strategy).toBe("failover");
+    expect(toPutBody(switched).combo.targets[0]).toEqual({
+      provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context.",
+    });
+    const blankNote = {
+      ...switched,
+      targets: [{ ...switched.targets[0]!, modelProfile: " \t " }],
+    };
+    expect(toPutBody(blankNote).combo.targets[0]).toEqual({ provider: "a", model: "m1" });
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "x".repeat(513) }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Bell\u0007note" }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Del\u007fnote" }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Line one\n\tLine two\r\nLine three" }] }))
+      .not.toBe("invalidModelProfile");
+  });
+
+  test("parse, dirty tracking, validation, and PUT preserve exact JEV target efforts", () => {
+    const payload = {
+      combos: [{
+        id: "jev-auto",
+        strategy: "jev",
+        targets: [
+          { provider: "a", model: "m1", reasoningEfforts: ["low", "high"] },
+          { provider: "b", model: "m2" },
+        ],
+      }],
+    };
+    const parsed = parseComboList(payload)[0]!;
+
+    expect(parsed.targets[0]?.reasoningEfforts).toEqual(["low", "high"]);
+    expect(parsed.targets[1]?.reasoningEfforts).toBeUndefined();
+    expect(toPutBody(parsed).combo.targets).toEqual([
+      { provider: "a", model: "m1", reasoningEfforts: ["low", "high"] },
+      { provider: "b", model: "m2" },
+    ]);
+
+    payload.combos[0]!.targets[0]!.reasoningEfforts!.push("max");
+    expect(parsed.targets[0]?.reasoningEfforts).toEqual(["low", "high"]);
+    expect(draftEquals(parsed, {
+      ...parsed,
+      targets: [{ ...parsed.targets[0]!, reasoningEfforts: ["low"] }, parsed.targets[1]!],
+    })).toBe(false);
+    expect(validate(combo({
+      strategy: "jev",
+      targets: [{ provider: "a", model: "m1", reasoningEfforts: [] }],
+    }))).toBe("invalidReasoningEfforts");
+  });
+
+  test("JEV Auto template uses the available Astra, Sol, and Luna targets in fail-open order", () => {
+    const draft = jevAutoDraft([
+      { provider: "native-only", id: "gpt-6-astra", reasoningEfforts: ["medium"] },
+      { provider: "native-only", id: "gpt-5.6-sol", reasoningEfforts: ["medium"] },
+      { provider: "native-only", id: "gpt-5.6-luna", reasoningEfforts: ["medium"] },
+      { provider: "openai", id: "gpt-5.6-luna", reasoningEfforts: ["low", "medium"] },
+      { provider: "anthropic", id: "claude-sonnet-5" },
+      { provider: "openai", id: "gpt-6-astra", reasoningEfforts: ["medium", "high"] },
+      { provider: "openai", id: "gpt-5.6-sol", reasoningEfforts: ["low", "medium", "high"] },
+    ], new Set(["openai", "anthropic"]));
+
+    expect(draft).toMatchObject({
+      id: "jev-auto",
+      model: "jev-auto",
+      alias: "jev-auto",
+      strategy: "jev",
+      defaultEffort: null,
+      reasoningEffortMode: "adaptive",
+    });
+    expect(draft.targets.map(({ provider, model }) => ({ provider, model }))).toEqual([
+      { provider: "openai", model: "gpt-6-astra" },
+      { provider: "openai", model: "gpt-5.6-sol" },
+      { provider: "openai", model: "gpt-5.6-luna" },
+    ]);
+    expect(draft.targets.every(target => typeof target.clientKey === "string")).toBe(true);
+    draft.targets.splice(1, 1);
+    expect(draft.targets.map(target => target.model)).toEqual(["gpt-6-astra", "gpt-5.6-luna"]);
+  });
+
   test("parseComboList accepts normalized GET rows and skips malformed entries", () => {
     const items = parseComboList({
       combos: [
@@ -283,10 +403,12 @@ describe("combo-workspace-data", () => {
     expect(parsedItem?.reasoningEffortMode).toBe("adaptive");
     expect(toPutBody(parsedItem!).combo.reasoningEffortMode).toBe("adaptive");
 
-    // The default stays off the wire so a GET -> PUT round-trip never writes it back.
-    expect(toPutBody(combo()).combo).not.toHaveProperty("reasoningEffortMode");
-    expect(toPutBody(combo({ reasoningEffortMode: "strict" })).combo)
-      .not.toHaveProperty("reasoningEffortMode");
+    // Strict now goes on the wire explicitly (#5687): the server preserves an omitted field
+    // from the stored combo, so an omitted strict could never replace a stored adaptive.
+    // Storage stays sparse — the server drops the default before persisting.
+    expect(toPutBody(combo()).combo.reasoningEffortMode).toBe("strict");
+    expect(toPutBody(combo({ reasoningEffortMode: "strict" })).combo.reasoningEffortMode)
+      .toBe("strict");
   });
 
   test("draftEquals treats a reasoningEffortMode change as dirty", () => {
@@ -536,6 +658,8 @@ describe("combo-workspace-data", () => {
         ],
         strategy: "round-robin",
         defaultEffort: "high",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
         stickyLimit: 7,
       },
     });
@@ -550,6 +674,8 @@ describe("combo-workspace-data", () => {
         targets: [{ provider: "a", model: "m1" }],
         strategy: "failover",
         defaultEffort: "medium",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
       },
     });
     expect("stickyLimit" in failoverBody.combo).toBe(false);
@@ -582,6 +708,8 @@ describe("combo-workspace-data", () => {
         ],
         strategy: "failover",
         defaultEffort: "medium",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
         alias: "deepseek-v4-flash",
       },
     });
@@ -721,7 +849,7 @@ describe("comboImagesSupported", () => {
     )).toBe(false);
   });
 
-  test("returns true only when every complete target advertises image", () => {
+  test("returns true when every known target advertises image", () => {
     const models = [
       { provider: "a", id: "m1", inputModalities: ["text", "image"] },
       { provider: "b", id: "m2", inputModalities: ["text", "image"] },
@@ -732,19 +860,107 @@ describe("comboImagesSupported", () => {
     )).toBe(true);
   });
 
-  test("returns false when any target is missing from the catalog or lacks image", () => {
+  test("allows text-only members for sidecar coverage but fails closed on unknown, silent, and text-free rows", () => {
     const models = [
       { provider: "a", id: "m1", inputModalities: ["text", "image"] },
       { provider: "b", id: "m2", inputModalities: ["text"] },
     ];
+    // Known text-only rows can be declared text-only on save; only catalog-absent rows block.
     expect(comboImagesSupported(
       [{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }],
       models,
+    )).toBe(true);
+    // No known modalities: the runtime cannot prove text input, so enrollment is refused.
+    expect(comboImagesSupported(
+      [{ provider: "a", model: "m1" }, { provider: "c", model: "m3" }],
+      [...models, { provider: "c", id: "m3" }],
+    )).toBe(false);
+    // Audio-only rows have no text input; the sidecar cannot cover them.
+    expect(comboImagesSupported(
+      [{ provider: "a", model: "m1" }, { provider: "c", model: "m3" }],
+      [...models, { provider: "c", id: "m3", inputModalities: ["audio"] }],
     )).toBe(false);
     expect(comboImagesSupported(
       [{ provider: "a", model: "m1" }, { provider: "b", model: "ghost" }],
       models,
     )).toBe(false);
+  });
+
+  test("classifies from the declared modalities so enrollment survives reload", () => {
+    // After enrollment the catalog WIDENS the row to image, but the declaration
+    // still says text-only: reload must keep it a sidecar member, not native vision.
+    const reloaded = [
+      { provider: "a", id: "m1", inputModalities: ["text", "image"], inputModalitiesDeclared: ["text"] },
+    ];
+    expect(comboImagesSupported([{ provider: "a", model: "m1" }], reloaded)).toBe(true);
+    expect(comboVisionSidecarTargets([{ provider: "a", model: "m1" }], reloaded))
+      .toEqual([{ provider: "a", model: "m1" }]);
+  });
+
+  test("visionSidecarConsumer beats image-advertised modalities when no declaration exists", () => {
+    // Legacy `noVisionModels` rows carry no declaration while the catalog widens
+    // them to image; the runtime flag alone keeps them sidecar members.
+    const reloaded = [
+      { provider: "a", id: "m1", inputModalities: ["text", "image"], visionSidecarConsumer: true },
+    ];
+    expect(comboImagesSupported([{ provider: "a", model: "m1" }], reloaded)).toBe(true);
+    expect(comboVisionSidecarTargets([{ provider: "a", model: "m1" }], reloaded))
+      .toEqual([{ provider: "a", model: "m1" }]);
+  });
+});
+
+describe("comboVisionSidecarTargets", () => {
+  test("returns only known text-only members, deduplicated", () => {
+    const models = [
+      { provider: "a", id: "m1", inputModalities: ["text", "image"] },
+      { provider: "b", id: "m2", inputModalities: ["text"] },
+      { provider: "c", id: "m3" },
+    ];
+    expect(comboVisionSidecarTargets(
+      [
+        { provider: "a", model: "m1" },
+        { provider: "b", model: "m2" },
+        { provider: "b", model: "m2" },
+      ],
+      models,
+    )).toEqual([
+      { provider: "b", model: "m2" },
+    ]);
+    // A blocked member forces the image switch off, so nothing may be enrolled on save.
+    expect(comboVisionSidecarTargets(
+      [
+        { provider: "b", model: "m2" },
+        { provider: "c", model: "m3" },
+      ],
+      models,
+    )).toEqual([]);
+  });
+
+  test("ignores incomplete or catalog-absent targets", () => {
+    expect(comboVisionSidecarTargets(
+      [{ provider: "", model: "" }, { provider: "b", model: "ghost" }],
+      [{ provider: "b", id: "m2", inputModalities: ["text"] }],
+    )).toEqual([]);
+  });
+
+  test("comboImageBlockedTargets names the members that refuse coverage", () => {
+    const models = [
+      { provider: "a", id: "m1", inputModalities: ["text", "image"] },
+      { provider: "b", id: "m2" },
+      { provider: "c", id: "m3", inputModalities: ["audio"] },
+    ];
+    expect(comboImageBlockedTargets(
+      [
+        { provider: "a", model: "m1" },
+        { provider: "b", model: "m2" },
+        { provider: "c", model: "m3" },
+        { provider: "b", model: "ghost" },
+      ],
+      models,
+    )).toEqual([
+      { provider: "b", model: "m2" },
+      { provider: "c", model: "m3" },
+    ]);
   });
 });
 
@@ -768,11 +984,22 @@ describe("combo imageInput draft persistence", () => {
     expect(draftEquals(base, disabled)).toBe(false);
   });
 
-  test("toPutBody emits imageInput only when disabled", () => {
+  test("toPutBody always sends imageInput so auto can replace a stored disabled", () => {
     const auto = emptyDraft("x");
     auto.targets = [{ provider: "a", model: "m1" }];
-    expect(toPutBody(auto).combo).not.toHaveProperty("imageInput");
+    expect(toPutBody(auto).combo.imageInput).toBe("auto");
     const disabled = { ...auto, imageInput: "disabled" as const };
     expect(toPutBody(disabled).combo.imageInput).toBe("disabled");
+  });
+
+  test("toPutBody carries visionSidecarTargets as a top-level request-only field", () => {
+    const auto = emptyDraft("x");
+    auto.targets = [{ provider: "a", model: "m1" }];
+    const sidecar = [{ provider: "a", model: "m1" }];
+    const body = toPutBody(auto, { visionSidecarTargets: sidecar });
+    expect(body.visionSidecarTargets).toEqual(sidecar);
+    expect(body.combo).not.toHaveProperty("visionSidecarTargets");
+    // Empty lists stay off the wire.
+    expect(toPutBody(auto, { visionSidecarTargets: [] })).not.toHaveProperty("visionSidecarTargets");
   });
 });

@@ -1,3 +1,4 @@
+import { spawnTestChild, TEST_CHILD_REAP_RESERVE_MS, type TestChildResult } from "./spawn-test-child";
 import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { repoRoot } from "./repo-root";
@@ -91,7 +92,7 @@ import { SPAWN_BUDGET_MS } from "./test-budget";
 const WARMUP_TEARDOWN_RESERVE_MS = 15_000;
 
 /** Reaping the warm-up child after its deadline. */
-const WARMUP_REAP_RESERVE_MS = 5_000;
+const WARMUP_REAP_RESERVE_MS = TEST_CHILD_REAP_RESERVE_MS;
 
 /**
  * Budget for the hook that performs a warm-up. This is `SPAWN_BUDGET_MS` because a warm-up IS a real
@@ -201,7 +202,21 @@ export async function warmModuleGraph(options: ColdSpawnWarmup): Promise<void> {
   return warmColdSpawn(options.graph, deadlineMs => runModuleGraphWarmup(options, deadlineMs));
 }
 
-function runModuleGraphWarmup(options: ColdSpawnWarmup, deadlineMs: number): void {
+export type ModuleGraphWarmupResult = TestChildResult;
+
+/** Warm-up compatibility surface; bounded child ownership is shared with behavior tests. */
+export function spawnModuleGraphWarmupChild(
+  script: string,
+  cwd: string,
+  env: Record<string, string | undefined> | undefined,
+  deadlineMs: number,
+): Promise<ModuleGraphWarmupResult> {
+  return spawnTestChild([process.execPath, "--eval", script], {
+    cwd, env: { ...process.env, ...env }, deadlineMs,
+  });
+}
+
+async function runModuleGraphWarmup(options: ColdSpawnWarmup, deadlineMs: number): Promise<void> {
   const cwd = options.cwd ?? repoRoot();
   const source = options.source ?? readFileSync(requireEntry(options), "utf8");
   const resolveDir = options.entry === undefined ? cwd : dirname(options.entry);
@@ -214,21 +229,26 @@ function runModuleGraphWarmup(options: ColdSpawnWarmup, deadlineMs: number): voi
   }
 
   const startedAt = performance.now();
-  const result = Bun.spawnSync([process.execPath, "--eval", warmupScript(specifiers, deadlineMs)], {
+  const result = await spawnModuleGraphWarmupChild(
+    warmupScript(specifiers, deadlineMs),
     cwd,
-    env: { ...process.env, ...options.env },
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: deadlineMs,
-  });
+    options.env,
+    deadlineMs,
+  );
   const elapsedMs = (performance.now() - startedAt).toFixed(0);
-  const stdout = result.stdout.toString();
-  const report = parseWarmupReport(stdout);
+  const report = parseWarmupReport(result.stdout);
+  if (result.timedOut) {
+    throw new Error(
+      `[cold-spawn-warmup] graph=${options.graph} warm-up child did not exit within ${deadlineMs}ms `
+      + `and was killed (specifiers=${specifiers.length}). `
+      + `stderr: ${result.stderr.trim().slice(0, 600)}`,
+    );
+  }
   if (result.exitCode !== 0 || report === undefined || report.loaded === 0) {
     throw new Error(
       `[cold-spawn-warmup] graph=${options.graph} loaded nothing in ${elapsedMs}ms `
       + `(exitCode=${String(result.exitCode)}, specifiers=${specifiers.length}). `
-      + `stderr: ${result.stderr.toString().trim().slice(0, 600)}`,
+      + `stderr: ${result.stderr.trim().slice(0, 600)}`,
     );
   }
   console.log(

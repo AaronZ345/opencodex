@@ -46,13 +46,18 @@ import {
   setMainAccountPlan,
 } from "../../src/codex/main-account";
 import {
+  clearMainAccountInfoCache,
+  observeMainQuotaCredential,
+  observeMainQuotaIdentity,
+} from "../../src/codex/main-account-cache";
+import {
   clearAccountNeedsReauth,
   clearAccountQuota,
-  handleCodexAuthAPI,
   isAccountNeedsReauth,
   markAccountNeedsReauth,
   setAccountQuotaFromParsed,
 } from "../../src/codex/auth-api";
+import { handleCodexAuthAPI } from "../../src/codex/auth-api/routes";
 import { __resetGuardianState, guardianSweep } from "../../src/oauth/token-guardian";
 import {
   CODEX_THREAD_AFFINITY_IDLE_TTL_MS,
@@ -64,7 +69,7 @@ import {
   resetCodexRoutingForManualSelection,
 } from "../../src/codex/routing";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
-import { setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
+import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import {
   blockNativeMainStartupForUnownedServiceHome,
   completeNativeMainRecovery,
@@ -81,17 +86,19 @@ import { recordContextSessionOwner, clearContextSessionOwnersForTests } from "..
 import { handleContextHistory } from "../../src/server/context-history";
 import { resetContextRelayActivationForTests } from "../../src/codex/context-compat";
 import { hasForwardableCodexBearer } from "../../src/server/auth-cors";
-import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { drainAndRemoveFixtureRoots } from "../helpers/fixture-teardown";
 
 let testDir: string;
 let previousOpencodexHome: string | undefined;
 let previousCodexHome: string | undefined;
 
 beforeEach(() => {
-  // This suite validates refresh admission and auth-context outcomes. Real icacls
-  // processes are covered elsewhere and can retain temp-dir handles long enough
-  // to obscure those assertions under Windows isolated-test load.
+  // This suite validates refresh admission and auth-context outcomes; real icacls is
+  // covered by tests/windows. Both runners are stubbed: the native-main claim lock is
+  // hardened through the ASYNC runner, and with only the sync one stubbed, real icacls
+  // still rewrote that lock's DACL under the home this teardown removes (#7515).
   setIcaclsRunnerForTests(() => ({ success: true, exitCode: 0, timedOut: false, stdout: "" }));
+  setAsyncIcaclsRunnerForTests(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: "" }));
   testDir = mkdtempSync(join(tmpdir(), "ocx-auth-ctx-"));
   previousOpencodexHome = process.env.OPENCODEX_HOME;
   process.env.OPENCODEX_HOME = testDir;
@@ -108,21 +115,28 @@ beforeEach(() => {
   clearAccountNeedsReauth("pool-b");
 });
 
-afterEach(() => {
+afterEach(async () => {
   resetContextRelayActivationForTests();
-  setIcaclsRunnerForTests(null);
-  removeTreeWithRetry(testDir);
-  clearThreadAccountMap();
-  clearCodexUpstreamHealth();
-  clearAccountQuota();
-  setMainAccountPlan(null);
-  __resetGuardianState();
-  clearAccountNeedsReauth("pool-a");
-  clearAccountNeedsReauth("pool-b");
-  if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
-  else process.env.OPENCODEX_HOME = previousOpencodexHome;
-  if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = previousCodexHome;
+  // Settle producers, config flights and ACL work, and refuse a home whose native-main
+  // owner is still open, before removal; the stubs stay installed until removal ends.
+  await drainAndRemoveFixtureRoots({
+    roots: [{ path: testDir }],
+    restoreEnvironment: () => {
+      setIcaclsRunnerForTests(null);
+      setAsyncIcaclsRunnerForTests(null);
+      clearThreadAccountMap();
+      clearCodexUpstreamHealth();
+      clearAccountQuota();
+      setMainAccountPlan(null);
+      __resetGuardianState();
+      clearAccountNeedsReauth("pool-a");
+      clearAccountNeedsReauth("pool-b");
+      if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousOpencodexHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    },
+  });
 });
 
 function config(): OcxConfig {
@@ -243,6 +257,28 @@ describe("Codex auth context", () => {
     expect(() => materializeCodexUpstreamAuth(new Headers(), ctx)).toThrow("validation is pending");
     expect(() => applyCodexAuthContextToProvider(cfg.providers.chatgpt!, ctx, "pool")).toThrow("validation is pending");
   });
+  test.each([
+    { enabled: true, global: 80, override: undefined, prime: true },
+    { enabled: false, global: 80, override: undefined, prime: false },
+    { enabled: true, global: 80, override: 0, prime: false },
+    { enabled: true, global: 0, override: 40, prime: true },
+  ])("priority failback primes known quota using the selected source threshold (%j)", async ({ enabled, global, override, prime }) => {
+    const cfg = config();
+    cfg.codexAccountPriorityFailback = enabled;
+    cfg.autoSwitchThreshold = global;
+    if (override !== undefined) cfg.codexAccountAutoSwitchThresholds = { "pool-a": override };
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pool_token", refreshToken: "pool_refresh",
+      expiresAt: Date.now() + 3_600_000, chatgptAccountId: "pool_acc",
+    });
+    setAccountQuotaFromParsed("pool-a", { weeklyPercent: 10 });
+    const reasons: string[] = [];
+    await expect(resolveCodexAuthContext(new Headers(), cfg, "pool", {
+      primeCodexPoolQuotas: async (_config, reason) => { reasons.push(reason); },
+    })).resolves.toMatchObject({ kind: "pool", accountId: "pool-a" });
+    expect(reasons).toEqual(prime ? ["priority-failback"] : []);
+  });
+
   test("main-profile drain routes a non-main pool account without native reads or quota priming", async () => {
     saveCodexAccountCredential("pool-a", {
       accessToken: "pool_token",
@@ -805,6 +841,7 @@ describe("Codex auth context", () => {
     } satisfies Partial<CodexModelAvailabilityError>);
   });
 
+
   test("ordinary native models do not pay the entitlement discovery path", async () => {
     saveCodexAccountCredential("pool-a", {
       accessToken: "pool-token",
@@ -1191,93 +1228,6 @@ describe("Codex auth context", () => {
     }
   });
 
-  async function resolveRequestOwnedMainPinCase(options: {
-    mainWeeklyPercent: number;
-    poolWeeklyPercent: number;
-    callerEntitled: boolean;
-  }): Promise<{
-    cfg: OcxConfig;
-    context: Awaited<ReturnType<typeof resolveCodexAuthContext>>;
-    directEntitlementChecks: number;
-  }> {
-    const cfg = config();
-    cfg.accountPoolStrategy = "quota";
-    cfg.autoSwitchThreshold = 90;
-    cfg.activeCodexAccountId = MAIN_CODEX_ACCOUNT_ID;
-    cfg.activeCodexAccountPinned = MAIN_CODEX_ACCOUNT_ID;
-    cfg.codexAccountPriorities = {
-      [MAIN_CODEX_ACCOUNT_ID]: 0,
-      "pool-a": 0,
-    };
-    resetCodexRoutingForManualSelection(MAIN_CODEX_ACCOUNT_ID);
-    saveCodexAccountCredential("pool-a", {
-      accessToken: "pool-token",
-      refreshToken: "pool-refresh",
-      expiresAt: Date.now() + 5 * 60_000,
-      chatgptAccountId: "pool-account",
-    });
-    setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { weeklyPercent: options.mainWeeklyPercent });
-    setAccountQuotaFromParsed("pool-a", { weeklyPercent: options.poolWeeklyPercent });
-    let directEntitlementChecks = 0;
-    const context = await resolveCodexAuthContext(new Headers({
-      authorization: "Bearer caller-keyring-token",
-      "chatgpt-account-id": "caller-keyring-account",
-    }), cfg, "pool", {
-      requestScopedMainCredential: true,
-      // Uses the one model still account-gated. These #3157 cases are about how a caller
-      // entitlement MISS interacts with the main pin, so they need a model whose entitlement is
-      // actually consulted; the flagships stopped being gated on 2026-09-04 and now skip the
-      // check entirely, which would leave directEntitlementChecks at 0 and prove nothing.
-      modelId: "gpt-daybreak-blue-latest",
-      isDirectCallerEntitledToCodexModel: async () => {
-        directEntitlementChecks += 1;
-        return options.callerEntitled;
-      },
-      resolveCodexModelEntitlements: async () => ({
-        modelsByAccount: new Map([["pool-a", new Set(["gpt-daybreak-blue-latest"])]]),
-        clientVersionByAccount: new Map([["pool-a", "0.150.1"]]),
-        confirmedAccountIds: new Set(["pool-a"]),
-        credentialIdentities: new Map([["pool-a", "pool:1:pool-account"]]),
-      }),
-    });
-    return { cfg, context, directEntitlementChecks };
-  }
-
-  test("a healthy manual main pin keeps the validated caller bearer ahead of an exhausted pool account (#3157)", async () => {
-    const { cfg, context, directEntitlementChecks } = await resolveRequestOwnedMainPinCase({
-      mainWeeklyPercent: 16,
-      poolWeeklyPercent: 100,
-      callerEntitled: true,
-    });
-    expect(context).toMatchObject({ kind: "main", accountId: null });
-    expect(directEntitlementChecks).toBe(1);
-    expect(cfg.activeCodexAccountId).toBe(MAIN_CODEX_ACCOUNT_ID);
-    expect(cfg.activeCodexAccountPinned).toBe(MAIN_CODEX_ACCOUNT_ID);
-  });
-
-  test("an exhausted request-owned main pin still yields to the healthy Pool account (#3157)", async () => {
-    const { cfg, context, directEntitlementChecks } = await resolveRequestOwnedMainPinCase({
-      mainWeeklyPercent: 100,
-      poolWeeklyPercent: 16,
-      callerEntitled: true,
-    });
-    expect(context).toMatchObject({ kind: "pool", accountId: "pool-a" });
-    expect(directEntitlementChecks).toBe(0);
-    expect(cfg.activeCodexAccountId).toBe("pool-a");
-    expect(cfg.activeCodexAccountPinned).toBeUndefined();
-  });
-
-  test("a caller entitlement miss uses a Pool model detour without clearing the healthy main pin (#3157)", async () => {
-    const { cfg, context, directEntitlementChecks } = await resolveRequestOwnedMainPinCase({
-      mainWeeklyPercent: 16,
-      poolWeeklyPercent: 20,
-      callerEntitled: false,
-    });
-    expect(context).toMatchObject({ kind: "pool", accountId: "pool-a" });
-    expect(directEntitlementChecks).toBe(1);
-    expect(cfg.activeCodexAccountId).toBe(MAIN_CODEX_ACCOUNT_ID);
-    expect(cfg.activeCodexAccountPinned).toBe(MAIN_CODEX_ACCOUNT_ID);
-  });
 
   test("a failed Pool account may fall back once to the validated caller-owned main credential", async () => {
     const cfg = config();
@@ -1725,6 +1675,7 @@ describe("Codex auth context", () => {
     await expect(resolveCodexAuthContext(new Headers({ authorization: "Bearer main_token" }), config(), "pool"))
       .rejects.toBeInstanceOf(CodexAccountCooldownError);
   });
+
 
   test("reset-derived cooldown admits one probe and clears on its success (#433)", async () => {
     const originalNow = Date.now;
@@ -2488,4 +2439,21 @@ test("context Direct bearer admission uses real stored-main materialization and 
     clearContextSessionOwnersForTests();
     globalThis.fetch = originalFetch;
   }
+});
+
+test("pool exhaustion never falls back to an observed paused main caller", async () => {
+  const cfg = config();
+  cfg.codexAccounts = [];
+  cfg.pausedCodexAccountIds = [MAIN_CODEX_ACCOUNT_ID];
+  cfg.codexMainAccountHardLock = false;
+  observeMainQuotaIdentity("paused-main-account");
+  observeMainQuotaCredential("paused-main-bearer", "paused-main-account");
+  const headers = new Headers({ authorization: "Bearer paused-main-bearer", "chatgpt-account-id": "paused-main-account" });
+  await expect(resolveCodexAuthContext(headers, cfg, "pool", {
+    requestScopedMainCredential: true,
+  })).rejects.toBeInstanceOf(CodexMainProfileDrainingError);
+  // Direct remains caller-owned; the pause applies to Pool fallback, not unrelated callers.
+  expect(await resolveCodexAuthContext(headers, cfg, "direct", {
+    requestScopedMainCredential: true,
+  })).toMatchObject({ kind: "main", accountId: null });
 });

@@ -104,13 +104,14 @@ GPT-5.6에만 사용합니다. 오래된 템플릿으로 근사하지 않고 모
 
 | 경로 | 선택기 id와 카탈로그 메타데이터 |
 | --- | --- |
-| Codex 로그인(계정 한정 선택기 행 비활성) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` 같은 bare native id를 표시하고 `codexAccountMode`에 따라 Pool 또는 Direct를 사용합니다. GPT-5.6 행의 카탈로그 창은 922,000토큰입니다. |
+| Codex 로그인(계정 한정 선택기 행 비활성) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` 같은 bare native id를 표시하고 `codexAccountMode`에 따라 Pool 또는 Direct를 사용합니다. GPT-5.6 행의 카탈로그 창은 922,000토큰입니다. `gpt-6.1-terra`: 기본 500,000 / 장문 872,000. |
 | Codex 로그인(계정 한정 선택기 행 활성, 유효한 selector 있음) | 유효한 selector와 지원되는 native model의 각 조합마다 `<selector>/<native-openai-model>` 행을 표시합니다. 각 행은 매핑된 계정만 사용하며 bare native 행은 선택기에서 숨깁니다. Native metadata와 context window는 보존됩니다. |
 | Codex 로그인(명시적 Daybreak forward 행) | canonical `openai` provider에 정확한 `customModels` 항목이 있을 때만 `openai/gpt-daybreak-blue-latest`를 표시합니다. Daybreak wire id를 유지하고 고정된 Sol capability snapshot(컨텍스트 922,000; 자동 압축점 922,000)을 사용합니다. |
-| OpenAI(API key) | 정확히 열 개의 네임스페이스 행: `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, 세 개의 `*-pro` 가상 id, 두 Daybreak 별칭 (모두 컨텍스트 922,000; 최대 입력 922,000) |
+| OpenAI(API key) | 네임스페이스 모델에는 `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, `*-pro` 가상 id, Daybreak 별칭이 포함됩니다(컨텍스트 1,050,000; 최대 입력 922,000). `openai-apikey/gpt-6.1-terra`는 컨텍스트 1,050,000, 최대 출력 128,000입니다. |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`, `openrouter/openai/gpt-5.6-terra`, `openrouter/openai/gpt-5.6-luna` (922,000) |
-| Cursor | 정적 폴백에는 `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra`, `cursor/gpt-5.6-luna` (1,000,000)와 Grok 4.5/4.6의 일반·Fast 항목(500,000)이 들어갑니다. 4.6은 `xhigh`도 노출하며, 실시간 계정 탐색이 어떤 항목을 계속 보일지 정합니다. |
-| xAI | 실시간 탐색이 기준입니다. 폴백 카탈로그에는 `xai/grok-4.6`이 포함되며 기본값은 `xai/grok-4.5`입니다. 두 모델 모두 컨텍스트 창은 500,000입니다. Grok 4.6은 `low` / `medium` / `high` / `xhigh`(업스트림 기본값: `high`)를 제공하고, Grok 4.5는 `high`까지만 제공합니다. |
+| OpenRouter | `openrouter/openai/gpt-6.1-terra` (1,050,000) |
+| Cursor | 정적 폴백에는 `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra`, `cursor/gpt-5.6-luna` (1,000,000)와 Grok 4.5/4.6/4.7의 일반·Fast 항목(500,000)이 들어갑니다. 4.6과 4.7은 `xhigh`도 노출하며, 실시간 계정 탐색이 어떤 항목을 계속 보일지 정합니다. |
+| xAI | 실시간 탐색이 기준입니다. 폴백 카탈로그에는 `xai/grok-4.6`과 `xai/grok-4.7`이 포함되며 기본값은 `xai/grok-4.5`입니다. 세 모델 모두 컨텍스트 창은 500,000입니다. Grok 4.6과 4.7은 `low` / `medium` / `high` / `xhigh`(업스트림 기본값: `high`)를 제공하고, Grok 4.5는 `high`까지만 제공합니다. |
 
 고정된 GPT-5.6 항목은 업스트림 ladder를 그대로 보존합니다. Sol과 Terra는 `low`부터 `ultra`까지 노출하고,
 Luna는 `max`에서 멈춥니다. Sol의 기본값은 `low`이고, Terra와 Luna의 기본값은 `medium`입니다. 명시적
@@ -171,6 +172,92 @@ fast_mode = true
 케이퍼빌리티로 게이트되어 프로바이더가 `supportsServiceTier: false`를 선언한 경우에만
 `service_tier`가 제거됩니다(레지스트리가 정식 OpenAI를 `true`, DeepSeek과 Volcengine Ark를 `false`로 분류). 미분류 커스텀 게이트웨이는 호출자가 준 값을 그대로 보존하고 주입도 받지 않습니다. 따라서
 처리 불가능한 곳에 fast 옵션이 노출되지 않으며, 커스텀 게이트웨이는 `true`로 명시적으로 옵트인할 수 있습니다.
+
+### Codex에서 Flex 선택
+
+`service_tier: "flex"` 지원이 확인된 라우팅 프로바이더와 모델에 한해 Flex를
+명시적으로 선언할 수 있습니다. 아래 필드는 **기존** `providers.nanogpt` 설정에
+병합해야 하며 URL과 API 키를 덮어쓰면 안 됩니다.
+
+```json
+{
+  "modelSupportsServiceTier": { "openai/gpt-6-luna": true },
+  "fastWire": {
+    "kind": "service-tier",
+    "canonicalToWire": { "priority": "priority", "flex": "flex" },
+    "foreignCallerTiers": "verbatim"
+  }
+}
+```
+
+적격한 `openai-responses` 라우트에서는 Luna의 Codex 속도 선택기에 Standard,
+Fast, Flex가 나타납니다. `openai-chat` 라우트는 Chat Completions API가
+호출자의 서비스 등급을 지원하는 것이 확인된 경우에만 `chatServiceTier: true`도
+설정해야 합니다. `fastWire` 매핑은 **프로바이더 전체에 적용**되므로 같은
+`providers.nanogpt` 항목에서 서비스 등급 사용이 이미 허용된 다른 모델에도
+Flex 선택지가 표시될 수 있습니다. `modelSupportsServiceTier`에 Luna만 적어도
+이미 적격인 다른 모델을 제외하는 허용 목록이 되는 것은 아닙니다. 다만 Flex 선택지는
+카탈로그에 게시되는 **일반 라우팅 모델 행**에만 표시되며, Combo 네임스페이스와
+Native Alias 행에는 표시되지 않습니다. 따라서 해당 항목에서 서비스 등급 사용이
+허용된 **모든 일반 라우팅 모델**의 Flex 지원 여부를 확인하세요.
+Luna만 Flex를 지원한다면 Fast 지원 모델이 다른 모델과 섞이지 않도록
+**별도 프로바이더 항목**으로 분리해야 합니다. Fast 지원만으로 Flex 지원을
+추정해서는 안 됩니다.
+
+OpenCodex의 전역 Fast 설정은 **Auto**(`fastMode` 생략)로 유지하세요.
+Fast 또는 Default 강제 모드는 Flex 선택을 덮어씁니다. `ocx sync` 후 Codex의
+모델 목록을 갱신하고 속도 선택기에서 **Flex**를 선택하거나, Codex CLI에서
+`/model <routed-id> --speed=flex`를 사용하면 됩니다. 이는 **선택 가능한 등급**이지
+모델별 강제 기본값은 아닙니다. 다른 모델로 바꾸더라도 Flex 사용이 자동 강제되지는
+않습니다. 상위 API로 `service_tier: "flex"`를 전달하지만, 실제 처리 가능 여부,
+요금과 지연 시간은 공급자에 따라 다릅니다. 메뉴나 요청 로그만으로 Flex 과금이
+확정되지는 않습니다.
+
+### Codex 데스크톱에서 Ultra Fast 선택
+
+`service_tier: "ultrafast"`를 지원하는 프로바이더에는 전송 매핑을 한 번 설정하면 됩니다.
+opencodex가 라우팅 모델의 Codex 기본 속도 메뉴에 **Ultra Fast**를 추가하므로, 동기화할 때마다
+`opencodex-catalog.json`을 직접 수정할 필요가 없습니다. 예를 들어 GPT-6.1 Sol용 API
+프로바이더의 기존 설정에 다음 필드를 병합하세요.
+
+```json
+{
+  "models": ["gpt-6.1-sol"],
+  "modelSupportsServiceTier": { "gpt-6.1-sol": true },
+  "fastWire": {
+    "kind": "service-tier",
+    "canonicalToWire": { "priority": "priority", "ultrafast": "ultrafast" },
+    "foreignCallerTiers": "verbatim"
+  }
+}
+```
+
+이 매핑은 해당 프로바이더에서 Fast를 사용할 수 있는 모든 모델에 적용됩니다. 일부 모델만
+Ultra Fast를 지원한다면 별도 프로바이더 항목을 사용하세요. 앱에서 선택한 속도를 전달하려면
+opencodex의 Fast 모드를 **Auto**로 유지하세요(`fastMode` 생략). Fast 강제 모드는 `priority`를
+전송하고, Default 강제 모드는 tier를 제거합니다. 모델 카탈로그를 새로고침하고, 앱에 이전
+목록이 남아 있다면 Codex 데스크톱을 다시 시작한 뒤 라우팅 모델의 속도 메뉴에서 **Ultra Fast**를
+선택하세요. 기본 속도는 Standard로 유지됩니다.
+
+이 선택지를 라우팅 항목에 자동 생성하려면 사용 가능한 `service-tier` 전송 경로와 명시적인
+`ultrafast → ultrafast` 매핑이 있어야 합니다. 일반 Fast 지원이나 GPT와 비슷한 이름만으로는
+추가되지 않습니다. 이 라우팅 매핑은 네이티브·계정별 네이티브 항목이나 combo 별칭에는
+적용되지 않습니다. 매핑을 제거하거나 모델의 service-tier 지원을 끄면 다음 동기화 성공 시
+카탈로그와 캐시에서 자동 생성된 라우팅 선택지도 제거됩니다.
+Codex가 HTTP로 모델 목록을 불러올 때도 현재 적용 중인 설정의 동일한 선언이 Ultra Fast 선택지를 결정합니다.
+
+라우팅 항목에서는 `ultraFastTier`가 `provider/model` 식별자가 정확히 일치하는 저장된 항목에 사용자가
+별도로 넣은 Ultra Fast tier를 보존합니다. 자동 생성된 라우팅 tier는 사용자 제공 tier로
+취급하지 않습니다. bare native `gpt-6-astra` / `gpt-6.1-sol` 항목과 신뢰된 계정별 복제
+항목에서는 `ultraFastTier`를 켜면 네이티브 기본 tier를 바꾸지 않고 누락된 Ultrafast 선택지도
+생성합니다. 끄면 자동 생성한 것으로 추적되는 네이티브 tier 메타데이터만 제거하며,
+사용자가 별도로 넣거나 수정한 네이티브 tier 항목은 보존합니다.
+
+[OpenAI API 문서](https://developers.openai.com/api/docs/guides/ultrafast-mode)는 GPT-6 Astra와
+GPT-6.1 Sol의 Ultrafast 지원을 안내합니다. API 사용 권한과
+[Codex 요금제·워크스페이스 권한](https://learn.chatgpt.com/docs/agent-configuration/speed)은
+별개입니다. 메뉴 표시가 제공자의 사용 권한이나 실측 속도를 보장하지는 않습니다.
+Ultra Fast는 사용량·비용이 더 크며 Codex 자체 기능 제한도 계속 적용됩니다.
 
 ## 서브에이전트 선택
 

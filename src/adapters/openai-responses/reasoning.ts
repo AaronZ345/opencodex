@@ -11,6 +11,37 @@ export function dropResponsesReasoningInputItems(body: unknown): unknown {
   return input.length === body.input.length ? body : { ...body, input };
 }
 
+/** Whether the item already carries a non-empty `reasoning_text` content part. */
+function hasPlaintextReasoningContent(content: unknown): boolean {
+  return Array.isArray(content) && content.some(part =>
+    isPlainObject(part)
+    && part.type === "reasoning_text"
+    && typeof part.text === "string"
+    && part.text.length > 0
+  );
+}
+
+/**
+ * Backfill for a reasoning item that would reach a plaintext-required wire with no
+ * `reasoning_text`: its text lived only in ciphertext the provider cannot read and was
+ * stripped, so replay the item's `summary_text` as `reasoning_text` — real model output,
+ * unlike a fabricated chain — and fall back to the same minimal placeholder the chat
+ * adapter emits for `requiresReasoningPlaceholderModels` (#5421). DeepSeek's thinking
+ * mode answers a bare emptied item with `The reasoning_text in the thinking mode must
+ * be passed back to the API` and aborts the turn.
+ */
+function plaintextReasoningBackfill(rec: Record<string, unknown>): unknown[] {
+  const fromSummary = Array.isArray(rec.summary)
+    ? rec.summary
+        .filter(part => isPlainObject(part)
+          && part.type === "summary_text"
+          && typeof part.text === "string"
+          && part.text.length > 0)
+        .map(part => ({ type: "reasoning_text", text: part.text }))
+    : [];
+  return fromSummary.length > 0 ? fromSummary : [{ type: "reasoning_text", text: " " }];
+}
+
 /**
  * Sanitize reasoning input by field policy, not by preserving each item's shape. Retaining a
  * native `encrypted_content` guarantees only that blob value: `status` is always removed;
@@ -35,6 +66,23 @@ export function sanitizeReasoningInputContent(
     preserveRawReasoningContent?: boolean;
     dropNullContentChannel?: boolean;
     stripEncryptedContent?: boolean;
+    /**
+     * Remove `id` from every reasoning item, with or without a blob, because the ids name items in a
+     * store this destination cannot read; see `OcxParsedRequest._dropForeignReasoningItemIds`.
+     */
+    dropForeignItemId?: boolean;
+    /**
+     * The destination documents a strict plaintext-replay contract (DeepSeek's Responses
+     * thinking mode): every reasoning input item must carry `reasoning_text` content.
+     * An item left with none is backfilled from its summary, or with a minimal
+     * placeholder, rather than emitted in the shape the upstream 400s on.
+     */
+    requirePlaintextReasoning?: boolean;
+    /**
+     * Called once per sanitized body when a reasoning item that carried nonempty plaintext
+     * `reasoning_text` was blanked. Observability only; it never changes the body (#6675).
+     */
+    onPlaintextReasoningBlanked?: () => void;
   },
 ): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
@@ -42,6 +90,7 @@ export function sanitizeReasoningInputContent(
   if (!Array.isArray(raw.input)) return body;
 
   let changed = false;
+  let blankedPlaintext = false;
   const input = raw.input.map(item => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return item;
     const rec = item as Record<string, unknown>;
@@ -55,6 +104,10 @@ export function sanitizeReasoningInputContent(
     const missingSummary = !Object.prototype.hasOwnProperty.call(rec, "summary");
     const stripEncryptedContent = hasOcxEnvelope
       || (opts?.stripEncryptedContent === true && hasEncryptedContent);
+    // An id-only item is as foreign as one with a blob: a stateful destination still resolves it
+    // against its own store.
+    const dropItemId = opts?.dropForeignItemId === true
+      && Object.prototype.hasOwnProperty.call(rec, "id");
     // Codex serializes an absent reasoning content channel as `"content": null`. The field is
     // optional and null carries nothing, but a strict gateway rejects the item on its declared type
     // — xAI answers `Could not decode the compaction blob`, naming the sibling `encrypted_content`
@@ -76,7 +129,15 @@ export function sanitizeReasoningInputContent(
     const blankContent = !dropNullContentChannel
       && !opts?.preserveRawReasoningContent
       && (hasRawContent || hasOcxEnvelope);
-    if (!blankContent && !stripOutputStatus && !stripEncryptedContent && !dropNullContentChannel && !missingSummary) {
+    // A strict plaintext-replay destination cannot consume a reasoning item emptied of its
+    // `reasoning_text` — the resumed-subagent shape (#5421), where the text lived only in
+    // ciphertext the provider cannot read. Backfill after every other strip has run.
+    const missingPlaintextReasoning = opts?.requirePlaintextReasoning === true
+      && !hasPlaintextReasoningContent(rec.content);
+    if (
+      !blankContent && !stripOutputStatus && !stripEncryptedContent && !dropNullContentChannel
+      && !missingSummary && !dropItemId && !missingPlaintextReasoning
+    ) {
       return item;
     }
     changed = true;
@@ -85,6 +146,7 @@ export function sanitizeReasoningInputContent(
     if (dropNullContentChannel) delete next.content;
     if (stripOutputStatus) delete next.status;
     if (stripEncryptedContent) delete next.encrypted_content;
+    if (dropItemId) delete next.id;
     // Routed models can produce raw `reasoning_text` output items. Codex echoes those in later
     // native GPT requests, but ChatGPT's Responses backend accepts reasoning input only with empty
     // `content`; keep summaries/ids and drop the raw content so native passthrough does not 400.
@@ -92,11 +154,98 @@ export function sanitizeReasoningInputContent(
     // guide merges reasoning items into the adjacent assistant message), so providers flagged
     // `preserveResponsesReasoningContent` keep it — deleting valid replay content there breaks
     // continuations after tool calls (issue #875 family).
-    if (blankContent) next.content = [];
+    if (blankContent) {
+      if (hasPlaintextReasoningContent(rec.content)) blankedPlaintext = true;
+      next.content = [];
+    }
+    if (missingPlaintextReasoning) next.content = plaintextReasoningBackfill(next);
     return next;
   });
 
-  return changed ? { ...raw, input } : body;
+  if (blankedPlaintext) opts?.onPlaintextReasoningBlanked?.();
+  // Runs after the per-item pass so an item it emptied has already been backfilled, and a
+  // placeholder is only invented for a turn that carries no reasoning item at all.
+  const withTurnReasoning = opts?.requirePlaintextReasoning === true
+    ? backfillBareToolCallTurnReasoning(input)
+    : input;
+  if (withTurnReasoning !== input) changed = true;
+  return changed ? { ...raw, input: withTurnReasoning } : body;
+}
+
+/** Assistant-authored history items: what DeepSeek merges into one assistant message. */
+function isAssistantTurnItem(item: unknown): boolean {
+  if (!isPlainObject(item) || typeof item.type !== "string") return false;
+  if (item.type === "reasoning") return true;
+  if (item.type === "message") return item.role === "assistant";
+  return item.type.endsWith("_call");
+}
+
+function isClientToolCallItem(item: unknown): boolean {
+  return isPlainObject(item)
+    && (item.type === "function_call" || item.type === "custom_tool_call" || item.type === "local_shell_call");
+}
+
+/**
+ * Give every assistant tool-call turn that has NO reasoning item a minimal plaintext one (#7298).
+ *
+ * A Combo can serve the turn that issued a tool call on one model and the continuation on
+ * another. When the issuing model was a GPT turn that produced no reasoning item (or the item
+ * was dropped upstream), the strict destination sees a bare `function_call` and DeepSeek's
+ * thinking mode refuses the whole request with `The reasoning_text in the thinking mode must be
+ * passed back to the API`. The per-item backfill above cannot help, because there is no item to
+ * backfill. This is the Responses-wire twin of the Chat adapter's `reasoning_content: " "`
+ * placeholder (#5421): the same single-space text, never fabricated reasoning, inserted at the
+ * head of the turn so it precedes the call exactly where a native turn's reasoning would be.
+ *
+ * A turn is a maximal run of assistant-authored items; any user message or tool output ends it.
+ * Turns that already carry a reasoning item, and turns with no client tool call, are untouched.
+ */
+export function backfillBareToolCallTurnReasoning(input: unknown[]): unknown[] {
+  const bareTurnStarts = new Set<number>();
+  let turnStart = -1;
+  let turnHasReasoning = false;
+  let turnHasToolCall = false;
+  const closeTurn = (): void => {
+    if (turnStart >= 0 && turnHasToolCall && !turnHasReasoning) bareTurnStarts.add(turnStart);
+    turnStart = -1;
+    turnHasReasoning = false;
+    turnHasToolCall = false;
+  };
+  for (let index = 0; index < input.length; index++) {
+    const item = input[index];
+    if (!isAssistantTurnItem(item)) {
+      closeTurn();
+      continue;
+    }
+    if (turnStart < 0) turnStart = index;
+    if ((item as Record<string, unknown>).type === "reasoning") turnHasReasoning = true;
+    if (isClientToolCallItem(item)) turnHasToolCall = true;
+  }
+  closeTurn();
+  if (bareTurnStarts.size === 0) return input;
+  const result: unknown[] = [];
+  for (let index = 0; index < input.length; index++) {
+    if (bareTurnStarts.has(index)) {
+      result.push({ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: " " }] });
+    }
+    result.push(input[index]);
+  }
+  return result;
+}
+
+/**
+ * `reasoning.summary: "none"` is an internal "hide the thinking summary" marker: Claude's
+ * `thinking.display: "omitted"` maps to it, and the parser reads it into
+ * `options.hideThinkingSummary`. It is not a Responses API value (valid: auto, concise,
+ * detailed), so drop it from the body that is serialized to the upstream.
+ */
+export function stripNoneReasoningSummary(body: unknown): unknown {
+  if (!isPlainObject(body) || !isPlainObject(body.reasoning) || body.reasoning.summary !== "none") return body;
+  const { summary: _summary, ...rest } = body.reasoning;
+  const next = { ...body };
+  if (Object.keys(rest).length > 0) next.reasoning = rest;
+  else delete next.reasoning;
+  return next;
 }
 
 export function stripUnsupportedReasoningSummaryDelivery(body: unknown, modelId: string): unknown {
@@ -174,6 +323,19 @@ export function stripDisabledVerbosity(
     ...body,
     ...(Object.keys(rest).length > 0 ? { text: rest } : { text: undefined }),
   };
+}
+
+/**
+ * `reasoning.enabled` is an OCX inbound compatibility extension, not an OpenAI Responses
+ * parameter. Strip it at Responses egress unless a custom destination explicitly declares
+ * the gateway-object wire; thinking capability alone does not declare a wire format.
+ */
+export function stripInternalReasoningEnabled(body: unknown): unknown {
+  if (!isPlainObject(body) || !isPlainObject(body.reasoning) || !Object.hasOwn(body.reasoning, "enabled")) {
+    return body;
+  }
+  const { enabled: _enabled, ...reasoning } = body.reasoning;
+  return { ...body, ...(Object.keys(reasoning).length > 0 ? { reasoning } : { reasoning: undefined }) };
 }
 
 /**

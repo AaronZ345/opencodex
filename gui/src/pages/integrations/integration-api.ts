@@ -2,6 +2,10 @@ import { readJsonIfOk } from "../../fetch-json";
 import { parseAsideProfileStatus, parseAsideProfileOutcomes, type AsideProfileOutcome } from "./aside-profile-contract";
 
 export const FILE_INTEGRATION_CLIENTS = [
+  "qoder",
+  "qoder-cn",
+  "workbuddy",
+  "workbuddy-ai",
   "opencode",
   "pi",
   "omp",
@@ -12,11 +16,16 @@ export const FILE_INTEGRATION_CLIENTS = [
   "dsh",
   "mcode",
   "zcode",
+  "commandcode",
   "prime",
   "aside",
   "raycast",
   "omo",
   "cline",
+  "kilo",
+  "droid",
+  "gentle-shell",
+  "t3code",
 ] as const;
 
 export type FileIntegrationClientId = (typeof FILE_INTEGRATION_CLIENTS)[number];
@@ -29,6 +38,7 @@ export type IntegrationReason =
   | "unowned-key"
   | "blocked-container"
   | "ambiguous-selector"
+  | "candidate-conflict"
   | "unresolvable-path";
 
 export type IntegrationRefusalReason =
@@ -36,6 +46,7 @@ export type IntegrationRefusalReason =
   | "conflict"
   | "unsafe"
   | "non_loopback"
+  | "superseded_store"
   | "drift_requires_confirm"
   | "snapshot_expired"
   | "write_failed";
@@ -53,6 +64,12 @@ export interface RaycastInstall {
   aiDirPresent: boolean;
 }
 
+/**
+ * Why a client's provider store is not written. `missing-store` is the one with a
+ * remedy the operator performs: create the store with `missingStoreDocument`.
+ */
+export type IntegrationSupersededReason = "owned-config-file" | "unestablished-schema" | "missing-store";
+
 export interface IntegrationStatus {
   clientId: FileIntegrationClientId;
   state: IntegrationState;
@@ -61,12 +78,50 @@ export interface IntegrationStatus {
   appliedAt?: string;
   lastOpId?: string;
   reason?: IntegrationReason;
+  conflictPaths?: string[];
+  candidateFailurePath?: string;
+  /**
+   * The store this client reads instead of `configPath`, when one exists.
+   *
+   * Independent of `state`: the block can be current in a file the client
+   * stopped opening, which is the one case where a green badge alone misleads.
+   * Same role as `raycast`, whose plan can make a written file inert.
+   */
+  supersededBy?: string;
+  /** Why `supersededBy` is not written; the server sends it exactly when it sends the path. */
+  supersededReason?: IntegrationSupersededReason;
+  /** `missing-store` only: what to create the missing store with. */
+  missingStoreDocument?: string;
   snapshotCount: number;
   retentionDegraded: boolean;
   /** Aside's explicit account-backed profile scope and desired sync state. */
   profileId?: number;
   enabled?: boolean;
+  /** The Hermes profile a profile-scoped read describes (#7674). */
+  hermesProfile?: string;
+  /** Why a listed Hermes profile cannot be changed safely. */
+  error?: string;
   raycast?: RaycastInstall;
+  droidReasoning?: DroidReasoningStatus;
+}
+
+export interface DroidReasoningModel {
+  model: string;
+  label: string;
+  efforts: string[];
+}
+
+export interface DroidReasoningStatus {
+  models: DroidReasoningModel[];
+  defaults: Record<string, string>;
+}
+
+/** A candidate issue can block adding Kilo while removal still targets its recorded file. */
+export function canDisableKiloWithCandidateIssue(status: IntegrationStatus): boolean {
+  return status.clientId === "kilo" && !!status.lastOpId
+    && (status.reason === "candidate-conflict"
+      || (status.state === "unsafe" && !!status.candidateFailurePath
+        && status.candidateFailurePath !== status.configPath));
 }
 
 export interface IntegrationStateListEnvelope {
@@ -129,6 +184,9 @@ export interface IntegrationMutationPlan {
   canApply: boolean;
   willChange: boolean;
   refusalReason?: IntegrationRefusalReason;
+  /** `superseded_store` refusals only. The store's path is on the status row, not the plan. */
+  supersededReason?: IntegrationSupersededReason;
+  missingStoreDocument?: string;
   profileId?: number;
 }
 
@@ -143,6 +201,9 @@ export interface ToggleIntegrationOptions {
   overwriteConflict?: boolean;
   profileId?: number;
   binding?: IntegrationPlanBinding;
+  droidReasoningDefaults?: Record<string, string>;
+  /** A named Hermes profile; omitted for the default profile. */
+  hermesProfile?: string;
 }
 
 export interface RestoreIntegrationOptions {
@@ -151,6 +212,7 @@ export interface RestoreIntegrationOptions {
   signal?: AbortSignal;
   profileId?: number;
   binding: IntegrationPlanBinding;
+  hermesProfile?: string;
 }
 
 export type IntegrationRefusalCode =
@@ -194,6 +256,7 @@ const REFUSAL_REASONS: ReadonlySet<string> = new Set<IntegrationRefusalReason>([
   "conflict",
   "unsafe",
   "non_loopback",
+  "superseded_store",
   "drift_requires_confirm",
   "snapshot_expired",
   "write_failed",
@@ -215,19 +278,32 @@ const INTEGRATION_STATES: ReadonlySet<string> = new Set<IntegrationState>([
 const PLAN_OPERATIONS: readonly IntegrationPlanOperation[] = ["apply", "overwrite", "disable", "restore"];
 const PLAN_CHANGE_KINDS: readonly IntegrationPlanChangeKind[] = ["add", "replace", "remove", "snapshot", "ownership", "journal"];
 const PLAN_FOREIGN_EDITS: readonly IntegrationPlanForeignEdit[] = ["none", "unowned", "foreign-edit", "drift"];
-const PLAN_KEYS = new Set(["version", "clientId", "operation", "state", "foreignEdit", "changes", "fingerprint", "canApply", "willChange", "refusalReason", "profileId"]);
+const PLAN_KEYS = new Set(["version", "clientId", "operation", "state", "foreignEdit", "changes", "fingerprint", "canApply", "willChange", "refusalReason", "supersededReason", "missingStoreDocument", "profileId"]);
+const SUPERSEDED_REASONS: ReadonlySet<string> = new Set<IntegrationSupersededReason>(["owned-config-file", "unestablished-schema", "missing-store"]);
+/** Shown verbatim (and echoed by the CLI): one short printable-ASCII line, as a store's empty form is. */
+const MISSING_STORE_DOCUMENT = /^[\x20-\x7e]{1,64}$/;
 const PLAN_CHANGE_KEYS = new Set(["kind", "path"]);
 const PLAN_PSEUDO_PATHS = new Set(["$snapshot", "$ownership", "$journal"]);
 const PLAN_SCHEMA_PATHS = new Set([
+  "*", // A WorkBuddy legacy document is a top-level model array.
   "provider.opencodex",
   "providers.opencodex",
   "models.providers.opencodex",
   "models.*",
+  "modelConfigs.customModels.*",
+  "providerInstances.opencodex",
   "llm-pi-ai.providers.opencodex",
   "custom_provider.opencodex",
   "providers.[id=opencodex]",
   "settings.providers.opencodex",
   "catalog.providers.opencodex",
+  "customModels.*",
+  // ZCode reads its providers from a second file; a plan for it publishes that
+  // file's templates, and a path missing here is rejected as an invalid preview.
+  "config.providerConfigRules.providerRules.[providerId=opencodex]",
+  "config.modelConfigRules.providerModelRules.*",
+  // DSH 0.1.7+ reads routes from the `llm-pi-ai` row of its Desktop profile patch.
+  "[id=llm-pi-ai].config.providers.opencodex",
 ]);
 const PLAN_CHANGE_LIMIT = 256;
 
@@ -254,12 +330,24 @@ export function parseIntegrationMutationPlan(value: unknown): IntegrationMutatio
     || !PLAN_OPERATIONS.includes(value.operation as IntegrationPlanOperation)
     || !INTEGRATION_STATES.has(String(value.state))
     || !PLAN_FOREIGN_EDITS.includes(value.foreignEdit as IntegrationPlanForeignEdit)
-    || typeof value.fingerprint !== "string" || !/^p1:(?:[0-9a-f]{32}|unbound)$/.test(value.fingerprint)
+    /*
+     * The version is matched as a version, not as `p1`. The server calls this
+     * token opaque and bumps its prefix whenever the inputs it binds change; a
+     * literal here made that bump a silent client-side rejection of every
+     * preview, which is a worse failure than the drift it was meant to catch.
+     */
+    || typeof value.fingerprint !== "string" || !/^p[0-9]+:(?:[0-9a-f]{32}|unbound)$/.test(value.fingerprint)
     || typeof value.canApply !== "boolean" || typeof value.willChange !== "boolean"
     || !Array.isArray(value.changes) || value.changes.length > PLAN_CHANGE_LIMIT
     || (value.profileId !== undefined && (typeof value.profileId !== "number" || !Number.isSafeInteger(value.profileId) || value.profileId < 0))
     || (value.profileId !== undefined && value.clientId !== "aside")
-    || (value.refusalReason !== undefined && !REFUSAL_REASONS.has(String(value.refusalReason)))) {
+    || (value.refusalReason !== undefined && !REFUSAL_REASONS.has(String(value.refusalReason)))
+    || (value.supersededReason !== undefined
+      && (value.refusalReason !== "superseded_store" || typeof value.supersededReason !== "string"
+        || !SUPERSEDED_REASONS.has(value.supersededReason)))
+    || (value.missingStoreDocument !== undefined
+      && (value.supersededReason !== "missing-store" || typeof value.missingStoreDocument !== "string"
+        || !MISSING_STORE_DOCUMENT.test(value.missingStoreDocument)))) {
     throw invalidPreviewResponse();
   }
   const changes: IntegrationPlanChange[] = [];
@@ -283,7 +371,7 @@ export function parseIntegrationMutationPlan(value: unknown): IntegrationMutatio
   }
   if ((value.willChange && (!value.canApply || changes.length === 0))
     || (!value.willChange && changes.length !== 0)
-    || (value.fingerprint === "p1:unbound" && value.canApply)
+    || ((value.fingerprint as string).endsWith(":unbound") && value.canApply)
     || (value.canApply === (value.refusalReason !== undefined))) throw invalidPreviewResponse();
   return {
     version: 1,
@@ -296,6 +384,8 @@ export function parseIntegrationMutationPlan(value: unknown): IntegrationMutatio
     canApply: value.canApply,
     willChange: value.willChange,
     ...(value.refusalReason === undefined ? {} : { refusalReason: value.refusalReason as IntegrationRefusalReason }),
+    ...(value.supersededReason === undefined ? {} : { supersededReason: value.supersededReason as IntegrationSupersededReason }),
+    ...(value.missingStoreDocument === undefined ? {} : { missingStoreDocument: value.missingStoreDocument as string }),
     ...(value.profileId === undefined ? {} : { profileId: Number(value.profileId) }),
   };
 }
@@ -385,6 +475,24 @@ function clientPath(client: FileIntegrationClientId, profileId?: number): string
   return client === "aside" ? "/api/client-integrations/aside/profiles" : `/api/client-integrations/${encodeURIComponent(client)}`;
 }
 
+/**
+ * The query that scopes a request to a named Hermes profile. Shared paths also name the client,
+ * which the server requires before it reads `profile` as a Hermes name rather than an Aside id.
+ */
+function hermesScope(hermesProfile: string | undefined, sharedPath: boolean): string {
+  if (hermesProfile === undefined) return "";
+  const profile = `profile=${encodeURIComponent(hermesProfile)}`;
+  return sharedPath ? `client=hermes&${profile}` : profile;
+}
+
+function withQuery(path: string, query: string): string {
+  return query ? `${path}${path.includes("?") ? "&" : "?"}${query}` : path;
+}
+
+function invalidHermesResponse(): IntegrationApiError {
+  return new IntegrationApiError(502, { code: "invalid_hermes_profile_response" });
+}
+
 export async function loadIntegrationStates(apiBase: string, signal?: AbortSignal) {
   return readResponse<IntegrationStateListEnvelope>(
     await fetch(`${apiBase}/api/client-integrations`, { signal }),
@@ -396,10 +504,12 @@ export async function loadIntegrationState(
   client: FileIntegrationClientId,
   signal?: AbortSignal,
   profileId?: number,
+  hermesProfile?: string,
 ) {
   const result = await readResponse<IntegrationStatus>(
-    await fetch(`${apiBase}${clientPath(client, profileId)}`, { signal }),
+    await fetch(`${apiBase}${withQuery(clientPath(client, profileId), hermesScope(hermesProfile, false))}`, { signal }),
   );
+  if (hermesProfile !== undefined && (client !== "hermes" || result.hermesProfile !== hermesProfile)) throw invalidHermesResponse();
   if (profileId !== undefined) {
     const parsed = parseAsideProfileStatus(result);
     if (!parsed || parsed.profileId !== profileId) throw new IntegrationApiError(502, { code: "invalid_aside_profile_response" });
@@ -413,10 +523,12 @@ export async function loadIntegrationJournal(
   client?: FileIntegrationClientId,
   signal?: AbortSignal,
   profileId?: number,
+  hermesProfile?: string,
 ) {
   if (profileId !== undefined && client !== "aside") throw new IntegrationApiError(400, { code: "invalid_aside_profile" });
+  if (hermesProfile !== undefined && client !== "hermes") throw new IntegrationApiError(400, { code: "invalid_hermes_profile" });
   const path = client === "aside" ? `${clientPath(client, profileId)}/journal`
-    : `/api/client-integrations/journal${client ? `?client=${encodeURIComponent(client)}` : ""}`;
+    : withQuery(`/api/client-integrations/journal${client ? `?client=${encodeURIComponent(client)}` : ""}`, hermesScope(hermesProfile, false));
   const result = await readResponse<IntegrationJournalEnvelope>(
     await fetch(`${apiBase}${path}`, { signal }),
   );
@@ -431,9 +543,17 @@ export async function previewIntegrationMutation(
   operation: Exclude<IntegrationPlanOperation, "restore">,
   signal?: AbortSignal,
   profileId?: number,
+  droidReasoningDefaults?: Record<string, string>,
+  hermesProfile?: string,
 ) {
-  const path = profileId === undefined ? "/api/client-integrations/preview" : `${profilePath(profileId)}/preview`;
-  const requestBody = profileId === undefined ? { clientId: client, operation } : { operation };
+  const path = profileId === undefined
+    ? withQuery("/api/client-integrations/preview", hermesScope(hermesProfile, true))
+    : `${profilePath(profileId)}/preview`;
+  const requestBody = {
+    ...(profileId === undefined ? { clientId: client } : {}),
+    operation,
+    ...(client === "droid" && droidReasoningDefaults !== undefined ? { droidReasoningDefaults } : {}),
+  };
   const plan = parseIntegrationMutationPlan(await readResponse<unknown>(await fetch(`${apiBase}${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody), signal,
   })));
@@ -447,8 +567,11 @@ export async function previewIntegrationRestore(
   confirmDrift = false,
   signal?: AbortSignal,
   profileId?: number,
+  hermesProfile?: string,
 ) {
-  const path = profileId === undefined ? "/api/client-integrations/restore/preview" : `${profilePath(profileId)}/preview`;
+  const path = profileId === undefined
+    ? withQuery("/api/client-integrations/restore/preview", hermesScope(hermesProfile, true))
+    : `${profilePath(profileId)}/preview`;
   const body = profileId === undefined ? { opId, confirmDrift } : { operation: "restore", opId, confirmDrift };
   const plan = parseIntegrationMutationPlan(await readResponse<unknown>(await fetch(`${apiBase}${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal,
@@ -458,14 +581,16 @@ export async function previewIntegrationRestore(
 }
 
 export async function toggleIntegration(apiBase: string, client: FileIntegrationClientId, options: ToggleIntegrationOptions) {
-  const { enabled, signal, overwriteConflict, profileId, binding } = options;
+  const { enabled, signal, overwriteConflict, profileId, binding, droidReasoningDefaults, hermesProfile } = options;
+  if (hermesProfile !== undefined && client !== "hermes") throw new IntegrationApiError(400, { code: "invalid_hermes_profile" });
   const expectedOperation: IntegrationPlanOperation = enabled ? (overwriteConflict ? "overwrite" : "apply") : "disable";
   let result: IntegrationToggleResult | { ok: false; message?: string; results?: unknown };
   try {
-    result = await readResponse<IntegrationToggleResult | { ok: false; message?: string; results?: unknown }>(await fetch(`${apiBase}${clientPath(client, profileId)}`, {
+    result = await readResponse<IntegrationToggleResult | { ok: false; message?: string; results?: unknown }>(await fetch(`${apiBase}${withQuery(clientPath(client, profileId), hermesScope(hermesProfile, false))}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, ...(overwriteConflict === true ? { overwriteConflict: true } : {}), ...binding }),
+      body: JSON.stringify({ enabled, ...(overwriteConflict === true ? { overwriteConflict: true } : {}), ...binding,
+        ...(client === "droid" && droidReasoningDefaults !== undefined ? { droidReasoningDefaults } : {}) }),
       signal,
     }));
   } catch (error) {
@@ -491,10 +616,10 @@ export async function restoreIntegration(
   apiBase: string,
   options: RestoreIntegrationOptions,
 ) {
-  const { opId, confirmDrift = false, signal, profileId, binding } = options;
+  const { opId, confirmDrift = false, signal, profileId, binding, hermesProfile } = options;
   let result: IntegrationRestoreResult;
   try {
-    result = await readResponse<IntegrationRestoreResult>(await fetch(`${apiBase}${profileId === undefined ? "/api/client-integrations/restore" : `${profilePath(profileId)}/restore`}`, {
+    result = await readResponse<IntegrationRestoreResult>(await fetch(`${apiBase}${profileId === undefined ? withQuery("/api/client-integrations/restore", hermesScope(hermesProfile, true)) : `${profilePath(profileId)}/restore`}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ opId, confirmDrift, ...binding }),
@@ -521,6 +646,7 @@ export async function deleteJournalEntry(
   opId: string,
   signal?: AbortSignal,
   profileId?: number,
+  hermesProfile?: string,
 ) {
   const result = await readResponse<{
     ok: true;
@@ -529,7 +655,7 @@ export async function deleteJournalEntry(
     snapshotRemoved: boolean;
     profileId?: number;
   }>(
-    await fetch(`${apiBase}${profileId === undefined ? "/api/client-integrations/journal" : `${profilePath(profileId)}/journal`}?opId=${encodeURIComponent(opId)}`, {
+    await fetch(`${apiBase}${withQuery(profileId === undefined ? "/api/client-integrations/journal" : `${profilePath(profileId)}/journal`, hermesScope(hermesProfile, true))}${hermesProfile === undefined ? "?" : "&"}opId=${encodeURIComponent(opId)}`, {
       method: "DELETE",
       signal,
     }),

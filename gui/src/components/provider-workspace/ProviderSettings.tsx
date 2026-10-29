@@ -1,7 +1,8 @@
 /**
  * ProviderSettings — adapter/baseUrl/defaultModel/authMode/note editing form
  * for the workspace Settings tab (WP091). Uses PATCH /api/providers via an
- * onUpdateProvider prop. May fetch `/api/provider-presets` once per provider
+ * onUpdateProvider prop; the upstream wire panel below the adapter field is read-only
+ * and never saves on its own. May fetch `/api/provider-presets` once per provider
  * to discover `baseUrlChoices` (e.g. Qwen Cloud endpoint picker).
  *
  * Parent should remount on provider change (`key={item.name}`) so choice-loading
@@ -10,23 +11,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { baseUrlForChoice, matchChoiceId, resolvedBaseUrlForChoice } from "../../base-url-choice";
 import { readJsonIfOk } from "../../fetch-json";
+import { confirmAction } from "../../action-dialogs";
 import { createBoundedFetch } from "../../bounded-fetch";
 import { startVisibilityPoll } from "../../visibility-poll";
 import { useT } from "../../i18n/shared";
 import { IconLock } from "../../icons";
 import { isCatalogProviderId } from "../../provider-icons";
 import { openAiAccountProviderState } from "../../provider-payload";
+import { canConfigureResponsesReasoningReplay } from "../../responses-reasoning-replay";
+import { ResponsesReasoningReplayControl } from "../responses-reasoning-replay-control";
 import { providerSupportsLiveModelDiscovery } from "../../provider-workspace/catalog";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import { authModeLabel } from "./ProviderRail";
+import { ProviderProtocolPanel } from "./ProviderProtocolPanel";
+import { ProviderKeyPacing, type KeyPacingDraft, type KeyPacingStatus } from "./ProviderKeyPacing";
 import type { WorkspaceItem, ProviderUpdatePatch, ProviderUpdateResult } from "./types";
 
 const ADAPTERS = ["openai-responses", "openai-chat", "anthropic", "google", "azure-openai", "cursor"] as const;
 const EMPTY_MODELS: string[] = [];
 
 type ChoicesStatus = "idle" | "loading" | "ready" | "error";
-type PacingRule = { requestsPerMinute?: number; minIntervalMs?: number };
-type PacingStatus = { enabled: boolean; queued: number; nextSlotInMs: number; lastStartedAt?: number; lastModelId?: string };
+type PacingRule = { requestsPerMinute?: number; minIntervalMs?: number; maxConcurrentRequests?: number };
+type PacingStatus = { enabled: boolean; queued: number; nextSlotInMs: number; lastStartedAt?: number; lastModelId?: string; keys?: KeyPacingStatus[] };
 type CursorHttpVersion = "http2" | "http1.1";
 
 function effectiveCursorHttpVersion(value: WorkspaceItem["upstreamHttpVersion"]): CursorHttpVersion {
@@ -47,11 +53,14 @@ function positiveInteger(value: string): number | undefined {
 function pacingSignature(value: WorkspaceItem["requestPacing"] | undefined): string {
   const models = Object.entries(value?.models ?? {})
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([model, rule]) => [model, rule.requestsPerMinute ?? null, rule.minIntervalMs ?? null]);
+    .map(([model, rule]) => [model, rule.requestsPerMinute ?? null, rule.minIntervalMs ?? null, rule.maxConcurrentRequests ?? null]);
   return JSON.stringify([
     value?.enabled === true,
     value?.requestsPerMinute ?? null,
     value?.minIntervalMs ?? null,
+    value?.maxConcurrentRequests ?? null,
+    value?.keySelection ?? "active",
+    [value?.keys?.requestsPerMinute ?? null, value?.keys?.minIntervalMs ?? null, value?.keys?.maxConcurrentRequests ?? null],
     models,
   ]);
 }
@@ -80,6 +89,7 @@ export default function ProviderSettings({
   const [apiKeyTransport, setApiKeyTransport] = useState(item.apiKeyTransport ?? "x-api-key");
   const [note, setNote] = useState(item.note ?? "");
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(item.allowPrivateNetwork ?? false);
+  const [preserveReasoningReplay, setPreserveReasoningReplay] = useState(item.preserveResponsesReasoningContent === true);
   const [liveModels, setLiveModels] = useState(savedLiveModels);
   const [cursorHttpVersion, setCursorHttpVersion] = useState<CursorHttpVersion>(savedCursorHttpVersion);
   const [saving, setSaving] = useState(false);
@@ -88,15 +98,19 @@ export default function ProviderSettings({
   const [modeSaving, setModeSaving] = useState(false);
   const [modeMsg, setModeMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [baseUrlChoices, setBaseUrlChoices] = useState<CatalogPreset["baseUrlChoices"]>();
-  const [choicesStatus, setChoicesStatus] = useState<ChoicesStatus>(apiBase ? "loading" : "idle");
+  // "" is the same-origin dashboard and must load like any other server base.
+  const [choicesStatus, setChoicesStatus] = useState<ChoicesStatus>(apiBase !== undefined ? "loading" : "idle");
   const [endpointChoice, setEndpointChoice] = useState(() => "custom");
   const [pacingEnabled, setPacingEnabled] = useState(item.requestPacing?.enabled === true);
+  const [keyPacing, setKeyPacing] = useState<KeyPacingDraft>({ keySelection: item.requestPacing?.keySelection, keys: item.requestPacing?.keys });
   const [pacingRpm, setPacingRpm] = useState(() => numberDraft(item.requestPacing?.requestsPerMinute));
   const [pacingDelay, setPacingDelay] = useState(() => numberDraft(item.requestPacing?.minIntervalMs));
+  const [pacingConcurrency, setPacingConcurrency] = useState(() => numberDraft(item.requestPacing?.maxConcurrentRequests));
   const [pacingModels, setPacingModels] = useState<Record<string, PacingRule>>(() => ({ ...(item.requestPacing?.models ?? {}) }));
   const [pacingModelId, setPacingModelId] = useState("");
   const [pacingModelRpm, setPacingModelRpm] = useState("");
   const [pacingModelDelay, setPacingModelDelay] = useState("");
+  const [pacingModelConcurrency, setPacingModelConcurrency] = useState("");
   const [pacingStatus, setPacingStatus] = useState<PacingStatus | null>(null);
 
   /* eslint-disable react-hooks/set-state-in-effect -- intentional form reset when saved provider fields change */
@@ -108,16 +122,19 @@ export default function ProviderSettings({
     setApiKeyTransport(item.apiKeyTransport ?? "x-api-key");
     setNote(item.note ?? "");
     setAllowPrivateNetwork(item.allowPrivateNetwork ?? false);
+    setPreserveReasoningReplay(item.preserveResponsesReasoningContent === true);
     setLiveModels(savedLiveModels);
     setCursorHttpVersion(savedCursorHttpVersion);
     setPacingEnabled(item.requestPacing?.enabled === true);
+    setKeyPacing({ keySelection: item.requestPacing?.keySelection, keys: item.requestPacing?.keys });
     setPacingRpm(numberDraft(item.requestPacing?.requestsPerMinute));
     setPacingDelay(numberDraft(item.requestPacing?.minIntervalMs));
+    setPacingConcurrency(numberDraft(item.requestPacing?.maxConcurrentRequests));
     setPacingModels({ ...(item.requestPacing?.models ?? {}) });
     setMsg(null);
     setModeMsg(null);
     queueMicrotask(() => setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl)));
-  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.apiKeyTransport, item.keyOptional, item.note, item.allowPrivateNetwork, savedLiveModels, savedCursorHttpVersion, item.requestPacing, baseUrlChoices]);
+  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.apiKeyTransport, item.keyOptional, item.note, item.allowPrivateNetwork, item.preserveResponsesReasoningContent, savedLiveModels, savedCursorHttpVersion, item.requestPacing, baseUrlChoices]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   // Account mode syncs on its own: a mode PATCH refresh must not reset an in-progress
@@ -129,7 +146,7 @@ export default function ProviderSettings({
   /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
-    if (!apiBase) return;
+    if (apiBase === undefined) return;
     let cancelled = false;
     const providerId = item.name;
     const savedBaseUrl = item.baseUrl;
@@ -160,7 +177,7 @@ export default function ProviderSettings({
   }, [apiBase, item.name]);
 
   useEffect(() => {
-    if (!apiBase) return;
+    if (apiBase === undefined) return;
     let active = true;
     let inFlight = false;
     const load = () => {
@@ -181,12 +198,17 @@ export default function ProviderSettings({
 
   const pacingDraft = useMemo(() => ({
     enabled: pacingEnabled,
+    ...keyPacing,
     ...(positiveRpm(pacingRpm) !== undefined ? { requestsPerMinute: positiveRpm(pacingRpm) } : {}),
     ...(positiveInteger(pacingDelay) !== undefined ? { minIntervalMs: positiveInteger(pacingDelay) } : {}),
+    ...(positiveInteger(pacingConcurrency) !== undefined ? { maxConcurrentRequests: positiveInteger(pacingConcurrency) } : {}),
     ...(Object.keys(pacingModels).length > 0 ? { models: pacingModels } : {}),
-  }), [pacingDelay, pacingEnabled, pacingModels, pacingRpm]);
+  }), [keyPacing, pacingConcurrency, pacingDelay, pacingEnabled, pacingModels, pacingRpm]);
 
-  const dirty = adapter.trim() !== item.adapter
+  const supportsReasoningReplay = !isCatalogProviderId(item.name)
+    && canConfigureResponsesReasoningReplay({ adapter, baseUrl, authMode });
+  const reasoningReplayDirty = supportsReasoningReplay && preserveReasoningReplay !== (item.preserveResponsesReasoningContent === true);
+  const dirty = reasoningReplayDirty || adapter.trim() !== item.adapter
     || baseUrl.trim() !== item.baseUrl
     || defaultModel.trim() !== (item.defaultModel ?? "")
     || authMode !== String(item.authMode ?? (item.keyOptional ? "local" : "key"))
@@ -232,7 +254,17 @@ export default function ProviderSettings({
     setSaving(true);
     setMsg(null);
     try {
-      if (pacingEnabled && !pacingDraft.requestsPerMinute && !pacingDraft.minIntervalMs && !pacingDraft.models) {
+      if (pacingConcurrency.trim() !== "" && positiveInteger(pacingConcurrency) === undefined) {
+        setMsg({ ok: false, text: t("pws.pacingCapInvalid") }); return false;
+      }
+      if (Object.entries(keyPacing.keys ?? {}).some(([field, value]) =>
+        !Number.isFinite(value) || value <= 0
+        || (field !== "requestsPerMinute" && !Number.isSafeInteger(value))
+        || (field === "requestsPerMinute" && (value < 1 / 60 || value > 60_000))
+        || (field === "minIntervalMs" && value > 3_600_000))) {
+        setMsg({ ok: false, text: t("pws.keyLimitInvalid") }); return false;
+      }
+      if (pacingEnabled && !pacingDraft.requestsPerMinute && !pacingDraft.minIntervalMs && !pacingDraft.maxConcurrentRequests && !pacingDraft.models && !pacingDraft.keys && pacingDraft.keySelection !== "round-robin") {
         setMsg({ ok: false, text: t("pws.pacingRuleRequired") }); return false;
       }
       const pacingOnly = pacingDirty && !dirty;
@@ -251,6 +283,7 @@ export default function ProviderSettings({
         // Keep omitted legacy values omitted unless the user actually changes this toggle.
         // Otherwise an unrelated settings save manufactures `liveModels: true` provenance.
         if (liveModelDiscoverySupported && liveModels !== (item.liveModels !== false)) patch.liveModels = liveModels;
+        if (reasoningReplayDirty) patch.preserveResponsesReasoningContent = preserveReasoningReplay;
         if (adapter.trim() === "cursor" && cursorHttpVersion !== savedCursorHttpVersion) {
           patch.upstreamHttpVersion = cursorHttpVersion === "http1.1" ? "http1.1" : null;
         }
@@ -295,14 +328,35 @@ export default function ProviderSettings({
     }
   };
 
+  /**
+   * Asks before switching, because flipping modes rebinds running threads and changes quota
+   * accounting. Written as a named async function rather than a promise chain inside the
+   * handler: a floating `.then` in a JSX handler has no rejection path and is what
+   * `no-floating-then-in-jsx-handler` exists to catch.
+   */
+  const requestAccountMode = async (next: "pool" | "direct", select: HTMLSelectElement) => {
+    if (await confirmAction({ message: t("pws.accountModeConfirm") })) {
+      await applyAccountMode(next);
+      return;
+    }
+    // Keep the visible choice aligned with the applied mode. React re-renders this
+    // controlled <select> only when `accountMode` changes, and a refusal leaves it
+    // unchanged, so the declined option would otherwise stay shown.
+    select.value = accountMode;
+  };
+
   const discard = () => {
     setAdapter(item.adapter); setBaseUrl(item.baseUrl);
     setDefaultModel(item.defaultModel ?? ""); setAuthMode(initialAuth);
     setApiKeyTransport(item.apiKeyTransport ?? "x-api-key");
     setNote(item.note ?? ""); setAllowPrivateNetwork(item.allowPrivateNetwork ?? false); setLiveModels(savedLiveModels);
+    setPreserveReasoningReplay(item.preserveResponsesReasoningContent === true);
     setCursorHttpVersion(savedCursorHttpVersion); setMsg(null);
     setPacingEnabled(item.requestPacing?.enabled === true); setPacingRpm(numberDraft(item.requestPacing?.requestsPerMinute));
-    setPacingDelay(numberDraft(item.requestPacing?.minIntervalMs)); setPacingModels({ ...(item.requestPacing?.models ?? {}) });
+    setKeyPacing({ keySelection: item.requestPacing?.keySelection, keys: item.requestPacing?.keys });
+    setPacingDelay(numberDraft(item.requestPacing?.minIntervalMs));
+    setPacingConcurrency(numberDraft(item.requestPacing?.maxConcurrentRequests));
+    setPacingModels({ ...(item.requestPacing?.models ?? {}) });
     setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl));
   };
 
@@ -319,9 +373,21 @@ export default function ProviderSettings({
     const modelId = pacingModelId.trim();
     const rpm = positiveRpm(pacingModelRpm);
     const delay = positiveInteger(pacingModelDelay);
-    if (!modelId || (rpm === undefined && delay === undefined)) return;
-    setPacingModels(current => ({ ...current, [modelId]: { ...(rpm !== undefined ? { requestsPerMinute: rpm } : {}), ...(delay !== undefined ? { minIntervalMs: delay } : {}) } }));
-    setPacingModelId(""); setPacingModelRpm(""); setPacingModelDelay("");
+    const cap = positiveInteger(pacingModelConcurrency);
+    if (pacingModelConcurrency.trim() !== "" && cap === undefined) {
+      setMsg({ ok: false, text: t("pws.pacingCapInvalid") });
+      return;
+    }
+    if (!modelId || (rpm === undefined && delay === undefined && cap === undefined)) return;
+    setPacingModels(current => ({
+      ...current,
+      [modelId]: {
+        ...(rpm !== undefined ? { requestsPerMinute: rpm } : {}),
+        ...(delay !== undefined ? { minIntervalMs: delay } : {}),
+        ...(cap !== undefined ? { maxConcurrentRequests: cap } : {}),
+      },
+    }));
+    setPacingModelId(""); setPacingModelRpm(""); setPacingModelDelay(""); setPacingModelConcurrency("");
   };
 
   return (
@@ -338,6 +404,13 @@ export default function ProviderSettings({
           </select>
         )}
       </label>
+      <ProviderProtocolPanel
+        apiBase={apiBase}
+        providerName={item.name}
+        savedAdapter={item.adapter}
+        draftAdapter={adapter.trim()}
+        refreshKey={`${item.baseUrl}|${item.authMode ?? ""}`}
+      />
       {hasEndpointPicker ? (
         <>
           <label className="pwi-settings-field">
@@ -415,14 +488,8 @@ export default function ProviderSettings({
             onChange={e => {
               const next = e.target.value as "pool" | "direct";
               if (next === accountMode) return;
-              // Flipping modes rebinds running threads and changes quota accounting,
-              // so the PATCH only fires after an explicit confirmation.
-              if (!window.confirm(t("pws.accountModeConfirm"))) {
-                // Keep the visible choice aligned with the applied mode.
-                e.target.value = accountMode;
-                return;
-              }
-              void applyAccountMode(next);
+              // currentTarget is read here: it is null once the handler resumes after an await.
+              void requestAccountMode(next, e.currentTarget);
             }}
           >
             <option value="pool">{t("codexAuth.accountModePool")}</option>
@@ -459,6 +526,7 @@ export default function ProviderSettings({
         <input type="checkbox" checked={allowPrivateNetwork} onChange={e => setAllowPrivateNetwork(e.target.checked)} />
         <span className="pwi-settings-label">{t("pws.allowPrivateNetwork")}</span>
       </label>
+      {supportsReasoningReplay && <ResponsesReasoningReplayControl checked={preserveReasoningReplay} onChange={setPreserveReasoningReplay} />}
       <label className="pwi-settings-field" style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
         <input
           type="checkbox"
@@ -479,6 +547,7 @@ export default function ProviderSettings({
         <div className="pwi-pacing-grid">
           <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingRpm")}</span><input className="input" type="number" min="0.016667" step="any" value={pacingRpm} onChange={e => setPacingRpm(e.target.value)} placeholder="38" /></label>
           <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingDelay")}</span><input className="input" type="number" min="1" step="1" value={pacingDelay} onChange={e => setPacingDelay(e.target.value)} placeholder="1600" /></label>
+          <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingConcurrency")}</span><input className="input" type="number" min="1" step="1" value={pacingConcurrency} onChange={e => setPacingConcurrency(e.target.value)} placeholder="8" /></label>
         </div>
         <p className="pwi-settings-hint">{t("pws.pacingSlowerWins")}</p>
         <div className="pwi-pacing-status" aria-live="polite">
@@ -486,14 +555,20 @@ export default function ProviderSettings({
           <span><strong>{pacingStatus?.nextSlotInMs ?? 0} ms</strong> {t("pws.pacingNextSlot")}</span>
           <span><strong>{pacingStatus?.lastModelId ?? t("pws.pacingNone")}</strong> {t("pws.pacingLastModel")}</span>
         </div>
+        {authMode !== "oauth" && authMode !== "forward" && <ProviderKeyPacing value={keyPacing} onChange={setKeyPacing} status={pacingStatus?.keys} />}
         <h4>{t("pws.pacingModelOverrides")}</h4>
         <div className="pwi-pacing-grid pwi-pacing-grid--model">
           <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingModel")}</span><input className="input" list={`pacing-models-${item.name}`} value={pacingModelId} onChange={e => setPacingModelId(e.target.value)} /><datalist id={`pacing-models-${item.name}`}>{availableModels.map(model => <option key={model} value={model} />)}</datalist></label>
           <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingRpm")}</span><input className="input" type="number" min="0.016667" step="any" value={pacingModelRpm} onChange={e => setPacingModelRpm(e.target.value)} /></label>
           <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingDelay")}</span><input className="input" type="number" min="1" step="1" value={pacingModelDelay} onChange={e => setPacingModelDelay(e.target.value)} /></label>
+          <label className="pwi-settings-field"><span className="pwi-settings-label">{t("pws.pacingConcurrency")}</span><input className="input" type="number" min="1" step="1" value={pacingModelConcurrency} onChange={e => setPacingModelConcurrency(e.target.value)} /></label>
           <button type="button" className="btn btn-ghost btn-sm" onClick={addPacingModel}>{t("pws.pacingAdd")}</button>
         </div>
-        {Object.entries(pacingModels).length > 0 && <div className="pwi-pacing-overrides">{Object.entries(pacingModels).map(([model, rule]) => <div key={model} className="pwi-pacing-row"><code>{model}</code><span>{rule.requestsPerMinute !== undefined ? `${rule.requestsPerMinute} ${t("pws.pacingRpmUnit")}` : ""}{rule.requestsPerMinute !== undefined && rule.minIntervalMs !== undefined ? " · " : ""}{rule.minIntervalMs !== undefined ? `${rule.minIntervalMs} ms` : ""}</span><button type="button" className="btn btn-ghost btn-sm" onClick={() => setPacingModels(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== model)))} aria-label={t("pws.pacingRemoveModel", { model })}>{t("pws.pacingRemove")}</button></div>)}</div>}
+        {Object.entries(pacingModels).length > 0 && <div className="pwi-pacing-overrides">{Object.entries(pacingModels).map(([model, rule]) => <div key={model} className="pwi-pacing-row"><code>{model}</code><span>{[
+          rule.requestsPerMinute !== undefined ? `${rule.requestsPerMinute} ${t("pws.pacingRpmUnit")}` : undefined,
+          rule.minIntervalMs !== undefined ? `${rule.minIntervalMs} ms` : undefined,
+          rule.maxConcurrentRequests !== undefined ? `${rule.maxConcurrentRequests} ${t("pws.pacingCapUnit")}` : undefined,
+        ].filter(part => part !== undefined).join(" · ")}</span><button type="button" className="btn btn-ghost btn-sm" onClick={() => setPacingModels(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== model)))} aria-label={t("pws.pacingRemoveModel", { model })}>{t("pws.pacingRemove")}</button></div>)}</div>}
       </section>
       {formDirty && (
         <div className="pwi-settings-sticky-bar">

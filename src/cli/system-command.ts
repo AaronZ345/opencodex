@@ -1,5 +1,7 @@
+import { runCatalogAction } from "./catalog-command-result";
 import {
   CliUsageError,
+  desktopSwitchApplyReason,
   printData,
   rejectArgs,
   runCliAction,
@@ -13,8 +15,11 @@ import {
 
 const USAGE = `Usage:
   ocx system [status] [--json]
+  ocx system health [--json]
   ocx system settings [--auto-start <on|off>] [--stream-mode <auto|legacy-tee|eager-relay>]
-      [--desktop-authless <on|off>] [--client-compaction <on|off>] [--json]
+      [--desktop-authless <on|off>] [--client-compaction <on|off>]
+      [--show-codex-credits <on|off>] [--account-picker <on|off>] [--main-account-hard-lock <on|off>]
+      [--ultra-fast-tier <on|off>] [--fast-rows <on|off>] [--json]
   ocx system startup <health|install-service|install-shim> [--json]
   ocx system diagnostics [--json]
   ocx system sync [--json]
@@ -23,6 +28,9 @@ const USAGE = `Usage:
   ocx system codex-cli-update check [--json]
   ocx system codex-cli-update attest [--json]
   ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <absolute-path> --npm-cli <absolute-path> --node <absolute-path> [--json]
+  ocx system codex-cli-update plan [--channel latest] [--json]
+  ocx system codex-cli-update apply --plan-id <32-hex> --yes [--request-id <key>] [--json]
+  ocx system codex-cli-update status <job-id> [--json]
   ocx system update check [--channel <latest|preview>] [--json]
   ocx system update run [--channel <latest|preview>] [--restart <on|off>] --yes [--json]
   ocx system update status <job-id> [--json]
@@ -44,6 +52,46 @@ async function status(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   printData(result, wantsJson, summaryLines(result));
 }
 
+/** The management health observation is distinct from root liveness and aggregate status. */
+async function health(argv: string[], deps: RuntimeApiDeps): Promise<number> {
+  return runCatalogAction(async () => {
+    const args = [...argv], wantsJson = takeFlag(args, "--json");
+    if (args.length) throw new CliUsageError("system health accepts only --json", USAGE);
+    const raw = await runtimeRequest("/api/system/health", { method: "GET", redirect: "error" }, deps);
+    const value = recordValue(raw), ledger = recordValue(value?.spendLedger);
+    const counter = (number: unknown): number => {
+      if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 0 || number > 1_000_000) {
+        throw new Error("Invalid health counter");
+      }
+      return number;
+    };
+    if (!value || Array.isArray(raw) || !ledger || Array.isArray(value.spendLedger)
+      || value.status !== "ok" || value.service !== "opencodex"
+      || typeof value.version !== "string" || !value.version.trim()
+      || typeof value.uptime !== "number" || !Number.isFinite(value.uptime) || value.uptime < 0
+      || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0
+      || (ledger.ownership !== "held" && ledger.ownership !== "unheld")
+      || typeof ledger.initialized !== "boolean" || typeof ledger.configured !== "boolean"
+      || typeof ledger.degraded !== "boolean") throw new Error("Invalid system health response");
+    const result = {
+      status: "ok", service: "opencodex", version: value.version, uptime: value.uptime, pid: value.pid,
+      spendLedger: {
+        ownership: ledger.ownership, initialized: ledger.initialized, configured: ledger.configured,
+        degraded: ledger.degraded, persistFailures: counter(ledger.persistFailures), corruptRecords: counter(ledger.corruptRecords),
+      },
+    };
+    printData(result, wantsJson, [
+      `Management endpoint: ${result.status} (${result.service} ${result.version}, PID ${result.pid})`,
+      `Uptime: ${result.uptime} seconds`,
+      `Spend ledger: ${ledger.degraded ? "degraded" : "no degradation reported"}; ownership ${ledger.ownership}`,
+      `Ledger initialized: ${ledger.initialized}; configured: ${ledger.configured}`,
+      `Ledger persistence failures: ${result.spendLedger.persistFailures}; corrupt records: ${result.spendLedger.corruptRecords}`,
+      "This observation does not certify every subsystem healthy.",
+      ...(ledger.degraded ? ["Next: inspect the proxy diagnostics and spend-ledger configuration before relying on spend limits."] : []),
+    ]);
+  });
+}
+
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
 }
@@ -56,14 +104,6 @@ function desktopSwitchInertReason(reason: unknown): string {
   return "the stored setting is not effective in the current runtime configuration";
 }
 
-function desktopSwitchApplyReason(reason: unknown): string {
-  if (reason === "not_requested") return "no desktop switch rewrite was requested";
-  if (reason === "proxy_not_running") return "the proxy is not running";
-  if (reason === "integration_disabled") return "Codex integration is disabled";
-  if (reason === "write_lock_busy") return "the Codex config write lock is busy";
-  if (reason === "injection_refused") return "Codex config injection was refused";
-  return "the rewrite could not be completed";
-}
 
 function settingsUpdateLines(
   result: unknown,
@@ -76,8 +116,19 @@ function settingsUpdateLines(
   const lines: string[] = [];
   const appendSwitch = (key: string, label: string): boolean => {
     const state = recordValue(switches[key]);
-    if (!state || typeof state.stored !== "boolean" || typeof state.effective !== "boolean") return false;
+    if (!state || typeof state.stored !== "boolean"
+      || (typeof state.effective !== "boolean" && state.effective !== null)) return false;
     lines.push(`${label}: stored ${state.stored ? "on" : "off"}.`);
+    if (state.effective === null) {
+      // `null` is reported for both withheld cases; the apply reason is the only place
+      // that still distinguishes them, so the line has to read it rather than claim
+      // external control over an ownership the server could not determine.
+      const withheld = recordValue(switches.apply)?.reason === "ownership_undetermined"
+        ? "effective state could not be determined"
+        : "effective state is controlled by the external model provider";
+      lines.push(`${label}: ${withheld}.`);
+      return true;
+    }
     // The effective value is always stated, even when it matches. Printing it only on a
     // mismatch would make silence ambiguous — the reader could not tell "the stored value is
     // in force" from "this build does not report effective state", and that ambiguity is a
@@ -104,7 +155,14 @@ function settingsUpdateLines(
     lines.push("Codex config: ~/.codex/config.toml was rewritten.");
   } else {
     const detail = typeof apply.detail === "string" && apply.detail.length > 0 ? ` Details: ${apply.detail}` : "";
-    lines.push(`Codex config: ~/.codex/config.toml was not rewritten because ${desktopSwitchApplyReason(apply.reason)}.${detail} Run 'ocx sync' to apply the stored settings.`);
+    const retry = apply.reason === "external_provider"
+      ? ""
+      : apply.reason === "ownership_undetermined"
+      ? " Resolve the reported config.toml read error, then inspect 'ocx system settings --json'."
+      : apply.reason === "integration_disabled"
+      ? " Enable Codex integration before applying the stored settings."
+      : " Run 'ocx sync' to apply the stored settings.";
+    lines.push(`Codex config: ~/.codex/config.toml was not rewritten because ${desktopSwitchApplyReason(apply.reason)}.${detail}${retry}`);
   }
   lines.push(`Auth source: ${authSource.summary}`);
   return lines;
@@ -176,11 +234,25 @@ async function update(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   if (!yes) throw new CliUsageError("update run requires --yes", USAGE);
   rejectArgs(args, USAGE);
   const result = await runtimeRequest("/api/update/run", { method: "POST", body: JSON.stringify({ tag: channel, restart }) }, deps);
-  printData(result, wantsJson, [`Update started (${channel}).`]);
+  const job = recordValue(recordValue(result)?.job);
+  const jobId = typeof job?.id === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(job.id) ? job.id : undefined;
+  const jobStatus = ["running", "restarting", "succeeded", "failed"].find(state => state === job?.status);
+  const lines = jobId ? [
+    `Update job ${jobId}: ${jobStatus ?? "status unconfirmed"} (${channel}).`,
+    `Check progress: ocx system update status ${jobId}`,
+  ] : ["Update request returned no usable job ID. Check: ocx system update check."];
+  printData(result, wantsJson, lines);
 }
 
 export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps = {}): Promise<number> {
   const [sub = "status", ...rest] = argv;
+  if (sub === "health") return health(rest, deps);
+  if (sub === "settings") {
+    const { SYSTEM_PARITY_OPTIONS, handleSystemSettingsParity } = await import("./system-settings-parity");
+    if (rest.some(arg => SYSTEM_PARITY_OPTIONS.some(flag => arg === flag || arg.startsWith(`${flag}=`)))) {
+      return handleSystemSettingsParity(rest, deps);
+    }
+  }
   if (sub === "codex-cli-update") {
     const { handleCodexCliUpdateCommand } = await import("./codex-cli-update");
     return await handleCodexCliUpdateCommand(rest);
@@ -201,17 +273,55 @@ export async function handleSystemCommand(argv: string[], deps: RuntimeApiDeps =
       const args = [...rest]; const wantsJson = takeFlag(args, "--json"); rejectArgs(args, USAGE);
       printData(await runtimeRequest("/api/system/codex-app-server", {}, deps), wantsJson);
     } else if (sub === "codex-restart") {
-      // --yes required: this fully quits and relaunches the user's Codex desktop app as well as
-      // restarting app-servers; an agent guessing a subcommand must not interrupt that session.
+      // --yes required: this interrupts running Codex turns, and when the desktop picker predates
+      // the catalog it also quits and relaunches the app, which can discard unsaved client state.
       const args = [...rest];
       const wantsJson = takeFlag(args, "--json");
       const yes = takeFlag(args, "--yes");
-      if (!yes) throw new CliUsageError("system codex-restart requires --yes: this fully quits and relaunches the Codex desktop app and restarts its app-servers", USAGE);
+      if (!yes) throw new CliUsageError(
+        "system codex-restart requires --yes: this restarts the Codex app-servers, interrupting running turns, and when the desktop app's model picker predates the current catalog (or that cannot be determined) it fully quits and relaunches the Codex desktop app, so unsaved composer drafts, model-picker selections, and pending approval prompts may be lost",
+        USAGE,
+      );
       rejectArgs(args, USAGE);
-      printData(await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps), wantsJson, ["Codex desktop app and app-server restart requested."]);
+      const result = await runtimeRequest("/api/system/codex-restart", { method: "POST" }, deps);
+      printData(result, wantsJson, codexRestartLines(result));
     } else if (sub === "update") await update(rest, deps);
     else throw new CliUsageError(`unknown system command ${sub}`, USAGE);
   });
+}
+
+/**
+ * Operator text for a codex-restart outcome. It reports what happened to the desktop app,
+ * because whether unsaved client state survived is the one thing the operator needs to know.
+ */
+export function codexRestartLines(result: unknown): string[] {
+  const view = recordValue(result);
+  const desktop = recordValue(view?.desktopApp);
+  const reason = typeof desktop?.reason === "string" ? desktop.reason : undefined;
+  // Only a reported `stale` reading may claim the picker predated the catalog; an unreadable
+  // reading also takes the full restart, and an older proxy reports no reading at all.
+  const why = desktop?.pickerState === "stale"
+    ? "its model picker predated the current catalog"
+    : "its model picker could not be confirmed current";
+  const stopped = Array.isArray(view?.stopped) ? view.stopped.length : 0;
+  const appServers = view?.code === "stopped"
+    ? `Stopped ${stopped} Codex app-server(s); their owners start replacements.`
+    : view?.code === "partially_stopped"
+      ? "Some Codex app-servers did not exit; stop them manually if Codex stays stale."
+      : view?.code === "enumeration_unavailable"
+        ? "Could not list Codex app-servers, so none were stopped."
+        : "No Codex app-server needed stopping.";
+  if (reason === "picker_current") {
+    return [appServers, "The Codex desktop app was left running: its model picker already shows the current catalog, so unsaved drafts and pending approvals were kept."];
+  }
+  if (reason === "no_targets") return [appServers, "The Codex desktop app is not running."];
+  if (desktop?.relaunch === "started") {
+    return [appServers, `The Codex desktop app was quit and relaunched because ${why}. Unsaved composer drafts, model-picker selections, and pending approval prompts may have been lost.`];
+  }
+  if (desktop?.attempted === true) {
+    return [appServers, `The Codex desktop app restart did not complete (${reason ?? "no outcome reported"}). Unsaved composer drafts, model-picker selections, and pending approval prompts may have been lost.`];
+  }
+  return [appServers, `The Codex desktop app was not restarted (${reason ?? "no outcome reported"}).`];
 }
 
 export const SYSTEM_USAGE = USAGE;

@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createGoogleAdapter } from "../../../src/adapters/google";
+import { summarizeGoogleWireShape } from "../../../src/adapters/google-wire-shape";
 import { chatCompletionsToResponsesBody } from "../../../src/chat/inbound";
 import { bridgeToResponsesSSE, buildResponseJSON } from "../../../src/bridge";
 import { withTestTranslatorBudget } from "../../helpers/translator-budget";
 import { parseRequest } from "../../../src/responses/parser";
+import { omitEarlierCompactionImages } from "../../../src/responses/compaction-images";
 import type { AdapterEvent, OcxParsedRequest } from "../../../src/types";
 
 const provider = { adapter: "google", baseUrl: "https://generativelanguage.googleapis.com", apiKey: "key" };
@@ -32,6 +34,21 @@ const REJECTED_CLAUDE_SDK_PARAGRAPH =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 describe("google adapter — tool result images", () => {
+  test("compaction projection avoids historical inline_data but keeps a pending image on Gemini wire", async () => {
+    const parsed = parsedWith([
+      { role: "user", content: [{ type: "image", imageUrl: "data:image/png;base64,b2xk" }], timestamp: 1 },
+      { role: "assistant", phase: "final_answer", content: [{ type: "text", text: "Prior chart total is 42." }], timestamp: 2 },
+      { role: "user", content: [{ type: "image", imageUrl: "data:image/png;base64,bmV3" }], timestamp: 3 },
+    ]);
+    parsed.context.messages = omitEarlierCompactionImages(parsed.context.messages);
+    const parts = (await geminiContents(parsed)).flatMap(turn => turn.parts);
+    expect(parts.filter(part => "inline_data" in part)).toEqual([
+      { inline_data: { mime_type: "image/png", data: "bmV3" } },
+    ]);
+    expect(JSON.stringify(parts)).toContain("Prior chart total is 42.");
+    expect(JSON.stringify(parts)).toContain("reopen the original attachment");
+  });
+
   test("tool-result screenshots ride along as inline_data beside the functionResponse", async () => {
     const contents = await geminiContents(parsedWith([
       {
@@ -138,6 +155,146 @@ describe("google adapter — Chat Completions video input", () => {
       parts: [{ text: "[video: https://example.test/video.mp4]" }],
     });
     expect(JSON.stringify(contents)).not.toContain("file_data");
+  });
+
+  test("a YouTube URL reaches Gemini as a video, carrying the agentic processing mode", async () => {
+    // #3271: the mode was dropped twice on the way in — z.object() strips an
+    // undeclared key, and the adapter then flattened the URL to a text marker,
+    // so agentic video understanding could not be requested at all.
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "When do the arms pick up the gear?" },
+          {
+            type: "video_url",
+            video_url: { url: "https://www.youtube.com/watch?v=example", processing: "agentic" },
+          },
+        ],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const contents = await geminiContents(parsed);
+
+    expect(contents).toContainEqual({
+      role: "user",
+      parts: [
+        { text: "When do the arms pick up the gear?" },
+        {
+          file_data: { file_uri: "https://www.youtube.com/watch?v=example" },
+          media_processing: "AGENTIC",
+        },
+      ],
+    });
+  });
+
+  test("a Files API uri is fetchable too, and without a mode nothing is added", async () => {
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "video_url",
+          video_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc123" },
+        }],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const contents = await geminiContents(parsed);
+
+    expect(contents).toContainEqual({
+      role: "user",
+      parts: [{
+        file_data: { file_uri: "https://generativelanguage.googleapis.com/v1beta/files/abc123" },
+      }],
+    });
+    // A caller who did not ask for a mode must not gain an unknown upstream field.
+    expect(JSON.stringify(contents)).not.toContain("media_processing");
+  });
+
+  test("inline video bytes carry the mode too — it rides on the part, not the uri", async () => {
+    // `media_processing` sits beside `inline_data`/`file_data`, so a data: URL is
+    // just as eligible. Emitting it on only the fetched-uri branch silently
+    // dropped agentic mode for callers who inline their clip.
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "video_url",
+          video_url: { url: "data:video/mp4;base64,aGVsbG8=", processing: "agentic" },
+        }],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const contents = await geminiContents(parsed);
+
+    expect(contents).toContainEqual({
+      role: "user",
+      parts: [{
+        inline_data: { mime_type: "video/mp4", data: "aGVsbG8=" },
+        media_processing: "AGENTIC",
+      }],
+    });
+  });
+
+  test("the mode is sent as GenerateContent spells it, not the caller's spelling", async () => {
+    // The caller sends `processing: "agentic"` (the Interactions API spelling, and
+    // what #3271 asked for). GenerateContent reads `media_processing` with an
+    // upper-case enum; forwarding the caller's spelling verbatim would have looked
+    // like a pass-through while agentic mode never engaged.
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "video_url",
+          video_url: { url: "https://youtu.be/example", processing: "agentic" },
+        }],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const wire = JSON.stringify(await geminiContents(parsed));
+
+    expect(wire).toContain('"media_processing":"AGENTIC"');
+    expect(wire).not.toContain('"processing":"agentic"');
+  });
+
+  test("a look-alike host is not treated as fetchable", async () => {
+    // The allowlist matches the host, not a substring: `file_data` asks Gemini to
+    // dereference the URL, so a near-miss must stay a marker rather than send
+    // Google after an attacker-chosen host.
+    for (const url of [
+      "https://youtube.com.evil.test/watch?v=x",
+      "https://notyoutube.com/watch?v=x",
+      "https://generativelanguage.googleapis.com.evil.test/v1beta/files/abc",
+      // The resumable-upload endpoint, not the resource: Gemini cannot read it back.
+      "https://generativelanguage.googleapis.com/upload/v1beta/files/abc",
+      // A files path nested under something else is not the resource form either.
+      "https://generativelanguage.googleapis.com/v1beta/tunedModels/x/files/abc",
+      "http://www.youtube.com/watch?v=x",
+    ]) {
+      const responsesBody = chatCompletionsToResponsesBody({
+        model: "google-antigravity/gemini-3.7-flash",
+        messages: [{ role: "user", content: [{ type: "video_url", video_url: { url, processing: "agentic" } }] }],
+      });
+      const parsed = parseRequest(responsesBody);
+      parsed.modelId = "gemini-3.7-flash";
+
+      const contents = await geminiContents(parsed);
+
+      expect(contents).toContainEqual({ role: "user", parts: [{ text: `[video: ${url}]` }] });
+      expect(JSON.stringify(contents)).not.toContain("file_data");
+    }
   });
 });
 
@@ -713,6 +870,205 @@ describe("google adapter — Antigravity thought-text opt-in", () => {
 });
 
 
+describe("google adapter — Vertex and direct Gemini thought-text opt-in", () => {
+  const vertexBase = {
+    adapter: "google",
+    googleMode: "vertex",
+    baseUrl: "https://aiplatform.googleapis.com",
+    apiKey: "vertex-key",
+    project: "fixture-proj",
+    location: "global",
+    modelReasoningEfforts: { "gemini-4-argon": ["low", "medium", "high"] },
+  } as const;
+  const directBase = {
+    adapter: "google",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    apiKey: "direct-key",
+    modelReasoningEfforts: { "gemini-4-argon": ["low", "medium", "high"] },
+  } as const;
+
+  /** Builds a minimal parsed request for Vertex/direct Gemini thought-opt-in tests. */
+  function makeParsed(modelId: string, effort?: string, hideThinkingSummary?: boolean): OcxParsedRequest {
+    return {
+      modelId,
+      stream: false,
+      options: { ...(effort ? { reasoning: effort } : {}), ...(hideThinkingSummary ? { hideThinkingSummary } : {}) },
+      context: { messages: [{ role: "user", content: "hi" }], tools: [] },
+    } as unknown as OcxParsedRequest;
+  }
+
+  /** Extracts the compiled generationConfig.thinkingConfig from a built request. */
+  async function wireThinkingConfig(
+    providerConfig: Record<string, unknown>,
+    modelId: string,
+    effort?: string,
+    hideThinkingSummary?: boolean,
+  ): Promise<Record<string, unknown> | undefined> {
+    const { body } = await createGoogleAdapter(providerConfig as never)
+      .buildRequest(makeParsed(modelId, effort, hideThinkingSummary));
+    const parsedBody = JSON.parse(body) as {
+      generationConfig?: { thinkingConfig?: Record<string, unknown> };
+    };
+    return parsedBody.generationConfig?.thinkingConfig;
+  }
+
+  test("opts Vertex and direct Gemini into includeThoughts when showThinkingSummary is true", async () => {
+    const vertexOptIn = { ...vertexBase, showThinkingSummary: true };
+    const directOptIn = { ...directBase, showThinkingSummary: true };
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-4-argon", "high"))
+      .toEqual({ thinkingLevel: "high", includeThoughts: true });
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-4-argon"))
+      .toEqual({ includeThoughts: true });
+    expect(await wireThinkingConfig(directOptIn, "gemini-4-argon", "medium"))
+      .toEqual({ thinkingLevel: "medium", includeThoughts: true });
+    expect(await wireThinkingConfig(directOptIn, "gemini-3.5-flash"))
+      .toEqual({ includeThoughts: true });
+  });
+
+  test("omits includeThoughts when showThinkingSummary is absent, false, or client-suppressed", async () => {
+    const vertexOptIn = { ...vertexBase, showThinkingSummary: true };
+    expect(await wireThinkingConfig(vertexBase, "gemini-4-argon", "high"))
+      .toEqual({ thinkingLevel: "high" });
+    expect(await wireThinkingConfig({ ...vertexBase, showThinkingSummary: false }, "gemini-4-argon", "high"))
+      .toEqual({ thinkingLevel: "high" });
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-4-argon", "high", true))
+      .toEqual({ thinkingLevel: "high" });
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-4-argon", undefined, true))
+      .toBeUndefined();
+  });
+
+  test("excludes unladdered Vertex models and image-capable models from includeThoughts", async () => {
+    const vertexOptIn = { ...vertexBase, showThinkingSummary: true };
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-2.5-flash", "high")).toBeUndefined();
+    expect(await wireThinkingConfig(vertexOptIn, "gemini-3.1-flash-image", "high")).toBeUndefined();
+    expect(await wireThinkingConfig({ ...vertexOptIn, noReasoningModels: ["gemini-4-argon"] }, "gemini-4-argon", "high")).toBeUndefined();
+    expect(await wireThinkingConfig({ ...directBase, showThinkingSummary: true, noReasoningModels: ["gemini-3.5-flash"] }, "gemini-3.5-flash", "high")).toBeUndefined();
+  });
+
+  test("emits thinking_delta for Vertex and direct Gemini only when showThinkingSummary is true", async () => {
+    const payload = {
+      candidates: [{
+        content: { parts: [{ thought: true, text: "vertex summary" }, { text: "answer" }] },
+        finishReason: "STOP",
+      }],
+    };
+
+    /** Reads the first adapter event from either a streaming SSE or buffered JSON response. */
+    async function extractFirstEvent(
+      adapter: ReturnType<typeof createGoogleAdapter>,
+      stream: boolean,
+    ): Promise<AdapterEvent | undefined> {
+      if (stream) {
+        for await (const event of adapter.parseStream(
+          new Response(`data: ${JSON.stringify(payload)}
+
+`, {
+            headers: { "content-type": "text/event-stream" },
+          }),
+        )) {
+          return event;
+        }
+        return undefined;
+      }
+      const events = await adapter.parseResponse!(Response.json(payload));
+      return events[0];
+    }
+
+    for (const stream of [false, true]) {
+      const optedInVertexAdapter = withTestTranslatorBudget(
+        createGoogleAdapter({ ...vertexBase, showThinkingSummary: true } as never),
+      );
+      await optedInVertexAdapter.buildRequest(makeParsed("gemini-4-argon", "high"));
+      expect(await extractFirstEvent(optedInVertexAdapter, stream)).toEqual({
+        type: "thinking_delta",
+        thinking: "vertex summary",
+      });
+
+      const optedInDirectAdapter = withTestTranslatorBudget(
+        createGoogleAdapter({ ...directBase, showThinkingSummary: true } as never),
+      );
+      await optedInDirectAdapter.buildRequest(makeParsed("gemini-3.5-flash", "high"));
+      expect(await extractFirstEvent(optedInDirectAdapter, stream)).toEqual({
+        type: "thinking_delta",
+        thinking: "vertex summary",
+      });
+
+      const defaultAdapter = withTestTranslatorBudget(createGoogleAdapter(vertexBase as never));
+      await defaultAdapter.buildRequest(makeParsed("gemini-4-argon", "high"));
+      expect(await extractFirstEvent(defaultAdapter, stream)).toEqual({
+        type: "reasoning_raw_delta",
+        text: "vertex summary",
+      });
+
+      const unladderedAdapter = withTestTranslatorBudget(
+        createGoogleAdapter({ ...vertexBase, showThinkingSummary: true } as never),
+      );
+      await unladderedAdapter.buildRequest(makeParsed("gemini-2.5-flash", "high"));
+      expect(await extractFirstEvent(unladderedAdapter, stream)).toEqual({
+        type: "reasoning_raw_delta",
+        text: "vertex summary",
+      });
+    }
+  });
+
+  test("reused adapter resets summary provenance across eligible and ineligible Vertex and direct Gemini models", async () => {
+    const payload = {
+      candidates: [{
+        content: { parts: [{ thought: true, text: "thought text" }, { text: "answer" }] },
+        finishReason: "STOP",
+      }],
+    };
+
+    /** Reads the first adapter event from either a streaming SSE or buffered JSON response. */
+    async function extractFirstEvent(
+      adapter: ReturnType<typeof createGoogleAdapter>,
+      stream: boolean,
+    ): Promise<AdapterEvent | undefined> {
+      if (stream) {
+        for await (const event of adapter.parseStream(
+          new Response(`data: ${JSON.stringify(payload)}
+
+`, {
+            headers: { "content-type": "text/event-stream" },
+          }),
+        )) {
+          return event;
+        }
+        return undefined;
+      }
+      const events = await adapter.parseResponse!(Response.json(payload));
+      return events[0];
+    }
+
+    for (const stream of [false, true]) {
+      const vertexAdapter = withTestTranslatorBudget(
+        createGoogleAdapter({ ...vertexBase, showThinkingSummary: true } as never),
+      );
+      for (const [modelId, expected] of [
+        ["gemini-4-argon", { type: "thinking_delta", thinking: "thought text" }],
+        ["gemini-2.5-flash", { type: "reasoning_raw_delta", text: "thought text" }],
+        ["gemini-4-argon", { type: "thinking_delta", thinking: "thought text" }],
+        ["gemini-3.1-flash-image", { type: "reasoning_raw_delta", text: "thought text" }],
+      ] as const) {
+        await vertexAdapter.buildRequest(makeParsed(modelId, "high"));
+        expect(await extractFirstEvent(vertexAdapter, stream)).toEqual(expected);
+      }
+
+      const directAdapter = withTestTranslatorBudget(
+        createGoogleAdapter({ ...directBase, showThinkingSummary: true } as never),
+      );
+      for (const [modelId, expected] of [
+        ["gemini-3.5-flash", { type: "thinking_delta", thinking: "thought text" }],
+        ["gemini-3.1-flash-image", { type: "reasoning_raw_delta", text: "thought text" }],
+        ["gemini-3.5-flash", { type: "thinking_delta", thinking: "thought text" }],
+      ] as const) {
+        await directAdapter.buildRequest(makeParsed(modelId, "high"));
+        expect(await extractFirstEvent(directAdapter, stream)).toEqual(expected);
+      }
+    }
+  });
+});
+
 describe("CCA thought summary provenance and replay", () => {
   const cca = { adapter: "google", googleMode: "cloud-code-assist", baseUrl: "https://daily-cloudcode-pa.googleapis.com",
     apiKey: "fixture-key", project: "fixture-project", showThinkingSummary: true } as const;
@@ -772,5 +1128,34 @@ describe("CCA thought summary provenance and replay", () => {
         ? { type: "thinking_delta", thinking: "thinking" }
         : { type: "reasoning_raw_delta", text: "thinking" });
     }
+  });
+});
+
+describe("google adapter — opening functionCall turn (issue #5008)", () => {
+  // Context compaction can truncate a long history so it opens on an assistant tool call, which
+  // compiles to a model functionCall at contents[0]. Antigravity rejects that with a 400:
+  // "function call turn comes immediately after a user turn or after a function response turn"
+  // (wire-shape class call-turn-opens-request, captured on a real failing session).
+  const truncatedHeadMessages = [
+    { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { cmd: "ls" } }] },
+    { role: "toolResult", toolCallId: "call_1", toolName: "bash", content: "ok", isError: false },
+    { role: "user", content: "next step" },
+  ];
+
+  test("a functionCall-opening request gets a user turn before the first model turn", async () => {
+    const contents = await geminiContents(parsedWith(truncatedHeadMessages));
+
+    expect(contents[0].role).toBe("user");
+    expect(contents[1].role).toBe("model");
+    expect(contents[1].parts.some(p => "functionCall" in p)).toBe(true);
+    expect(contents[2].parts.some(p => "functionResponse" in p)).toBe(true);
+  });
+
+  test("the repaired head reports no call-turn-opens-request ordering violation", async () => {
+    const { body } = await createGoogleAdapter(provider).buildRequest(parsedWith(truncatedHeadMessages));
+    const shape = summarizeGoogleWireShape(JSON.parse(body));
+
+    expect(shape.firstOrderingViolation).toBeNull();
+    expect(shape.orderingViolations).toBe(0);
   });
 });

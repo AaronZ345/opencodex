@@ -3,6 +3,8 @@ title: Remote Workspace
 description: Keep Codex, Claude Code, Pi, and their logins on one OCX Hub while OCX-only computers provide the workspace and build environment.
 ---
 
+For SSH machine links, see [Remote Link](/guides/remote-link/).
+
 Remote Workspace lets one OpenCodex Hub run your coding agents while another computer supplies the
 project files, commands, tests, and build compute. A phone or third computer can control the session
 through the Hub dashboard.
@@ -24,6 +26,16 @@ helpers reject probe and command requests. Windows commands remain unsupported u
 lifecycle owner can retain cleanup authority through cancellation. Missing command support never
 falls back to executing on the Hub.
 :::
+
+## RPC compatibility and timeouts
+
+Remote Workspace uses encrypted RPC v2. The Hub and every Executor must support v2; RPC v1 peers
+fail closed instead of falling back to immediate execution, so upgrade the Hub and Executors
+together.
+
+A timeout requests executor cancellation but does not confirm it. A grant may already be in transit,
+or its operation may already be running. The default RPC timeout is 65 seconds, and `timeoutMs`
+accepts inclusive values from 1 through 120,000 milliseconds.
 
 ## Set up the Hub
 
@@ -49,12 +61,45 @@ configuration still sets legacy `sandbox_mode` or `sandbox_workspace_write`, the
 Codex as unavailable instead of starting with a weaker boundary. Migrate that Codex profile before
 using the feature; do not configure both the legacy sandbox and a permission profile.
 
+## Inspect the Hub without starting a session
+
+```bash
+ocx remote-workspace hub --help
+ocx remote-workspace hub status --json
+ocx remote-workspace hub runtimes --json
+ocx remote-workspace hub sessions --json
+```
+
+These use the selected running management Hub. Existing `remote-workspace status`
+continues to read local Executor state. Status returns
+`{available:true,devices,runtimes,sessions}`; runtimes returns
+`{runtimes:{codex:{available,...},claude:{available,...},pi:{available,...}}}`;
+sessions returns `{sessions:[...]}`. Runtime availability is an object, not an
+array, and checking it may probe executable availability. Device roots expose IDs
+and labels, not Executor filesystem paths. Sessions include public recent events;
+human terminal output escapes control characters.
+
+An available Hub with empty device/session lists exits 0. When Hub activation is
+off, the outer dispatcher can return HTTP 200 with `available:false`, empty devices
+and sessions, and `runtimes:{}`. The CLI emits that narrow unavailable observation
+with a fixed Hub/activation instruction and exits 1. It does not present unavailable
+as empty success. An inner non-Hub HTTP 409 returns exit 5 with stderr guidance;
+client-role, transport and malformed replies also remain failures.
+
+Check the intended Hub and its `OCX_REMOTE_WORKSPACE_ENABLED=1` activation when
+unavailable; do not silently change configuration as recovery. These observations
+do not authorize or perform pairing, session creation, prompts, revocation or
+trust changes. Those remain the separate dashboard/session workflows below.
+
 ## Pair an Executor
 
-1. Open **Remote Workspace** in the Hub dashboard.
-2. Select **Create pairing code**.
-3. On Computer 2, change into the project directory you want to expose.
-4. Copy the generated **Linux / macOS terminal** or **Windows PowerShell** command for that computer.
+1. Pair the browser with the Hub through the dashboard pairing panel. Run the displayed
+   `ocx gui pair --origin` command on the Hub and enter its one-time code; an automatically
+   bootstrapped local or Tailscale session may view status but cannot control Remote Workspace.
+2. Open **Remote Workspace** in that paired Hub dashboard.
+3. Select **Create pairing code**.
+4. On Computer 2, change into the project directory you want to expose.
+5. Copy the generated **Linux / macOS terminal** or **Windows PowerShell** command for that computer.
    It pairs the current directory and keeps
    `ocx remote-workspace agent` connected in that terminal.
 
@@ -122,9 +167,34 @@ to another computer or folder silently. If the Executor disconnects, the session
 
 Prompt submission acknowledges acceptance immediately; the dashboard polls the session for progress and completion. If the acknowledgement is lost, the draft remains visible with an unknown-submission notice. Check session progress before sending it again; the dashboard never retries a prompt automatically.
 
+If the Pi process exits or its extension fails while a turn is starting, the session reports the failure even if Pi has not acknowledged that turn yet.
+
 **Stop** remains available while a prompt is running. It interrupts the Hub coding-agent turn,
 cancels an active Executor command, and prevents a late response from reopening the stopped
 session.
+
+## Work with sessions side by side
+
+The session list on the left opens a session in the focused pane. Drag a session to the left,
+right, top, or bottom edge of another pane to split the conversation area. You can show up to
+four different sessions at once. An already visible session moves between panes instead of
+opening a duplicate composer.
+
+Use **Split right** or **Split below** next to a session for the keyboard-accessible alternative.
+Drag a divider to resize the panes, or focus the divider and use its arrow keys. **Home** and
+**End** set the divider to its minimum and maximum size. Each session
+keeps its own draft, submission state, and Stop action, so a pending turn in one pane does not
+block a different session. **Close pane** changes the layout only; it does not stop the session.
+
+The pane layout is restored for this Hub in the same browser. Only session identifiers and pane
+positions and divider sizes are saved; draft text and model output are not written to browser storage. Reloading
+the page clears unsent drafts. On screens up to 760px wide, panes stack vertically without
+resize dividers; the saved split positions and sizes return when the screen is wider.
+
+This view is shared by the browser dashboard and the OpenCodex desktop dashboard. CLI users
+can open the dashboard with `ocx gui` and select **Remote Workspace** after its normal Hub setup.
+It does not change the terminal interface of `codex` or the conversation layout inside the
+separate official ChatGPT/Codex desktop app.
 
 ## Restart and reconnect behavior
 

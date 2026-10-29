@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   ClientPathError,
   EXPORT_CLIENTS,
@@ -40,7 +41,7 @@ describe("Prime Agent client config", () => {
   test("shares Pi's model contract without opting Prime into session headers", () => {
     const prime = buildClientConfig("prime", context()) as PiGeneratedConfig;
     const pi = buildClientConfig("pi", context()) as PiGeneratedConfig;
-    expect(pi.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ sendSessionAffinityHeaders: true });
+    expect(pi.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ sendSessionAffinityHeaders: true, supportsDeveloperRole: false });
     delete pi.providers[OPENCODE_PROVIDER_ID]!.compat;
     expect(prime).toEqual(pi);
     expect(buildClientContribution("prime", context()).fragments[0]!.value)
@@ -77,7 +78,7 @@ describe("Prime Agent client config", () => {
   test("resolves the agent-dir override and the documented destination", () => {
     expect(primeAgentDir({}, "/home/u")).toBe(join("/home/u", ".prime", "agent"));
     expect(primeConfigPath({}, "/home/u")).toBe(join("/home/u", ".prime", "agent", "models.json"));
-    expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: "/elsewhere" }, "/home/u")).toBe(join("/elsewhere", "models.json"));
+    expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: join(tmpdir(), "elsewhere") }, "/home/u")).toBe(join(join(tmpdir(), "elsewhere"), "models.json"));
     expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: "~/alt" }, "/home/u")).toBe(join("/home/u", "alt", "models.json"));
     // A relative override would name different files for the proxy and the
     // agent, which have different working directories.
@@ -87,7 +88,7 @@ describe("Prime Agent client config", () => {
   test("detects installation by the agent directory the override names", () => {
     const spec = INTEGRATION_CLIENTS.prime;
     expect(spec.detectDir({}, "/home/u")).toBe(join("/home/u", ".prime", "agent"));
-    expect(spec.detectDir({ PRIME_AGENT_CODING_AGENT_DIR: "/elsewhere" } as NodeJS.ProcessEnv, "/home/u")).toBe("/elsewhere");
+    expect(spec.detectDir({ PRIME_AGENT_CODING_AGENT_DIR: join(tmpdir(), "elsewhere") } as NodeJS.ProcessEnv, "/home/u")).toBe(join(tmpdir(), "elsewhere"));
   });
 
   test("ships as a loopback-only integration with no env var to export", () => {

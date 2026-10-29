@@ -9,7 +9,6 @@ import {
   OPENCODE_API_KEY_ENV,
   OPENCODE_API_KEY_ENV_REF,
   LOOPBACK_API_KEY_PLACEHOLDER,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildClientConfig,
   buildClientContribution,
   buildClientConfigText,
@@ -26,6 +25,7 @@ import {
 import { buildOpencodeProviderBlockFromCatalog, opencodeCatalogFromProxyRows, opencodeGlobalConfigPath } from "../../src/cli/opencode";
 import { exportModelsFromProxyRows } from "../../src/cli/export-command";
 import type { OcxConfig } from "../../src/types";
+import { configSchema } from "../../src/config/schema/config-schema";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import * as facade from "../../src/clients/config-export";
 import { OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG as leafDefaultConfig } from "../../src/clients/config-export/constants";
@@ -65,15 +65,15 @@ function cfg(extra?: Partial<OcxConfig>): OcxConfig {
 }
 
 /**
- * Captured from `buildOpencodeProviderBlockFromCatalog` BEFORE the serializer moved to
+ * Based on `buildOpencodeProviderBlockFromCatalog` before the serializer moved to
  * src/clients/config-export.ts, for the fixture above at port 10100 / 127.0.0.1. Inlined
  * rather than read from a file so the assertion survives without scratch state.
  *
- * The relocated builder must reproduce this byte-for-byte; the client-config path adds a
+ * Updated for authoritative output limits (#5828). The builder reproduces this; the client-config path adds a
  * dedupe+sort precondition, so it is compared entry-by-entry against the same truth.
  */
 const GOLDEN_OPENCODE_BLOCK = JSON.parse(
-  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":32000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":32000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
+  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":128000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":128000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
 ) as {
   npm: string;
   name: string;
@@ -141,7 +141,7 @@ describe("split config-export public facade", () => {
 
 
 describe("relocated OpenCode serializer (accept criterion 1)", () => {
-  test("the moved builder reproduces the pre-refactor golden byte-for-byte", () => {
+  test("the builder reproduces the updated golden byte-for-byte", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, FIXTURE, "127.0.0.1");
     expect(JSON.stringify(block)).toBe(JSON.stringify(GOLDEN_OPENCODE_BLOCK));
   });
@@ -215,21 +215,17 @@ describe("relocated OpenCode serializer (accept criterion 1)", () => {
 });
 
 /**
- * Reasoning efforts reach opencode as model variants, and only through the V2 `providers`
- * block: a `variants` array under the legacy `provider` block is parsed and then ignored
- * (verified against opencode 0.0.0-beta-18684), which is why both blocks are emitted.
+ * Each generation receives the effort dialect it actually consumes: V1 maps and V2 arrays.
  */
 describe("OpenCode V2 block (reasoning-effort variants)", () => {
   const LADDER_ROWS: ExportModel[] = [
     // Deliberately out of canonical order, with a duplicate and an unknown value.
     { namespaced: "opencode-go/glm-5.3", provider: "opencode-go", id: "glm-5.3", reasoningEfforts: ["max", "low", "high", "low", "turbo"], contextWindow: 1_000_000 },
-    // `none` is a declared sentinel, but the chat ingress has no such wire effort, so it is
-    // dropped: offering it would be a selection that silently falls back to the proxy default.
-    // `minimal` is a real wire effort and stays.
+    // Both none and minimal reach the proxy as explicit controls.
     { namespaced: "opencode-go/deepseek-v4-flash", provider: "opencode-go", id: "deepseek-v4-flash", reasoningEfforts: ["high", "minimal", "none"], contextWindow: 1_000_000 },
     { namespaced: "opencode-go/no-ladder", provider: "opencode-go", id: "no-ladder", contextWindow: 1_000_000 },
     { namespaced: "opencode-go/empty-ladder", provider: "opencode-go", id: "empty-ladder", reasoningEfforts: [], contextWindow: 1_000_000 },
-    // A ladder made only of the dropped sentinel leaves nothing selectable.
+    // A none-only ladder permits disabling reasoning, not a fabricated positive rung.
     { namespaced: "opencode-go/none-only", provider: "opencode-go", id: "none-only", reasoningEfforts: ["none"], contextWindow: 1_000_000 },
   ];
 
@@ -246,33 +242,33 @@ describe("OpenCode V2 block (reasoning-effort variants)", () => {
       { id: "max", settings: { reasoningEffort: "max" } },
     ]);
     expect(models["opencode-go/deepseek-v4-flash"]!.variants).toEqual([
+      { id: "none", settings: { reasoningEffort: "none" } },
       { id: "minimal", settings: { reasoningEffort: "minimal" } },
       { id: "high", settings: { reasoningEffort: "high" } },
     ]);
   });
 
-  test("`none` is never offered: it has no wire effort and would silently no-op", () => {
+  test("declared `none` remains a selectable explicit off control", () => {
     const models = (buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig)
       .providers.opencodex!.models;
     const ids = models["opencode-go/deepseek-v4-flash"]!.variants!.map(variant => variant.id);
-    expect(ids).not.toContain("none");
-    // A ladder consisting only of `none` leaves nothing selectable at all.
-    expect(models["opencode-go/none-only"]!.variants).toBeUndefined();
+    expect(ids).toContain("none");
+    expect(models["opencode-go/none-only"]!.variants).toEqual([{ id: "none", settings: { reasoningEffort: "none" } }]);
   });
 
-  test("a model without a usable ladder carries no variants key at all", () => {
+  test("a model without a usable ladder suppresses automatically invented variants", () => {
     const models = (buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig)
       .providers.opencodex!.models;
-    expect(models["opencode-go/no-ladder"]!.variants).toBeUndefined();
-    expect(models["opencode-go/empty-ladder"]!.variants).toBeUndefined();
+    expect(models["opencode-go/no-ladder"]!.variants).toEqual([]);
+    expect(models["opencode-go/empty-ladder"]!.variants).toEqual([]);
   });
 
-  test("the legacy block stays variant-free instead of carrying fields opencode ignores", () => {
+  test("the legacy block receives an options map instead of native settings arrays", () => {
     const config = buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig;
-    for (const entry of Object.values(config.provider.opencodex!.models)) {
-      expect(entry).not.toHaveProperty("variants");
-      expect(entry).not.toHaveProperty("settings");
-    }
+    expect(config.provider.opencodex!.models["opencode-go/glm-5.3"]!.variants).toEqual({
+      low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" }, max: { reasoningEffort: "max" },
+    });
+    for (const entry of Object.values(config.provider.opencodex!.models)) expect(entry).not.toHaveProperty("settings");
   });
 
   test("both blocks describe the same model set and the same connection", () => {
@@ -283,7 +279,7 @@ describe("OpenCode V2 block (reasoning-effort variants)", () => {
     expect(v2.settings).toEqual(v1.options);
     // opencode V2 merges both blocks by provider and model id, so the same ids must not
     // produce duplicate picker entries.
-    expect(v2.package).toBe("@opencode-ai/ai/providers/openai-compatible");
+    expect(v2.package).toBe("@opencode/ai/providers/openai-compatible");
     for (const [key, entry] of Object.entries(v2.models)) {
       expect(entry.name).toBe(v1.models[key]!.name);
       expect(entry.limit).toEqual(v1.models[key]!.limit);
@@ -318,6 +314,17 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(provider.apiKey).toBe(LOOPBACK_API_KEY_PLACEHOLDER);
     expect(provider.compat?.sendSessionAffinityHeaders).toBe(true);
     expect(buildClientContribution("pi", ctx()).fragments[0]!.value).toEqual(provider);
+  });
+
+  test("tells Pi to send system instead of developer, on export and contribution alike (#5664)", () => {
+    // Pi sends `developer` for reasoning models; the native Chat route forwards roles verbatim,
+    // and upstreams such as DashScope compatible-mode reject that role with a 400.
+    expect(piConfig().providers.opencodex!.compat).toEqual({
+      sendSessionAffinityHeaders: true,
+      supportsDeveloperRole: false,
+    });
+    expect(buildClientContribution("pi", ctx()).fragments[0]!.value)
+      .toHaveProperty("compat.supportsDeveloperRole", false);
   });
 
   test("cost is omitted on every entry — zeros would assert routed models are free", () => {
@@ -386,11 +393,11 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(entry).toEqual({ id: "custom/no-context", name: "no-context (custom)", input: ["text"] });
   });
 
-  test("maxTokens uses the schema budget and clamps to a smaller context window", () => {
+  test("maxTokens uses the known output limit and clamps to a smaller context window", () => {
     const models = piConfig().providers.opencodex!.models;
     const large = models.find(model => model.id === "gpt-5.6-luna")!;
     expect(large.contextWindow).toBe(272_000);
-    expect(large.maxTokens).toBe(SCHEMA_REQUIRED_OUTPUT_BUDGET);
+    expect(large.maxTokens).toBe(128_000);
     const small = models.find(model => model.id === "tiny/small-ctx")!;
     expect(small.contextWindow).toBe(8_000);
     expect(small.maxTokens).toBe(8_000);
@@ -538,7 +545,14 @@ describe("DSH rc.6 serializer", () => {
     expect(models.find(model => model.id === "a/context")?.contextWindow).toBe(128_000);
     expect(models.find(model => model.id === "a/fraction")).not.toHaveProperty("contextWindow");
     expect(models.find(model => model.id === "a/zero")).not.toHaveProperty("contextWindow");
+    // DSH reads maxTokens as the real output ceiling and falls back to 32768 without it,
+    // so a known limit must ride along with the context window (see #5828 for the same
+    // failure in the other exporters). No context window means no limit claim either.
     for (const model of models) expect(model).not.toHaveProperty("maxTokens");
+    const withLimit = dshConfig(ctx({
+      models: [{ namespaced: "a/limit", provider: "a", id: "limit", contextWindow: 200_000, maxTokens: 128_000 }],
+    }))["llm-pi-ai"].providers.opencodex!.models;
+    expect(withLimit[0]!.maxTokens).toBe(128_000);
   });
 
   test("maps only authoritative effort levels to DSH level-to-wire entries", () => {
@@ -661,7 +675,7 @@ describe("stable ordering (accept criterion 4)", () => {
 describe("hub-resolved Fast exports", () => {
   const eligible: ExportModel = {
     namespaced: "remote/model", provider: "remote", id: "model", displayName: "Remote Model",
-    fastRowAvailable: true, contextWindow: 8192, inputModalities: ["text", "image"],
+    fastRowAvailable: true, contextWindow: 8192, inputModalities: ["text", "image"], supportsTools: true,
     reasoningEfforts: ["none", "high", "ultra"], defaultReasoningEffort: "high",
   };
 
@@ -749,7 +763,7 @@ describe("hub-resolved Fast exports", () => {
     for (const block of [blocks.v1, blocks.v2]) {
       expect(Object.keys(block.models)).toEqual(["z/sparse", "remote/model", "remote/model--fast", "z/sparse--fast"]);
       expect(block.models["remote/model--fast"]!.name).toBe("Exact row (remote)");
-      expect(block.models["z/sparse--fast"]).toEqual({ name: "z/sparse Fast (routed)" });
+      expect(block.models["z/sparse--fast"]!.name).toBe("z/sparse Fast (routed)");
     }
     const expanded = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
     // A Fast row is a second selector for the same model, so it inherits the capabilities the
@@ -758,11 +772,18 @@ describe("hub-resolved Fast exports", () => {
     expect(expanded.v1.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
       attachment: true, modalities: { input: ["text", "image"], output: ["text"] },
+      reasoning: true, interleaved: { field: "reasoning_content" },
+      options: { reasoningEffort: "high" },
+      tool_call: true,
+      variants: { none: { reasoningEffort: "none" }, high: { reasoningEffort: "high" }, ultra: { reasoningEffort: "ultra" } },
     });
     expect(expanded.v2.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
-      attachment: true, modalities: { input: ["text", "image"], output: ["text"] },
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+      compatibility: { reasoningField: "reasoning_content" },
+      settings: { reasoningEffort: "high" },
       variants: [
+        { id: "none", settings: { reasoningEffort: "none" } },
         { id: "high", settings: { reasoningEffort: "high" } },
         { id: "ultra", settings: { reasoningEffort: "ultra" } },
       ],
@@ -774,10 +795,49 @@ describe("hub-resolved Fast exports", () => {
     expect(remote.v2.settings).toEqual(remote.v1.options);
   });
 
+  test("opencodeClientExport timeouts are omitted by default and emitted into both blocks when set", () => {
+    const off = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
+    for (const conn of [off.v1.options, off.v2.settings]) {
+      expect(conn).not.toHaveProperty("headerTimeout");
+      expect(conn).not.toHaveProperty("chunkTimeout");
+      expect(conn).not.toHaveProperty("timeout");
+    }
+    const full = opencodeProviderBlocks(BASE_URL, [eligible], cfg({
+      fastRows: false,
+      opencodeClientExport: { headerTimeoutMs: false, chunkTimeoutMs: 1_800_000, timeoutMs: 3_600_000 },
+    } as Partial<OcxConfig>));
+    const expected = { baseURL: BASE_URL, apiKey: OPENCODE_API_KEY_ENV_REF, headerTimeout: false, chunkTimeout: 1_800_000, timeout: 3_600_000 };
+    expect(full.v1.options).toEqual(expected);
+    expect(full.v2.settings).toEqual(expected);
+
+    // A partial block emits only the fields the operator set.
+    const partial = opencodeProviderBlocks(BASE_URL, [eligible], cfg({
+      fastRows: false,
+      opencodeClientExport: { headerTimeoutMs: false },
+    } as Partial<OcxConfig>));
+    expect(partial.v1.options).toEqual({ baseURL: BASE_URL, apiKey: OPENCODE_API_KEY_ENV_REF, headerTimeout: false });
+    expect(partial.v2.settings).toEqual(partial.v1.options);
+  });
+
+  test("configSchema keeps valid opencodeClientExport timeouts and degrades malformed per-field values", () => {
+    const base = { port: 10100, defaultProvider: "mock", providers: { mock: { adapter: "openai-chat", baseUrl: "https://api.example.com/v1" } } };
+    const valid = configSchema.parse({ ...base, opencodeClientExport: { headerTimeoutMs: false, chunkTimeoutMs: 1_800_000, timeoutMs: 3_600_000 } });
+    expect(valid.opencodeClientExport).toEqual({ headerTimeoutMs: false, chunkTimeoutMs: 1_800_000, timeoutMs: 3_600_000 });
+
+    // A malformed per-field value is dropped (opencode keeps its native wait) without failing the
+    // whole parse or taking the sibling fields down with it.
+    const salvaged = configSchema.parse({ ...base, opencodeClientExport: { headerTimeoutMs: "nope", chunkTimeoutMs: -5, timeoutMs: 600_000 } });
+    expect(salvaged.opencodeClientExport).toEqual({ timeoutMs: 600_000 });
+
+    // An entirely malformed block degrades to undefined rather than rejecting the config.
+    const dropped = configSchema.parse({ ...base, opencodeClientExport: 42 });
+    expect(dropped.opencodeClientExport).toBeUndefined();
+  });
+
   test("each generation owns its modalities map, so an edit to one cannot move the other", () => {
     const blocks = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
     blocks.v1.models["remote/model"]!.modalities!.input.push("audio");
-    expect(blocks.v2.models["remote/model"]!.modalities!.input).toEqual(["text", "image"]);
+    expect(blocks.v2.models["remote/model"]!.capabilities!.input).toEqual(["text", "image"]);
   });
 
   test("both CLI projections retain hub true/false/absence despite conflicting local settings", () => {
@@ -832,13 +892,13 @@ describe("hub-resolved Fast exports", () => {
     expect(exportModelsFromProxyRows(rows, config)).toEqual([shadowed]);
     const blocks = opencodeProviderBlocks(BASE_URL, opencodeCatalogFromProxyRows(rows, config), config);
     expect(blocks.v1.models["remote/model"]!.modalities).toEqual({ input: ["text"], output: ["text"] });
-    expect(blocks.v2.models["remote/model"]!.modalities).toEqual({ input: ["text"], output: ["text"] });
+    expect(blocks.v2.models["remote/model"]!.capabilities).toEqual({ tools: true, input: ["text"], output: ["text"] });
   });
 });
 
 describe("EXPORT_CLIENTS registry", () => {
-  test("covers exactly the fourteen file-toggle clients", () => {
-    expect(EXPORT_CLIENT_IDS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside", "raycast", "omo", "cline"]);
+  test("covers exactly the twenty-four file-toggle clients", () => {
+    expect(EXPORT_CLIENT_IDS).toEqual(["qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "commandcode", "prime", "aside", "raycast", "omo", "cline", "kilo", "droid", "gentle-shell", "t3code"]);
     for (const id of EXPORT_CLIENT_IDS) expect(isExportClientId(id)).toBe(true);
     // The exception clients keep their own surfaces and are not export clients.
     expect(isExportClientId("claude-desktop")).toBe(false);
@@ -868,7 +928,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
+            "output": 128000
           }
         },
         "custom/no-context": {
@@ -878,7 +938,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "gpt-5.6-luna (native)",
           "limit": {
             "context": 272000,
-            "output": 32000
+            "output": 128000
           }
         },
         "tiny/small-ctx": {
@@ -893,7 +953,7 @@ describe("EXPORT_CLIENTS registry", () => {
   },
   "providers": {
     "opencodex": {
-      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "package": "@opencode/ai/providers/openai-compatible",
       "name": "OpenCodex",
       "settings": {
         "baseURL": "http://127.0.0.1:10100/v1",
@@ -904,25 +964,29 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
-          }
+            "output": 128000
+          },
+          "variants": []
         },
         "custom/no-context": {
-          "name": "no-context (custom)"
+          "name": "no-context (custom)",
+          "variants": []
         },
         "gpt-5.6-luna": {
           "name": "gpt-5.6-luna (native)",
           "limit": {
             "context": 272000,
-            "output": 32000
-          }
+            "output": 128000
+          },
+          "variants": []
         },
         "tiny/small-ctx": {
           "name": "small-ctx (tiny)",
           "limit": {
             "context": 8000,
             "output": 8000
-          }
+          },
+          "variants": []
         }
       }
     }
@@ -941,7 +1005,8 @@ describe("EXPORT_CLIENTS registry", () => {
       "api": "openai-completions",
       "apiKey": "opencodex-loopback",
       "compat": {
-        "sendSessionAffinityHeaders": true
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
       },
       "models": [
         {
@@ -951,7 +1016,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "custom/no-context",
@@ -967,7 +1032,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 272000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "tiny/small-ctx",
@@ -992,9 +1057,10 @@ describe("EXPORT_CLIENTS registry", () => {
       expect(typeof spec.summarize).toBe("function");
       expect(typeof spec.buildContribution).toBe("function");
       // The filename's extension must match the declared format, so a reader
-      // never has to guess which one is authoritative.
+      // never has to guess which one is authoritative. Kilo's destination is
+      // `.jsonc` while serialize stays pretty JSON (`format: "json"`).
       const extension = spec.filename.slice(spec.filename.lastIndexOf(".") + 1);
-      expect(extension).toBe(spec.format);
+      expect(extension).toBe(id === "kilo" ? "jsonc" : spec.format);
     }
   });
 
@@ -1008,6 +1074,11 @@ describe("EXPORT_CLIENTS registry", () => {
     const extensionFor = { json: "json", yaml: "yaml", toml: "toml", json5: "json5" } as const;
     for (const id of EXPORT_CLIENT_IDS) {
       const spec = EXPORT_CLIENTS[id];
+      if (id === "kilo") {
+        expect(spec.filename.endsWith(".jsonc")).toBe(true);
+        expect(spec.format).toBe("json");
+        continue;
+      }
       expect(spec.filename.endsWith(`.${extensionFor[spec.format]}`)).toBe(true);
     }
   });
@@ -1127,7 +1198,9 @@ test("renamed CommandCode gathered effort tables reach DSH and ZCode exports", a
     const context = ctx({ models, config });
     const dshConfig = dsh.buildDshClientConfig(context);
     const dshModels = Object.values(dshConfig["llm-pi-ai"].providers).flatMap(provider => provider.models);
-    expect(dshModels.find(model => model.id === `CommandCode/${known}`)?.reasoningEfforts).toEqual({ high: "high", max: "max" });
+    expect(dshModels.find(model => model.id === `CommandCode/${known}`)?.reasoningEfforts).toEqual({
+      low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+    });
     expect(dshModels.find(model => model.id === `CommandCode/${overridden}`)?.reasoningEfforts).toEqual({ low: "low" });
     expect(dshModels.find(model => model.id === "CommandCode/unknown-model")?.reasoningEfforts).toBeUndefined();
     for (const id of [known, overridden, "unknown-model"]) {
@@ -1135,7 +1208,7 @@ test("renamed CommandCode gathered effort tables reach DSH and ZCode exports", a
     }
     const zcodeModels = Object.assign({}, ...Object.values(zcode.buildZcodeClientConfig(context).provider).map(provider => provider.models)) as Record<string, zcode.ZcodeModelEntry>;
     expect(zcodeModels[`CommandCode/${known}`]).toBeDefined();
-    expect(zcodeModels[`CommandCode/${known}`]!.reasoning?.variants).toEqual(["high", "max"]);
+    expect(zcodeModels[`CommandCode/${known}`]!.reasoning?.variants).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(zcodeModels[`CommandCode/${overridden}`]).toBeDefined();
     expect(zcodeModels[`CommandCode/${overridden}`]!.reasoning?.variants).toEqual(["low"]);
     expect(zcodeModels["CommandCode/unknown-model"]).toBeDefined();
@@ -1143,5 +1216,39 @@ test("renamed CommandCode gathered effort tables reach DSH and ZCode exports", a
   } finally {
     clearModelCache();
     isolated.restore();
+  }
+});
+
+describe("authoritative client output limits (#5828)", () => {
+  for (const [provider, id, contextWindow, expected] of [
+    ["anthropic", "claude-opus-5", 200_000, 128_000],
+    ["anthropic-apikey", "claude-opus-5", 200_000, 128_000],
+    ["xai", "grok-4.20-0309-reasoning", 2_000_000, 30_000],
+    ["anthropic", "claude-opus-5", 8_000, 8_000],
+    ["custom", "unknown", 200_000, 32_000],
+    ["custom", "unknown", 8_000, 8_000],
+  ] as const) {
+    test(`${provider}/${id} with context ${contextWindow} exports ${expected}`, () => {
+      const model = { provider, id, namespaced: `${provider}/${id}`, contextWindow };
+      const context = ctx({ models: [model] });
+      const block = opencodeConfig(context).provider.opencodex!;
+      expect(block.models[model.namespaced]!.limit!.output).toBe(expected);
+      for (const client of ["pi", "omp", "gajae"] as const) {
+        const config = buildClientConfig(client, context) as PiGeneratedConfig;
+        expect(config.providers.opencodex!.models[0]!.maxTokens).toBe(expected);
+      }
+    });
+  }
+});
+
+test("explicit output metadata takes precedence and survives Fast expansion", () => {
+  for (const maxTokens of [60_000, 300_000, 0, NaN, Infinity]) {
+    const model: ExportModel = { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", contextWindow: 200_000, maxTokens, fastRowAvailable: true };
+    const expected = maxTokens > 0 && Number.isFinite(maxTokens) ? Math.min(maxTokens, 200_000) : 128_000;
+    for (const client of ["pi", "omp", "gajae"] as const) {
+      const config = buildClientConfig(client, ctx({ models: [model] })) as PiGeneratedConfig;
+      expect(config.providers.opencodex!.models).toHaveLength(2);
+      for (const entry of config.providers.opencodex!.models) expect(entry.maxTokens).toBe(expected);
+    }
   }
 });

@@ -12,12 +12,14 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as oauth from "../../../src/oauth";
 import { fetchProviderModels } from "../../../src/codex/catalog/provider-fetch";
 import { clearModelCache } from "../../../src/codex/model-cache";
+import { clearCopilotAutoModelsForTests } from "../../../src/providers/github-copilot-auto";
 import { providerConfigSeed } from "../../../src/providers/derive";
 import { getProviderRegistryEntry } from "../../../src/providers/registry";
 import { resolveWireProtocolOverride } from "../../../src/server/adapter-resolve";
 import { handleResponses } from "../../../src/server/responses/core";
 import type { OcxConfig, OcxProviderConfig } from "../../../src/types";
 import { acquireOwnedSpendHome } from "../../helpers/owned-spend-home";
+import { withStubbedProviderFetch } from "../../helpers/catalog-provider-fetch";
 
 let releaseSpendHome: (() => void) | undefined;
 
@@ -30,6 +32,8 @@ const RESPONSES_ONLY = [
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
   "grok-4.5",
   "grok-4.6",
   "mai-code-1.1-flash",
@@ -45,6 +49,10 @@ describe("Copilot discovery-only models do not widen the cold-start seed", () =>
   for (const authMode of ["key", "oauth"] as const) {
     test(`${authMode} discovery exposes new models but failure retains the configured seed`, async () => {
       const auth = spyOn(oauth, "resolveModelsAuthToken").mockResolvedValue("test-token");
+      // Refreshing OAuth discovery takes the token and its origin from one snapshot.
+      const snapshot = spyOn(oauth, "getValidAccessTokenSnapshot").mockResolvedValue({
+        provider: "github-copilot", accountId: "acct-test", generation: "gen-test", accessToken: "test-token",
+      });
       const original = globalThis.fetch;
       const provider = { ...providerConfigSeed(getProviderRegistryEntry("github-copilot")!), authMode, apiKey: "test-token" };
       try {
@@ -60,6 +68,7 @@ describe("Copilot discovery-only models do not widen the cold-start seed", () =>
       } finally {
         globalThis.fetch = original;
         auth.mockRestore();
+        snapshot.mockRestore();
         clearModelCache("github-copilot");
       }
     });
@@ -144,27 +153,42 @@ describe("the wire default survives the handleResponses replay", () => {
     // Release the preload-home lease before later teardown can replace or remove that home.
     releaseSpendHome?.();
     releaseSpendHome = undefined;
+    clearCopilotAutoModelsForTests();
     globalThis.fetch = originalFetch;
   });
 
-  function captureUpstreamUrl(): string[] {
-    const urls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      urls.push(String(input));
+  function captureUpstreamUrls(): { catalogUrls: string[]; inferenceUrls: string[] } {
+    const catalogUrls: string[] = [];
+    const inferenceUrls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      if (url === "https://api.githubcopilot.com/models") {
+        expect(method).toBe("GET");
+        catalogUrls.push(url);
+        // Named-model permission discovery precedes inference and expects JSON.
+        return Response.json({ data: [...RESPONSES_ONLY, ...CHAT_SERVED]
+          .map(id => ({ id, model_picker_enabled: true })) });
+      }
+      expect(method).toBe("POST");
+      inferenceUrls.push(url);
       return new Response("data: [DONE]\n\n", {
         status: 200,
         headers: { "content-type": "text/event-stream" },
       });
     }) as typeof fetch;
-    return urls;
+    return { catalogUrls, inferenceUrls };
   }
 
   async function drive(model: string, inboundWire?: "responses" | "chat" | "anthropic"): Promise<string> {
-    const urls = captureUpstreamUrl();
-    const config = { providers: { "github-copilot": copilotProvider() } } as unknown as OcxConfig;
+    clearCopilotAutoModelsForTests();
+    const { catalogUrls, inferenceUrls } = captureUpstreamUrls();
+    const config = withStubbedProviderFetch({
+      providers: { "github-copilot": copilotProvider() },
+    }) as unknown as OcxConfig;
     // Direct dispatch needs the writer lease that startServer normally owns for this home.
     releaseSpendHome = acquireOwnedSpendHome();
-    await handleResponses(
+    const response = await handleResponses(
       new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -176,7 +200,14 @@ describe("the wire default survives the handleResponses replay", () => {
       { model: "", provider: "" },
       inboundWire === undefined ? {} : { inboundWire },
     );
-    return urls[0] ?? "";
+    try {
+      expect(response.status).toBe(200);
+      expect(catalogUrls).toEqual(["https://api.githubcopilot.com/models"]);
+      expect(inferenceUrls).toHaveLength(1);
+      return inferenceUrls[0] ?? "";
+    } finally {
+      await response.body?.cancel();
+    }
   }
 
   test("gpt-5.4 reaches the Responses endpoint, never /chat/completions", async () => {

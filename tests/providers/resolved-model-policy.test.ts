@@ -13,6 +13,7 @@ import {
   clampObservedModelLimits,
   resolveModelPolicy,
 } from "../../src/providers/resolved-model-policy";
+import { modelRecordValue } from "../../src/reasoning-effort";
 
 const MODEL = "vendor/model-a";
 
@@ -65,6 +66,14 @@ function resolve(
 }
 
 describe("resolved static model policy parity", () => {
+  test("inline tag opt-in inherits only matching transport defaults and preserves explicit empty lists", () => {
+    const entry = registry({ inlineThinkTagModels: [MODEL] });
+    expect(resolve(provider(), entry).provider.inlineThinkTagModels).toEqual([MODEL]);
+    expect(resolve(provider({ inlineThinkTagModels: [] }), entry).provider.inlineThinkTagModels).toEqual([]);
+    expect(resolve(provider({ inlineThinkTagModels: ["other"] }), entry).provider.inlineThinkTagModels).toEqual(["other"]);
+    expect(resolve(provider(), entry, false).provider.inlineThinkTagModels).toBeUndefined();
+    expect(routedProviderConfig("fixture-provider", provider({ inlineThinkTagModels: [MODEL] })).inlineThinkTagModels).toEqual([MODEL]);
+  });
   test("representative registry maps stay byte-equivalent to the current route merge", () => {
     const entry = PROVIDER_REGISTRY.find(candidate => {
       if (candidate.allowBaseUrlOverride || /\{[^}]*\}/.test(candidate.baseUrl)) return false;
@@ -291,7 +300,7 @@ describe("resolved static model policy parity", () => {
     expect(JSON.stringify(policy)).not.toContain("usable-private-key");
   });
 
-  test("captured unresolved key authority falls back to registry OAuth", () => {
+  test("captured unresolved key authority stays explicit key mode", () => {
     const entry = PROVIDER_REGISTRY.find(candidate => (
       candidate.authKind === "oauth" && candidate.allowKeyAuthOverride === true
     ))!;
@@ -307,7 +316,7 @@ describe("resolved static model policy parity", () => {
         apiKey: reference,
       });
       const authority = routedProviderConfig(entry.id, configured);
-      expect(authority.authMode).toBe("oauth");
+      expect(authority.authMode).toBe("key");
       const policy = resolveModelPolicy({
         providerName: entry.id,
         modelId: entry.defaultModel ?? MODEL,
@@ -795,5 +804,139 @@ describe("resolved static model policy parity", () => {
     expect(Object.isFrozen(policy.model.inputModalities)).toBe(true);
     expect(JSON.stringify(policy)).not.toContain("secret-value");
     expect(JSON.stringify(policy)).not.toContain("account-like-private-id");
+  });
+
+  test("case-varied modelReasoningEffortMap override claims the registry row", () => {
+    const entry = registry({
+      modelReasoningEffortMap: { [MODEL]: { low: "registry-low", xhigh: "registry-xhigh" } },
+    });
+    const configured = provider({
+      modelReasoningEffortMap: { "VENDOR/Model-A": { xhigh: "custom" } },
+    });
+    const policy = resolve(configured, entry);
+    const map = policy.provider.modelReasoningEffortMap;
+    expect(map).not.toHaveProperty(MODEL);
+    expect(map?.["VENDOR/Model-A"]).toEqual({ low: "registry-low", xhigh: "custom" });
+    // The folded runtime lookup must resolve the operator row, not a registry-spelled shadow.
+    expect(modelRecordValue(map, MODEL)).toEqual({ low: "registry-low", xhigh: "custom" });
+  });
+
+  test("case-varied operator key reports operator provenance for the folded model id", () => {
+    const entry = registry({
+      modelContextWindows: { "claude-opus-5": 200_000 },
+    });
+    const configured = provider({
+      modelContextWindows: { "Claude-Opus-5": 150_000 },
+    });
+    const policy = resolveModelPolicy({
+      providerName: "anthropic",
+      modelId: "claude-opus-5",
+      provider: configured,
+      registryEntry: entry,
+      transportMatchedRegistry: true,
+    });
+    expect(policy.model.contextWindow).toBe(150_000);
+    expect(policy.provenance.model.contextWindow).toBe("operator");
+  });
+
+  test.each([50_000, 150_000])("case-varied API-key caps retain the lower limit for operator cap %i", (cap) => {
+    const operatorKey = "VENDOR/Model-A";
+    const entry = registry({ id: "openai-apikey" });
+    const configured = provider({
+      modelContextWindows: { [operatorKey]: cap },
+      modelMaxInputTokens: { [operatorKey]: cap - 10_000 },
+    });
+    for (const modelId of [MODEL, operatorKey, "Vendor/model-a"]) {
+      const policy = resolveModelPolicy({
+        providerName: "openai-apikey", modelId, provider: configured,
+        registryEntry: entry, transportMatchedRegistry: true,
+      });
+      expect(policy.model.contextWindow).toBe(Math.min(100_000, cap));
+      expect(policy.model.maxInputTokens).toBe(Math.min(80_000, cap - 10_000));
+      expect(policy.provider.modelContextWindows).not.toHaveProperty(MODEL);
+      expect(policy.provider.modelMaxInputTokens).not.toHaveProperty(MODEL);
+      expect(policy.provenance.model.contextWindow).toBe("operator");
+      expect(policy.provenance.model.maxInputTokens).toBe("operator");
+      expect(policy.provider.modelContextWindows?.["registry-only"]).toBe(90_000);
+    }
+    expect(configured.modelContextWindows).toEqual({ [operatorKey]: cap });
+    expect(entry.modelContextWindows?.[MODEL]).toBe(100_000);
+  });
+});
+
+describe("independent reasoning policy", () => {
+  const id = "synthetic-reasoner";
+  const entry: ProviderRegistryEntry = {
+    id: "synthetic-reasoner", label: "Synthetic reasoner", adapter: "openai-chat",
+    baseUrl: "https://synthetic.example.test/v1", authKind: "key",
+    reasoningEfforts: ["low", "medium", "high"],
+    modelCapabilities: { [id]: {
+      supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: false, defaultThinkingEnabled: true,
+    } },
+    thinkingToggleModels: [id],
+  };
+  test("registry axes fill beneath exact operator axes without synthetic strength defaults", () => {
+    const provider: OcxProviderConfig = { adapter: entry.adapter, baseUrl: entry.baseUrl,
+      modelCapabilities: { [id]: { supportsThinkingToggle: false, defaultThinkingEnabled: false } },
+      modelReasoningEfforts: { [id]: ["low", "high"] }, modelDefaultReasoningEfforts: { [id]: "high" } };
+    const policy = resolveModelPolicy({ providerName: "synthetic", modelId: id, provider, registryEntry: entry, transportMatchedRegistry: true });
+    expect(policy.model).toMatchObject({ supportsReasoning: true, supportsThinkingToggle: false,
+      supportsReasoningEffort: false, defaultThinkingEnabled: false, reasoningEfforts: [] });
+    expect(policy.model.defaultReasoningEffort).toBeUndefined();
+    expect(policy.provider.modelReasoningEfforts?.[id]).toEqual(["low", "high"]);
+    expect(policy.provenance.model.supportsThinkingToggle).toBe("operator-capability");
+    expect(policy.provenance.model.supportsReasoningEffort).toBe("registry");
+    expect(entry.modelCapabilities?.[id]?.supportsThinkingToggle).toBe(true);
+  });
+  test.each(["synthetic-reasoner", "SYNTHETIC-REASONER"])("case-varied capability overrides remain authoritative for %s", modelId => {
+    const provider: OcxProviderConfig = { adapter: entry.adapter, baseUrl: entry.baseUrl,
+      modelCapabilities: { [id.toUpperCase()]: { supportsThinkingToggle: false, defaultThinkingEnabled: false } } };
+    const policy = resolveModelPolicy({ providerName: "synthetic", modelId, provider, registryEntry: entry, transportMatchedRegistry: true });
+    expect(policy.model).toMatchObject({ supportsReasoning: true, supportsThinkingToggle: false,
+      supportsReasoningEffort: false, defaultThinkingEnabled: false });
+    expect(policy.provenance.model.supportsThinkingToggle).toBe("operator-capability");
+    expect(policy.provenance.model.supportsReasoningEffort).toBe("registry");
+    expect(Object.keys(policy.provider.modelCapabilities ?? {})).toHaveLength(1);
+    const overlay = resolveModelPolicy({ providerName: "synthetic", modelId, provider, registryEntry: entry,
+      transportMatchedRegistry: true, modelCapabilities: { defaultThinkingEnabled: true } });
+    expect(overlay.model).toMatchObject({ supportsReasoning: true, supportsThinkingToggle: false,
+      supportsReasoningEffort: false, defaultThinkingEnabled: true });
+    expect(entry.modelCapabilities?.[id]?.supportsThinkingToggle).toBe(true);
+    expect(provider.modelCapabilities?.[id.toUpperCase()]).toEqual({ supportsThinkingToggle: false, defaultThinkingEnabled: false });
+  });
+  test("case-folded capability declarations govern discovered rows without changing unknown legacy evidence", () => {
+    const provider: OcxProviderConfig = {
+      adapter: entry.adapter,
+      baseUrl: entry.baseUrl,
+      modelCapabilities: { M: { supportsReasoning: false } },
+    };
+    const discovered = {
+      provider: "synthetic",
+      id: "m",
+      supportsReasoning: true,
+      supportsThinkingToggle: true,
+      supportsReasoningEffort: true,
+      reasoningEfforts: ["low", "high"],
+    };
+    const policy = resolveModelPolicy({ providerName: "synthetic", modelId: "m", provider, registryEntry: entry, transportMatchedRegistry: true });
+    expect(policy.model).toMatchObject({ supportsReasoning: false, supportsThinkingToggle: false, supportsReasoningEffort: false });
+    expect(applyProviderConfigHints("synthetic", provider, discovered)).toMatchObject({
+      supportsReasoning: false,
+      supportsThinkingToggle: false,
+      supportsReasoningEffort: false,
+      reasoningEfforts: [],
+    });
+    expect(applyProviderConfigHints("synthetic", { adapter: entry.adapter, baseUrl: entry.baseUrl }, discovered)).toMatchObject(discovered);
+  });
+  test.each(["operator", "registry"])("%s noReasoningModels remains authoritative over every independent declaration", source => {
+    const provider: OcxProviderConfig = { adapter: entry.adapter, baseUrl: entry.baseUrl,
+      modelCapabilities: { [id]: { supportsThinkingToggle: true } },
+      ...(source === "operator" ? { noReasoningModels: [id] } : {}) };
+    const registryEntry = source === "registry" ? { ...entry, noReasoningModels: [id] } : entry;
+    const policy = resolveModelPolicy({ providerName: "synthetic", modelId: id, provider, registryEntry, transportMatchedRegistry: true });
+    expect(policy.model).toMatchObject({ supportsReasoning: false, supportsThinkingToggle: false,
+      supportsReasoningEffort: false, defaultThinkingEnabled: false, reasoningEfforts: [] });
+    expect(policy.provenance.model).toMatchObject({ supportsReasoning: source, supportsThinkingToggle: source,
+      supportsReasoningEffort: source, defaultThinkingEnabled: source });
   });
 });

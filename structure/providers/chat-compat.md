@@ -9,22 +9,76 @@ Native Codex Spark-specific request exceptions are absent. General Lite and name
 remain shared [Responses compatibility](../transports/responses.md#responses-httpsse), including
 other providers whose models happen to share a name fragment.
 
-## OpenCode Go chronological instructions
+## Chronological in-conversation instructions
 
-For the registry-recognized OpenCode Go Chat destination and exact model
-`deepseek-v4.1-flash`, `src/adapters/openai-chat.ts` keeps text-only timeline
-developer messages in place as system messages. Appending a reminder therefore
-does not hoist new text into the leading system prompt and rewrite the existing
-serialized message prefix. Pending tool results still precede deferred reminders.
-The base system prompt, vision conversion and native OpenAI developer roles retain
-their existing behavior; other Chat destinations and models retain leading-system
-folding. This is independent of the Claude trailing-notice stabilization option
-and does not guarantee upstream cache hits. Regression coverage is in
-`tests/adapters/openai/openai-chat-system-order.test.ts`.
+`src/adapters/openai-chat/messages.ts` keeps text-only timeline developer messages in their
+original slots on every Chat destination and model. A later reminder does not rewrite the
+leading system prompt or move ahead of earlier turns; pending tool results still precede
+deferred reminders. This behavior previously covered only OpenCode Go and
+`deepseek-v4.1-flash`. The base system prompt, vision conversion, native OpenAI developer
+roles, and Claude trailing-notice option are unchanged; cache hits are not guaranteed.
+Tests: `tests/adapters/openai/openai-chat-system-order.test.ts` and `tests/adapters/openai/openai-chat-developer-position.test.ts`.
+
+The role that slot carries is a separate decision, and the setting that makes it is tri-state.
+`foldDeveloperRoleToSystem` unset sends `system`, `true` sends `system`, and `false` sends
+`developer`. Unset means nothing has been recorded about the destination; `true` records an
+upstream that rejects the role; `false` records one that accepts it. The message keeps the slot it
+arrived in in every case — only the role changes, never the position. The unrecorded state is the
+folded one because a destination that rejects the role answers
+`400 role 'developer' is not allowed` and the turn never starts, a failure that lands outside this
+repository where no test can reach it. The role was previously decided by testing the base URL host
+against `api.openai.com`, so every OpenAI-compatible gateway was assumed not to support a standard
+role until proven otherwise, and the instruction silently lost `developer` precedence.
+
+The translated `Qwen3.8-27B` Chat route follows its [pinned template](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/chat_template.jinja): a late `system` raises, `developer` is unsupported, and a late `user` renders in place; the `OrcaSAQ-2-Cyber-27B` GGUF family pins the same contract and takes the same mapping.
+Flash-Next uses the same mapping for the exact `flash-next` and `Qwen3.8-Flash-Next` ids (the failure is reported in [#6242](https://github.com/lidge-jun/opencodex/issues/6242)). Gateway-namespaced ids such as LiteLLM's `openai/Qwen3.8-27B` and `oh-my-gpu/flash-next` match too. The Orca exception requires `GGUF` in the final model segment before any optional colon quant tag; non-GGUF Orca variants keep their configured mapping. Text-only developer items therefore keep their content and slot but use the `user` wire role,
+losing developer precedence. Other models retain the mapping above; native Chat passthrough
+is unchanged. The rule is recorded in `tests/fixtures/qwen38-27b-chat-template-contract.json`
+and exercised by `tests/adapters/openai/openai-chat-qwen38-leading-system.test.ts`.
+
+That mapping is not prose to be restated. `tests/ci-workflows/docs-developer-role-policy.test.ts`
+builds the sentence above from the role `src/adapters/openai-chat/messages.ts` serializes for each
+of the three states, and requires this document and
+`docs-site/src/content/docs/reference/configuration/providers.md` to carry it word for word, so a
+changed default fails a check rather than only a document review (INV-CHAT-01). The translated
+configuration pages and Claude Code guides are held against their English source in the same file.
 
 Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts.
 
 ## Reasoning and tool-result compatibility
+
+For `api.mistral.ai`, `src/adapters/openai-chat/response-events.ts` preserves typed text/thinking arrays in both response paths and rejects unsupported blocks. Inline-tag parsing crosses adjacent text blocks but resets at typed reasoning. It adds no signature replay.
+On that same host, `src/adapters/openai-chat/messages.ts` reconstructs historical thinking as native `content` chunks before assistant text, for every hosted model family. An explicit `preserveReasoningContentModels` list, including `[]`, still controls enrollment; the default preserves supplied thinking. The shared prompt projection counts that thinking. Replay can recover actual text from the existing scoped tool-call cache, but never invents placeholders or forwards generic IR signatures. Original chunk metadata and exact chunk boundaries are not retained by this text-only reconstruction. Native Chat passthrough and other destinations retain their existing behavior.
+Tests: `tests/adapters/openai/openai-chat-mistral-content.test.ts`; byte budgets retain their existing limits.
+
+### Inline think-tag recovery
+
+A gateway that serves a thinking model without a server-side reasoning parser returns the chain
+of thought inside `message.content` as `<think>` / `<thinking>` / `<reasoning>` blocks and sends
+neither `reasoning_content` nor `reasoning_details`. `src/adapters/openai-chat.ts` recovers those
+blocks into reasoning only for models listed in `inlineThinkTagModels`. An explicit operator list,
+including `[]`, replaces matching registry defaults. The option is off by default because registry
+providers share this adapter and a gateway that does parse reasoning
+must keep its visible content byte-exact. Once enabled the splitter still engages only for a
+response that opens with a thinking tag (optionally preceded by whitespace), so ordinary prose or
+code fences before a tag leave the entire response untouched. Whitespace before that initial tag
+and after every closing tag remains answer text;
+after it engages it keeps splitting later blocks, because M-series models interleave thinking with
+answer segments, including same-line interleaving. Once engaged, tags are protocol delimiters even
+inside subsequent code fences or quoted examples: this explicit opt-in does not parse Markdown.
+Gateways producing ambiguous literals should use structured reasoning instead. A moving cursor
+scans each upstream chunk without copying the remaining response after every block. Only undecided
+leading input or a trailing tag fragment is retained and charged to the translator budget.
+Undecided leading whitespace is charged one incoming segment at a time and joined only when
+the initial format is decided or the stream ends.
+A block left unterminated at end of stream flushes as reasoning rather than being
+dropped. In interleaved Chat mode, whitespace after the leading block and after later blocks
+remains answer text, including indentation and blank lines. Kiro uses single-block mode and
+retains its existing first-answer normalization.
+`src/adapters/inline-think-tags.ts` owns the parser and is shared with the Kiro adapter,
+which consumes it in single-block mode with its existing leading/first-answer normalization.
+Regression coverage is in `tests/adapters/openai/openai-chat-inline-think-tags.test.ts` and
+`tests/adapters/openai/inline-think-boundaries.test.ts`.
 
 Google tool-declaration narrowing is observed by the Google final compiler, not this shared Chat
 compatibility layer. Its endpoint profile and privacy boundary are specified in the
@@ -32,8 +86,11 @@ compatibility layer. Its endpoint profile and privacy boundary are specified in 
 
 Chat models sometimes return a freeform call body under a common alternate field or wrap the whole
 body in a Markdown fence. Restoration in `src/responses/apply-patch-envelope.ts` is deliberately
-narrow: only bare `exec` and `apply_patch` accept one recognized alternate field or one complete
+narrow: only bare or `default.`-prefixed `exec` and `apply_patch` accept one recognized alternate field or one complete
 outer fence, while ambiguous wrappers and provider-owned freeform grammars remain byte-exact.
+Structured shell arguments mistakenly sent to code-mode `exec` follow the shared
+[Responses restoration contract](../transports/responses.md#responses-httpsse), including preview
+holding and preservation of valid JavaScript fallback fields.
 
 Kiro groups only consecutive original-message tool results whose raw call ID exactly matches
 the originating call. Its wire-ID map retains the original ID privately so replacement or
@@ -50,14 +107,12 @@ nonblank `id`/`name`/`namespace`, and fully representable nonempty text/image ou
 existing continuation conversation-boundary calculation. The metadata is structural,
 not authentication. Unknown/opaque/malformed parts reject the entire conversion;
 ordinary missing/empty tool call ids retain the existing translated-route 400 guard.
-Native passthrough and compaction retain raw-body handling. The leaf reuses the input
-content converter after validation and imports no optional subsystem.
+Passthrough and routed-compaction raw-body repairs emit it as a user turn (`externalTaskInputResponsesContent`,
+#6764); the direct native `/responses/compact` forward keeps its raw-body handling. The leaf imports no optional subsystem.
 Stateful developer-guidance injection reuses that validator for its raw insertion
 boundary, so parsed messages and stored raw history retain the same task/guidance order.
 
-Native OpenAI passthrough consults the existing configured capability ladder before forwarding
-`reasoning_effort`; an explicitly empty ladder removes that unsupported control while an unknown
-ladder remains unclassified. It also sanitizes routed reasoning history so `reasoning` input items do not send
+Native Chat passthrough and translated Chat share `src/adapters/openai-chat/reasoning-wire.ts` after provider resolution. Explicit reasoning/effort false declarations and empty strength ladders remove unsupported effort; toggle false removes the switch without declaring an unknown strength axis unsupported. A declared toggle wire serializes the independent thinking choice without treating enabled/disabled/adaptive discriminators as strengths. Dual-control requests still pass through gateway-object projection and tool-bearing effort omission; a legacy toggle configuration gains a second serialized control only with explicit effort support; unknown declarations preserve legacy raw forwarding. Native passthrough also sanitizes routed reasoning history so `reasoning` input items do not send
 non-empty `content` arrays to upstream models that reject them. Chat Completions bridging repairs
 orphan `toolResult` messages by inserting a synthetic assistant `tool_call` before tool messages.
 It also repairs the opposite direction (260718): an assistant `tool_calls` round left dangling —
@@ -67,13 +122,12 @@ and synthesizing explicit "no tool result was recorded" answers only when no rea
 (Kimi/Moonshot 400 `ocx-mrqaiw05-269`; unit `devlog/_fin/260718_dangling_toolcall_hardening`).
 
 The native Ollama wire carries the same contract. `src/adapters/ollama-native.ts`
-`buildNativeMessages` defers `user`/`developer` messages that arrive while a batch is open and
-releases them after the tool messages, and answers a call with no result anywhere in the replayed
-history with the same `[ocx] no tool result was recorded for "<name>"` marker. The shape it
-absorbs is ordinary Codex history, not a malformed one: Codex records mid-turn items (a
-`PostToolUse` hook verdict, a context notice) between an assistant `tool_calls` message and that
-call's own result. The strict pair checks (orphan result, duplicate result, result naming another
-tool) still throw on both wires (#4842).
+`buildNativeMessages` defers `user`/`developer` messages while a batch is open; assistant text/thinking
+with no new tool calls is also deferred while results remain outstanding. Deferred messages retain arrival order after recorded results; an unresolved counter avoids rescanning calls per message.
+A new tool-call batch settles its predecessor. Additional results in an open batch join in arrival
+order, preserving images and error markers; known late output uses an attributed user-text carrier
+after any pending batch. Unknown IDs and mismatched names/namespaces still throw; missing results
+retain the unknown-status marker. Late-output attribution shares a 256 KiB generated JSON-byte budget per request, reserved before concatenation; overflow uses the HTTP 413 [byte-accounting contract](../transports/byte-accounting.md#request-copy-accounting) instead of truncating identities or output. The replay and tool-continuation tests under `tests/providers/ollama/` cover these paths. See the decision record below. Native response tool-call identity uses valid IDs before function-index/position fallbacks. Distinct IDs at index zero remain separate; repeated IDs replace arguments and cannot change function names. ID-less later frames can update an existing index (and an id may adopt a call first seen without one), but same-frame entries share a call only with the same ID. First-seen order, separate call budgets/retained metadata and the 128-call cap remain enforced. `parallelToolCalls:false` still fails closed before actionable tool events. `tests/providers/ollama/ollama-native-parser.test.ts` covers these contracts.
 
 Forward-mode OpenAI passthrough also repairs replayed `call_id` values longer than the Responses
 API's 64-character limit. Sidechat/fork replay can namespace routed-provider ids beyond that limit,
@@ -131,6 +185,22 @@ switch therefore costs one extra upstream round trip and one turn of degraded re
 wedging the thread; unrelated 4xx responses and requests whose outbound body carries no blob never
 enter this recovery.
 
+Recovery is admitted for every adapter whose registry contract resolves to the Responses wire
+(`adapterSpeaksResponsesWire` in `src/server/responses/core-opaque-recovery.ts`, through
+`resolvedAdapterWire`), not for one adapter name. `openai-responses` qualifies directly and
+`azure`/`azure-openai` through `contractParent`; before #5583 a name check left Azure's wrapper of
+the same passthrough outside recovery. Once the destination itself has rejected foreign opaque
+state, replayed reasoning items also lose their `id`, with or without a blob: the id names an item
+in the refused identity's store,
+and without `store: false` a stateful destination resolves it against its own store and answers
+`Item with id 'rs_…' not found` on the recovered send. `_dropForeignReasoningItemIds` carries that
+signal from `prepareOpaqueBlobRecovery` and from the rejection memo below into
+`sanitizeReasoningInputContent`. A proven route switch sets it only when the durable destination or
+credential changed (`reasoningReplayItemStoreChanged`): that is when the id names another store. A
+model or adapter change on the same destination and credential strips the blob but keeps the id,
+which that store can still resolve.
+`tests/responses/responses-azure-opaque-blob-recovery.test.ts` runs the switch on both adapters.
+
 After a self-identified opaque-blob rejection, the proxy also keeps a five-minute rejection memo.
 The memo key is the resolved conversation identity plus the durable serving identity: provider,
 destination, adapter, model, and credential. It is recorded only when the blobless recovery resend
@@ -153,6 +223,7 @@ serving-identity record. That omission is intentional: binding those routes woul
 conversation's last-serving identity and cause a later main-model turn to strip valid blobs.
 
 > Decision record: [ADR-0051](../decisions/ADR-0051-reasoning-and-tool-result-compatibility.md)
+> Decision record: [ADR-6574](../decisions/ADR-6574-ollama-tool-continuations.md)
 
 DeepSeek's stateless Responses compatibility pass normalizes only unambiguous tool-call batches.
 Calls emitted before the first matched output stay together as one assistant batch, followed by
@@ -185,13 +256,16 @@ xAI's public Responses API is stateful (`store` defaults true; `previous_respons
 stored conversation), so the provider is not marked `statelessResponses`. The pairing repair
 synthesizes an honest unknown-status placeholder without touching `store` or
 `previous_response_id`: repairing an interrupted history must not cost the thread its server-side
-state. Forward auth suppresses the synthesis regardless of the flag, because the backend that holds
-the conversation can resolve the pair itself.
+state. An output-only continuation is preserved because its call may live in that server-side state;
+pairing only synthesizes results for calls present in the current input. Forward auth suppresses the
+synthesis regardless of the flag, because the backend that holds the conversation can resolve the
+pair itself. Replay-miss reasoning cleanup remains independent of whether orphan outputs are
+converted. A retained previous-response ID does not override an explicit custom-tool denial below.
 
 > Decision record: [ADR-0052](../decisions/ADR-0052-reasoning-and-tool-result-compatibility.md)
 
 ## Declared hosted-tool denials
-
+The explicitly selected Codex Responses Lite ordinary unreferenced history projection follows [hosted-search continuation binding](../providers-and-adapters.md#hosted-search-continuation-binding): it changes historical cells, not hosted tool declarations or action capability.
 A gateway that speaks the Responses API does not necessarily accept everything OpenAI accepts.
 `unsupportedHostedTools` is how such a destination says so: it names the hosted tool declarations
 this provider rejects, and `stripUnsupportedHostedTools` in
@@ -206,9 +280,9 @@ but rejected hosted `web_search` with HTTP 400 `unsupported_request`, which mean
 prompt failed before the model answered, because Codex's hosted declaration travelled with it. A
 provider nobody has classified can now describe itself in config.
 
-The declaration is additive to that table, not a replacement for it. The table still covers
-destinations that reject a tool regardless of configuration, so an operator who never heard of the
-field stays protected; a declaration can only deny more, never re-enable a known-broken pairing.
+The declaration is additive to that table, not a replacement for it. The table is for destinations that reject a tool regardless of configuration, so an operator who never heard of the field stays protected;
+a declaration can only deny more, never re-enable a known-broken pairing. The table denies `web_search` and `web_search_preview` for `xiaomimimo.com` and its subdomains, including the public API and token-plan hosts (#5501), independent of model name. Matching uses the parsed URL hostname, so unrelated hosts with MiMo names in paths or queries are unaffected.
+OpenCode Go keeps hosted search: it refuses two OpenAI-private fields rather than the tool, and `src/adapters/xai-web-search.ts` normalizes those fields for every Grok model there.
 
 Two properties are deliberate. Spelling variants of one capability are aliased, so declaring
 `web_search` also denies `web_search_preview` — the rest of the proxy already folds that pair into
@@ -223,6 +297,13 @@ This capability is independent of `supportsResponsesCustomTools`, which denies n
 tools and `custom_tool_call` items. A gateway that rejects both sets both; neither implies the
 other.
 
+When that capability is explicitly false, `src/responses/custom-tool-compat.ts` also lowers valid
+historical custom-call/result pairs absent from the live catalog, without adding their names to
+current declaration or restoration sets. Malformed or duplicate call identities and collisions
+with live function names fail closed. Unmapped custom outputs request full replay; residual native
+items fail the final outbound guard and map to HTTP 400. True or unspecified support preserves the
+existing native path. Nested tool-output JSON remains data, not a protocol item to rewrite.
+
 ## OpenRouter provider routing
 
 The canonical OpenRouter `openai-chat` transport may carry optional provider-routing preferences
@@ -236,6 +317,49 @@ equivalent) and the `openai-chat` adapter. Alternate ports, credentials, query s
 lookalike hosts, and custom proxy paths fail validation. A model override replaces rather than
 merges the provider-wide default, keeping precedence deterministic. With no preference configured,
 the request body is byte-for-byte unchanged in this area and OpenRouter retains its default routing.
+
+## Serialized tool-call content
+
+Some Chat gateways expose one model-produced call twice: as a complete
+`<tool_call><function=…>…</function></tool_call>` content block and as a structured `tool_calls`
+entry. `src/adapters/openai-chat/serialized-tool-call-content.ts` recognizes bare line-start blocks outside Markdown.
+Its scanner `src/adapters/openai-chat/serialized-tool-call-markup.ts` also recognizes `<tool_call_deadbeef>` after ordinary prose, requiring identical closing IDs (1–64 hex characters); code, quotes and indentation stay literal. Identified-wrapper recognition alone never dispatches a call.
+Structured-call reconciliation holds a possible serialized block, resumes ordinary text delivery when the header cannot match, and removes the block only when its function name and
+freeform body match a structured call's parsed `input` or exact raw arguments from a declared
+freeform/custom tool in the same response. Valid JSON primitives, arrays, and objects can be raw
+freeform input too; the declared tool name and namespace fit whether the bridge unwraps an alternate field.
+A block may close a freeform body with a stray `</parameter>` and may omit `</function>`, and one
+newline after the function header is template layout, so MiMo's echoes of those shapes match too
+(#5724). A forward-only next-line-header cursor keeps adjacent-block scanning linear; closing tags must match the opener’s exact ID (`</tool_call>` for bare blocks).
+Before the next line-start header, the first matching close preceded by `</function>` wins; otherwise the first matching close before that header is the unclosed fallback.
+If no matching close precedes that header, scanning continues beyond it but accepts only a matching close preceded by `</function>`. Bodies can still carry literal tags.
+If the gateway also prefixes the structured call's JSON arguments with the same freeform body, the adapter keeps the JSON suffix only when the block body,
+prefix, and wrapper's `input` value all agree. Mismatched markup and arguments remain byte-exact.
+MiMo V2 Chat IDs of `mimo-v2` or `mimo-v2.*` can send `{}` for a freeform call and put
+its input in one bare or identified block; hyphenated IDs (`mimo-v2-pro`, `mimo-v2-omni`) are excluded. With no other text, one call and an exact wire-tool match, the adapter restores `input` and removes the block.
+Prose, fences, ordinary functions, multiple calls/blocks, and nonempty arguments remain inert. A malformed `<parameter=` opener is stripped only at that block's start; streaming recovery stops after earlier answer text is released.
+Two immediately adjacent identical blocks (bare or identified), with optional trailing whitespace,
+are suppressed only when exactly one structured call matches their function name and carries their
+body as `input` or exact raw arguments, or when one doubled `input` can be reduced to that body.
+Reducing a doubled `input` requires an arguments object with no keys besides `input`; extra keys
+leave it unchanged. When another same-function call also matches or doubles the body, neither
+arguments nor markup are changed because the response is ambiguous. An empty block and its own
+empty-input call do not create a second explanation. Unrelated structured calls do not
+prevent suppression, and other repeated shapes remain unchanged.
+Silent held-content frames emit adapter heartbeats. Terminal errors and transport read failures
+drain all held text, including matching serialized blocks, because pending tools are not dispatched.
+The held bytes use the shared translator budget. The streaming hold is bounded (`ingestStreaming`): once a closed block is followed by more than 8 KiB of prose with no block open after it, or held text plus queued events would pass 4 MiB, everything held is released in order with nothing suppressed, so an unmatched block no longer delays the rest of the answer to the end of the turn. A duplicate is the tail of the content, so its reconciliation is unaffected; past either bound the stream prefers delivery (the pre-#5548 raw markup) over suppression. Buffered responses keep the unbounded `ingest` because their structured calls are already known (`tests/adapters/openai/openai-chat-serialized-tool-call-hold-bound.test.ts`). For a model opted into inline `<think>` splitting,
+reconciliation sees only the answer text the splitter emits. A reasoning event that arrives while
+a block candidate is held waits behind it and is released in its original position, so event order
+never changes and a duplicate is not exposed early. Complete control bodies stay Markdown-opaque on every provider, including bounded release;
+line, fence and inline-code state carry across answer text and think sections. Streaming and buffered responses use the same
+matching and repair rules; regression coverage enters through `/v1/responses` in
+`tests/responses/responses-chat-tool-call-content.test.ts`.
+
+Standalone bare-call recovery follows [the separate MiMo policy](mimo-bare-calls.md); traversal stops at the 129th candidate header and disables the entire recovery batch.
+
+> Decision record: [ADR-5548](../decisions/ADR-5548-serialized-tool-call-content.md)
+> Decision record: [ADR-5724](../decisions/ADR-5724-serialized-tool-call-content.md)
 
 ## Kimi Coding Plan prompt-cache affinity
 
@@ -272,11 +396,12 @@ ledger: `devlog/_fin/260709_parallel_tool_calls/`.
 
 ## Volcengine Ark assistant continuation shapes
 
-The `openai-chat` adapter keeps Volcengine's pay-as-you-go Chat endpoint and Coding Plan endpoint
-on separate empty-assistant contracts. The pay-as-you-go `/api/v3` route retains the structured
-`[{ "type": "text", "text": "" }]` placeholder inferred for #796, while `/api/coding/v3` uses the
-ordinary empty string accepted by its live tool-call continuation contract (#1571). Matching only
-the shared Ark hostname is too broad because the two endpoint families reject opposite shapes.
+The `openai-chat` adapter uses `""` for Kimi K3.1 Pro (`kimi-k3-1-pro`, including dated versions)
+on Ark's pay-as-you-go `/api/v3` route: tool continuations reject the legacy empty-text array.
+This covers ordinary, reasoning-only and synthesized orphan assistant turns. Other pay-as-you-go
+Ark models retain the `[{ "type": "text", "text": "" }]` placeholder inferred for #796.
+Coding Plan's `/api/coding/v3` uses the empty string accepted by its live continuation contract
+(#1571); matching only the shared Ark hostname cannot identify the continuation format.
 
 > Decision record: [ADR-0063](../decisions/ADR-0063-volcengine-ark-assistant-continuation-shapes.md)
 
@@ -286,10 +411,21 @@ First-party Kimi and Moonshot Chat destinations normalize a `$ref` with sibling 
 their wire rejects that valid JSON Schema 2020-12 shape. Inlining preserves conjunction semantics:
 `required` members are unioned, lower numeric bounds take the maximum, upper numeric bounds take the
 minimum, and overlapping `properties` recurse with the same rules. The walk remains depth-, node-,
-and expansion-bounded. Unresolvable or cyclic references keep the existing bare-`$ref` fallback,
-and unrelated OpenAI-compatible providers retain the caller's schema unchanged.
+expansion-, and inline-byte-bounded: each inlined reference is charged its serialized size against
+one 1 MiB allowance shared by every tool in the request. Raw target bytes are reserved before
+normalization. A candidate expansion restores its byte, node, and expansion allowances when
+it falls back; nested retained copies spend the allowance once, and only additional outer growth
+is charged. Moonshot's validator requires an explicit object termination type for recursive
+unions, so a schema carrying `properties` or `additionalProperties`, or an `allOf` with such a
+member, is emitted with `type: "object"`. This narrows scalar instances that JSON Schema would
+permit; tool-argument schemas do not rely on those scalar instances. Non-object `allOf`
+compositions, such as string constraints, remain untyped. An over-budget reference keeps the
+bare-`$ref` fallback.
+Unresolvable or cyclic references do the same, and unrelated OpenAI-compatible providers
+retain the caller's schema unchanged.
 
 > Decision record: [ADR-0064](../decisions/ADR-0064-chat-structured-output-compatibility.md)
+> Decision record: [ADR-0355](../decisions/ADR-0355-chat-structured-output-compatibility.md)
 
 The `openai-chat` adapter translates Responses `text.format` and Chat Completions
 `response_format` through one internal format, then emits `response_format` on the upstream chat
@@ -303,18 +439,15 @@ family shared by unrelated upstreams.
 
 ## Anthropic structured-output compatibility
 
-The Anthropic adapter lowers Responses `text.format` and Chat Completions `response_format` JSON
-Schema requests to `output_config.format`. The local transform follows Anthropic's TypeScript SDK
-subset so upstream rejects neither OpenAI-only envelope fields nor unsupported schema constraints.
-The adapter merges `format` into an existing adaptive-thinking `output_config` rather than replacing
-it, so a compatible `output_config.effort` remains alongside the structured-output format.
-Routed Anthropic Messages input carries `output_config.format` through internal `text.format`, so
-stored-OAuth requests regain the same native format when the Anthropic adapter rebuilds the wire body.
-Unsupported constraints remain in `description` as model guidance instead of disappearing. Root
-`$defs` stay beside a root `$ref`, intentionally differing from the current SDK transform's early
-`$ref` return so local references remain resolvable.
+The Anthropic adapter lowers Responses `text.format` and Chat Completions `response_format` JSON Schema requests to `output_config.format`, following Anthropic's TypeScript SDK subset.
+It merges `format` into the existing adaptive-thinking `output_config`, preserving compatible `output_config.effort`. Unsupported constraints remain in `description` as model guidance; root `$defs` remain beside a root `$ref` so local references resolve.
+Routed Anthropic Messages input carries `output_config.format` through internal `text.format`; stored-OAuth requests regain that format when the Anthropic adapter rebuilds the wire body.
+In that inbound direction, `src/adapters/anthropic-output-schema.ts` checks the original schema, not the normalized acceptance clone. Strict mode requires an object root without a root union, and every object must supply a property map, `additionalProperties: false`, and exactly matching `required` names.
+The check traverses schema-valued properties, array items, unions and definitions; property names and literal enum/const values are not schema nodes. It admits only documented schema keywords for the node's declared type, so incomplete objects, unknown constraints and invalid keyword values retain their original schema with explicit `strict: false` instead of waiting for a denylist update. Fine-tuned `ft:` targets use OpenAI's narrower model-specific keyword subset after Claude alias/model-map resolution; later provider/combo routing remains outside this ingress proof. Anthropic's native acceptance still includes `uri`; only the translated OpenAI strict claim uses the narrower set.
+`tests/claude-integration/claude-output-schema-strict.test.ts` covers the acceptance probe, inbound format, translated Responses parser, recursive object controls and caller-schema preservation.
 
 > Decision record: [ADR-0066](../decisions/ADR-0066-anthropic-structured-output-compatibility.md)
+> Decision record: [ADR-5901](../decisions/ADR-5901-translated-output-schema-strict-eligibility.md)
 
 ## Reasoning display parity (hideThinkingSummary)
 
@@ -329,7 +462,9 @@ measurement rather than allocating a serialized copy just to measure it.
 
 > Decision record: [ADR-0067](../decisions/ADR-0067-reasoning-display-parity-hidethinkingsummary.md)
 
-`hideThinkingSummary` (request reasoning summary absent/"none" — the routed catalog default) is
+For Responses delivery, `hideThinkingSummary` is set for explicit summary "none", or omitted summary without active thinking. An explicit `thinkingEnabled` boolean determines activity before effort is considered; otherwise accepted minimal/low/medium/high/xhigh/max (including ultra normalized to max)
+allow raw visibility when summary is omitted; none and invalid efforts do not. Explicit "auto"
+still permits raw visibility independently of effort. This flag is
 honored by BOTH reasoning paths: anthropic `thinking_delta` AND raw `reasoning_raw_delta`
 (openai-chat `reasoning_content`, kiro tags). Hidden reasoning emits an envelope-only reasoning
 item (`summary: []`, txt-only `ocxr1:` `encrypted_content`, no text deltas) — invisible in the
@@ -342,6 +477,23 @@ the desktop thinking band shows the "Thinking…" placeholder, and raw text appe
 #45 display intent, intentionally reverted 260911) put unsummarized thinking in the desktop band,
 which only fits native OpenAI providers that author real summaries. Diagnosis and codex-rs
 grouping evidence: `devlog/_fin/260709_native_response_pattern/`.
+Provider policy `hideRawReasoning` hides only this raw channel (summaries keep streaming); it controls
+display, not confidentiality ([Responses wire shapes](../transports/responses-wire-shapes.md)).
+
+Chat ingress carries `chatRawReasoningVisible` separately from parsed options: raw reasoning already
+produced upstream reaches `delta.reasoning_content` or buffered `message.reasoning_content` by default.
+The existing explicit summary-over-`include_reasoning` precedence resolves display none first;
+then an explicit thinking/enabled boolean wins over effort, and effort none hides raw text.
+Provider `hideRawReasoning` still wins. Both bridge and direct encoders apply this only to the raw
+channel; `thinking_delta` keeps its existing summary policy. No default reasoning field is injected
+into the upstream body, and Responses and Messages ingress retain their existing behavior.
+`src/server/responses/sidecar-execution.ts` forwards the same delivery-only flag through
+`WebSearchLoopDeps` and `ImageBridgeDeps` to `src/web-search/loop.ts` and `src/images/loop.ts`.
+These sidecar bridges use internal Responses SSE even with direct encoders enabled; Chat folds
+that stream for buffered callers. Parsed generation options and upstream bytes remain unchanged.
+`tests/responses/chat-raw-reasoning-delivery.test.ts` pins delivery and unchanged upstream bytes.
+
+For models requiring a reasoning placeholder, a preserved thinking-only assistant receives it even without tools, keeping strict DeepSeek continuations valid (#5421). Chat replay policy in `src/adapters/openai-chat/reasoning-replay.ts` honors explicit lists and otherwise recognizes thinking model families (`isThinkingModelFamily`): DeepSeek Flash/Pro (`isDeepSeekThinkingModel`) across versions and gateways, and Reflection/Stealth families (`isReflectionThinkingModel`: `/(?:^|\/)(?:reflection|stealth)(?:$|[-_:/.])/i`). Default replay policy sets `preserve: true` for all thinking model families; operators may override preservation via `provider.preserveReasoningContentModels` or placeholder synthesis via `provider.requiresReasoningPlaceholderModels`. While DeepSeek models scope reasoning replay to tool-enabled turns (`hasTools: true`), Reflection and Stealth families require reasoning replay across all prior assistant turns even when no tools are present (`hasTools: false`), synthesizing whitespace placeholder `[" "]` when `placeholder: true` and cached reasoning is absent. In `src/adapters/openai-chat/messages.ts`, `messagesToChatFormat` checks `isReflectionThinkingModel` to synthesize thinking placeholders when `wireSerializesThinking` is true. Upstream reasoning capture in `src/server/chat-native-reasoning.ts` extracts thinking from both `reasoning_content` and `reasoning` in SSE stream deltas and non-streaming choices. In `src/adapters/openai-chat/passthrough.ts`, `baseBytes` is measured unconditionally against `maxSerializedBytes - replayPlan.serializedBytes` via `jsonUtf8Bytes(transformedBody(), ...)` for both unchanged bodies and changed replays; exceeding budget raises `TranslatorBudgetExceededError("request_copies", maxSerializedBytes)` (HTTP 413), guaranteeing non-replay requests also enforce `maxSerializedBytes` and reserve transient budget. [Native continuation](../data-planes/inbound-compat.md#native-chat-thinking-continuation) shares this replay and byte-accounting policy. Model-contract evidence and compatibility policy: Verification date: 2026-10-25. The Reflection/Stealth family default is a defensive compatibility fallback policy based on observed vendor behavior: live testing against Vercel AI Gateway (`reflection-beam`, 2026-10-23) observed rejection of tool-free multi-turn requests with HTTP 400 (`Missing required parameter: 'messages[12].reasoning_content'`). Because this destination-specific observation is not a vendor guarantee across all possible stealth or reflection hosts, OpenCodex applies this heuristic as a fallback policy while providing explicit operator overrides via `preserveReasoningContentModels` and `requiresReasoningPlaceholderModels`. Continuous CI verification exercises hermetic local fixtures in `tests/responses/chat-native-reasoning-scope.test.ts` (pinning multi-turn non-tool replay, `reasoning` delta capture, and passthrough size checks) without live network requests.
 
 The process-local raw-reasoning fallback is fail-closed unless a request has an explicit client
 thread plus an exact provider destination, wire adapter, final model, and physical credential
@@ -358,82 +510,82 @@ reasoning.
 
 > Decision record: [ADR-0068](../decisions/ADR-0068-reasoning-display-parity-hidethinkingsummary.md)
 
+`src/chat/inbound.ts` translates legacy Chat `functions`, assistant `function_call`, and textual
+`role: "function"` results as one Responses function exchange. Missing or null assistant
+`function_call` fields mean no call and preserve ordinary assistant text. The translator assigns
+bounded sequential call IDs and pairs results by function name; malformed or orphan results fail
+explicitly, and image-bearing legacy results remain unsupported rather than losing media.
+
+> Decision record: [ADR-0111](../decisions/ADR-0111-legacy-chat-function-history.md)
+
 ## Chat streamed tool-call identity
 
-`src/adapters/openai-chat.ts` retains a call's first observed non-negative safe integer
-index as an alias when the call started by ID. Every present, non-null index must
-be a number in that range: strings (including numeric and empty strings), booleans,
-objects, arrays, negative numbers, fractions and unsafe integers terminate the stream
-before any key, alias, ID or last-call matching. `Number.MAX_SAFE_INTEGER` is accepted;
-larger integers are rejected because distinct wire literals can parse to the same number.
-The invalid-index error releases all pending call reservations without emitting
-those calls or a successful completion; invalid indexes are never treated as absent.
-Only missing and null indexes are absent-index placeholders. Repeated ID, name and
-argument string-field tolerance retains its existing rules.
+`src/adapters/openai-chat.ts` retains a call's first observed non-negative safe integer index as an
+alias when the call started by ID. Every present, non-null index must be a number in that range:
+strings (including numeric and empty strings), booleans, objects, arrays, negative numbers, fractions,
+and unsafe integers terminate the stream before any key, alias, ID or last-call matching.
+`Number.MAX_SAFE_INTEGER` is accepted; larger integers are rejected because distinct wire literals can parse
+to the same number. The invalid-index error releases all pending call reservations without emitting
+those calls or a successful completion; invalid indexes are never treated as absent. Only missing and
+null indexes are absent-index placeholders. Repeated ID, name and argument string-field tolerance retains
+its existing rules.
 
-For valid indexes, lookup preserves direct-key precedence, then index alias, then
-ID fallback. The initial key continues to own all translator budget reservations
-and release; learning an alias creates no additional owner. Unassociated index-only
-fragments are not guessed onto pending ID-only calls.
-`tests/adapters/openai/openai-chat-parallel-stream.test.ts` covers late aliases,
-parallel/colliding identities, distinct unsafe raw JSON index literals, the maximum
-safe-integer boundary, invalid index types, missing/null continuations and UTF-8
-byte-limit boundaries.
+For valid indexes, lookup preserves direct-key precedence, then index alias, then ID fallback. The
+initial key continues to own all translator budget reservations and release; learning an alias creates
+no additional owner. Unassociated index-only fragments are not guessed onto pending ID-only calls.
+`tests/adapters/openai/openai-chat-parallel-stream.test.ts` covers late aliases, parallel/colliding
+identities, distinct unsafe raw JSON index literals, the maximum safe-integer boundary, invalid index
+types, missing/null continuations and UTF-8 byte-limit boundaries.
 
 Canonical Spark Lite metadata follows the final serialized model and surviving nonempty Lite tool catalog; see [Responses transport](../transports/responses.md).
 
 Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
 ## Anthropic parallel tool use
 
-`options.parallelToolCalls === false` maps onto Anthropic's nested
-`tool_choice.disable_parallel_tool_use`. Because the flag lives inside
-`tool_choice`, a request that carries only the parallel intent and no explicit
-choice gets a synthesized `{type:"auto"}` so the flag has somewhere to live;
-`required` maps to `{type:"any"}` and a named choice to `{type:"tool"}`, and both
-accept it. `{type:"none"}` does not receive the flag because tool use is already off,
-and a request with no tools on the wire emits no `tool_choice` at all. An unset or
-true `parallelToolCalls` is byte-identical to previous behavior.
+`options.parallelToolCalls === false` maps onto Anthropic's nested `tool_choice.disable_parallel_tool_use`.
+Because the flag lives inside `tool_choice`, a request that carries only the parallel intent and no
+explicit choice gets a synthesized `{type:"auto"}` so the flag has somewhere to live; `required` maps
+to `{type:"any"}` and a named choice to `{type:"tool"}`, and both accept it. `{type:"none"}` does not
+receive the flag because tool use is already off, and a request with no tools on the wire emits no
+`tool_choice` at all. An unset or true `parallelToolCalls` is byte-identical to previous behavior.
 
-The flag constrains the model's output, not execution ordering. Sequential tool use
-is enforced by the caller's own loop returning each `tool_result` before issuing the
-next request; this mapping does not provide that.
+The flag constrains the model's output, not execution ordering. Sequential tool use is enforced by
+the caller's own loop returning each `tool_result` before issuing the next request; this mapping does not provide that.
+
+Claude Opus 5.5, Fable 5.1 and Sonnet 5.5 are upstream exceptions to the forced-choice mapping: Anthropic
+rejects `tool_choice: {type:"any"}` and `{type:"tool",name:...}` for that model, with or without adaptive
+thinking, for all three. The adapter sends `{type:"auto"}` for those choices so the request succeeds,
+but the caller's forced-tool guarantee cannot be preserved; the prompt must provide any required tool-use
+instruction. Other Claude model families retain the normal forced-choice mapping: Haiku 5.5 retains
+`any`/named tools, uses adaptive thinking for low..max, and reasoning none sends `disabled` without effort.
+Its non-default sampling fields are dropped on every path.
 ## Unmapped modalities are recorded, not dropped
 
-The translated Chat route has no video mapping — this adapter does not implement one.
-Both serialization branches emit a bounded marker for a video part: the image-bearing
-branch previously produced `{type:"text", text: undefined}`, a malformed part, and the
-text-only branch joined it to `""` so a video-only or text-plus-video message was
-dropped entirely. The marker names opencodex's own missing mapping; it does not assert
-anything about the provider's or model's capability, which the proxy has not
-established. Native Chat passthrough and Google inline video are separate routes and
-are unaffected.
+The translated Chat route has no video mapping — this adapter does not implement one. Both serialization
+branches emit a bounded marker for a video part: the image-bearing branch previously produced `{type:"text", text: undefined}`,
+a malformed part, and the text-only branch joined it to `""` so a video-only or text-plus-video message
+was dropped entirely. The marker names opencodex's own missing mapping; it does not assert anything about
+the provider's or model's capability, which the proxy has not established. Native Chat passthrough and
+Google inline video are separate routes and are unaffected.
 
-`input_audio` parts are recognized in the shared Responses parser and recorded as a
-presence marker in the translated IR. This is **presence only and not audio support**:
-the IR has no audio carrier and no adapter consumes one. The parser stays non-throwing
-because the native Responses passthrough also runs through `parseRequest` before the
-adapter forwards `_rawBody`, so refusing there would regress raw passthrough.
+`input_audio` parts with an inline WAV/MP3 data URL, or raw base64 with an explicit `wav`/`mp3` format,
+are supported on the translated Chat wire. The shared parser preserves the bytes as an `OcxAudioContent` part;
+the Chat serializer emits `input_audio` for user content and promotes tool-result audio into a follow-up
+user message because `role:"tool"` content is text-only. The parser stays non-throwing for native Responses
+passthrough; native Responses and native Chat retain their existing wire behavior. Remote audio, unsupported
+formats, the top-level `audio` spelling, developer audio, and system or assistant audio are refused. The final
+adapter checks the original input under the [untranslated-media contract](../adapters/registry.md#untranslated-input-media);
+translated adapters refuse unsupported inputs while native Responses retains the original body. The opposite
+Chat-to-Responses projection still rejects audio/file parts, except user-content inline documents. No audio
+transport or URL fetch is added, and no client filename, payload, URL or metadata enters errors. Admission
+charges supported audio by decoded size at the conservative 256-bytes-per-token proxy, not an upstream token formula.
 
-The final registered adapter also checks the original input under the
-[untranslated-media contract](../adapters/registry.md#untranslated-input-media). Audio/file
-attachments cannot succeed merely because the normalized representation retained a text
-marker: translated adapters refuse them, while native Responses retains the original body.
-Chat conversion rejects recognized audio/file parts before projection; the native Chat wire
-is unchanged. No audio/file transport or automatic URL fetch is added, and no client filename,
-payload, URL or metadata is included in the new error messages.
-
-The shared coding-agent projection (CodeBuddy, Qoder) carries tool-result images as
-real image blocks rather than flattening them to the text `[image]`, and orders image
-blocks chronologically — history before current — so attachment order matches the
-prose the model reads beside them. Vendor tool execution stays disabled on both
-adapters. CodeBuddy refuses an unquoted, line-oriented full-width-bar DSML `calls`
-container followed by a named bare or namespaced invoke control line in either output channel; it
-preserves preceding answer text, never promotes vendor prose into execution authority,
-and leaves discussed or quoted literals and code examples untouched. Qoder's explicit
-refusal of original images is unchanged.
+The shared coding-agent projection in `src/adapters/coding-agent/` carries supported tool-result images as real image blocks in conversation order, history before current. Current tool-result prose retains `[image attached below]` and `[image omitted: unsupported reference]`. Qoder alone opts into omission markers for single-user input and historical user/tool-result prose through `src/adapters/qoder/image-input.ts`; CodeBuddy retains its previous bytes (historical `[image]` and single-user unsupported-reference omission), and Claude keeps its stable replay builder. Vendor tool execution stays disabled.
+CodeBuddy refuses an unquoted, line-oriented full-width-bar DSML `calls` container followed by a named bare or namespaced invoke control line in either output channel; it preserves preceding answer text, never promotes vendor prose into execution authority, and leaves discussed or quoted literals and code examples untouched. Qoder Global continues forwarding supported images without a per-model vision allowlist. CN retains its sidecar classification. Its raw-image route admits only one canonical base64 PNG of at most 1 MiB decoded in one non-developer user message, on `DeepSeek-Flash` or `Qwen3.8-Flash`; developer images, URL references, other media types/models, multiple images, tool-result images and image-bearing multi-turn replay return a fixed non-retryable 400 `unsupported_input_modality` before CLI discovery/spawn. Before CLI discovery, admission bounds encoded length, validates base64 length/padding and round-trip decoding, then checks the PNG signature and basic IHDR fields (13-byte first chunk, positive PNG-range dimensions, legal depth/colour pair, compression/filter/interlace). It does not decompress pixels or validate all chunks/CRCs. Invalid or oversized images receive the same fixed error event; text-only CN turns remain unrestricted by this gate.
+Issue #7516 reports live verification on Windows 11 x64 with `qoderclicn 1.1.70` for those two models and a single PNG, through both `--attachment` and inline `--input-format stream-json --output-format stream-json` stdin. OpenCodex uses only stdin; attachment flags are not added. The 1 MiB decoded ceiling is local resource policy, not a vendor maximum: the reported 96×96 PNG has a 36 KiB RGBA raster; larger upstream inputs remain unverified. This is reported evidence, not a fresh live test or a guarantee for other CLI versions; operators must use the verified version (no runtime version probe is added). Injected CLI tests prove serialization, omission markers, refusals and cancellation, not upstream image understanding. Global still replays historical images with `--no-session-persistence`, whose text/image association remains unverified across turns. The scaffold/replay output guards ([ADR-7517](../clients/qoder.md#qoder-assistant-text-replay-guard)) and selector ownership ([ADR-7512](../clients/qoder.md#qoder-settings-ownership)) remain independent.
 
 Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
-
-Upstream API-key usage follows the [physical-attempt account attribution contract](../gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
-
+Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-accounting.md#unicode-pattern-normalization) while preserving the existing schema and wire semantics.
+
+DeepSeek Artifact compatibility: `src/adapters/openai-chat/tool-schema.ts` omits schema `pattern` and `anyOf` constraints and strict mode for unnamespaced `Artifact` tools on `api.deepseek.com`. Surrounding properties and required fields remain; union-only nodes become unconstrained, so tool execution must validate inputs. Property names, literal defaults/examples, and caller schemas are preserved; other tools and hosts retain existing normalization. `tests/providers/deepseek-artifact-tool-schema.test.ts` checks the serialized request. Negotiated early tool delivery follows [completed tool blocks](completed-tool-blocks.md).

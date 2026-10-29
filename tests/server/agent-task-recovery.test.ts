@@ -16,8 +16,10 @@ import {
   codexHeaders,
   encryptedInput,
   FERNET_TASK,
+  FINAL_ANSWER_ENVELOPE,
+  FINAL_ANSWER_TASK_ENVELOPE,
   originalFetch,
-  post,
+  post as handlePost,
   providerResponse,
   recoveryArgumentsDoneSse,
   recoveryCompletedSse,
@@ -27,15 +29,129 @@ import {
   SECOND_FERNET_TASK,
 } from "../helpers/agent-task-recovery";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { createAgentTaskRecoveryFixture } from "../helpers/agent-task-recovery-fixture";
+import { resolveCachedAgentTaskRecoveryWithResult } from "../../src/server/responses/agent-task-recovery-cache";
+
+test("fixture rejects a foreign recovery before it can advance this case's counter", async () => {
+  const fixture = caseFixture;
+  let sends = 0;
+  fixture.stub((async () => { sends++; return new Response(recoverySse("fixture")); }) as typeof fetch);
+  const foreign = new Request("https://chatgpt.com/backend-api/codex/responses", {
+    headers: codexHeaders("previous-case", { "user-agent": "previous-case" }),
+  });
+  fixture.expectForeignFetch(foreign);
+  try {
+    await expect(fetch(foreign)).rejects.toThrow("foreign recovery fetch");
+    expect(sends).toBe(0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("fixture reports unexpected fetches even when recovery catches their rejection", async () => {
+  const fixture = caseFixture;
+  fixture.stub((async () => new Response(recoverySse("must not run"))) as typeof fetch);
+  const foreign = new Request("http://localhost/v1/responses", { headers: codexHeaders("unexpected-case") });
+  expect(await recoverEncryptedAgentTaskWithResult(foreign, encryptedInput(), {}, routedConfig()))
+    .toEqual({ recovered: false, reason: "recovery_transport_error" });
+  try {
+    await expect(fixture.close()).rejects.toThrow("recovery fixture cleanup failed");
+  } finally {
+    // The deliberately rejected fixture is complete; keep ordinary afterEach independent.
+    caseFixture = createAgentTaskRecoveryFixture();
+  }
+});
+
+test("fixture close waits for shared work after caller cancellation and fetch settlement", async () => {
+  const fixture = caseFixture;
+  let release!: () => void;
+  const body = new Promise<void>(resolve => { release = resolve; });
+  const caller = new AbortController();
+  let fetchSettled = false;
+  let workSettled = false;
+  let closed = false;
+  fixture.stub((async () => new Response("fixture")) as typeof fetch);
+  const installedFetch = globalThis.fetch;
+  const pending = resolveCachedAgentTaskRecoveryWithResult(fixture.marker, 200, async () => {
+    await fetch("https://chatgpt.com/backend-api/codex/responses", { headers: fixture.request().headers });
+    fetchSettled = true;
+    await body;
+    workSettled = true;
+    return { recovered: false, reason: "recovery_aborted" };
+  }, caller.signal);
+  // Let the synthetic mock's response settle while its owned body work remains blocked.
+  await Promise.resolve();
+  await Promise.resolve();
+  caller.abort();
+  expect(await pending).toEqual({ recovered: false, reason: "caller_cancelled" });
+  const closing = fixture.close().then(() => { closed = true; });
+  try {
+    await Promise.resolve();
+    expect(fetchSettled).toBe(true);
+    expect(workSettled).toBe(false);
+    expect(closed).toBe(false);
+    expect(globalThis.fetch).toBe(installedFetch);
+    release();
+    await closing;
+    expect(workSettled).toBe(true);
+    expect(globalThis.fetch).toBe(originalFetch);
+  } finally {
+    release();
+    await closing;
+  }
+});
+
+test("fixture close releases a gated recovery after an assertion fails", async () => {
+  const fixture = caseFixture;
+  const events: string[] = [];
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  fixture.releaseOnClose(() => { events.push("released"); release(); });
+  fixture.stub((async () => {
+    started();
+    await gate;
+    events.push("mock-settled");
+    return new Response(recoverySse("fixture"));
+  }) as typeof fetch);
+  const pending = fixture.track(recoverEncryptedAgentTaskWithResult(fixture.request(), encryptedInput(), {}, routedConfig()));
+  try {
+    await ready;
+    let assertion: unknown;
+    try {
+      expect("unreleased gate").toBe("released gate");
+    } catch (error) {
+      assertion = error;
+    } finally {
+      await fixture.close();
+    }
+    expect(assertion).toBeDefined();
+    expect(events).toEqual(["released", "mock-settled"]);
+    expect(await pending).toEqual({ recovered: false, reason: "recovery_aborted" });
+  } finally {
+    release();
+    await pending;
+    await fixture.close();
+  }
+});
 
 // Direct handler dispatch never takes the writer lease that startServer would take, so it is refused.
 let releaseSpendHome: (() => void) | undefined;
+let caseFixture: ReturnType<typeof createAgentTaskRecoveryFixture>;
+const post: typeof handlePost = (...args) => {
+  args[4] = args[4] ? AbortSignal.any([args[4], caseFixture.signal]) : caseFixture.signal;
+  return caseFixture.track(handlePost(...args));
+};
 beforeEach(() => {
   releaseSpendHome = acquireOwnedSpendHome();
+  caseFixture = createAgentTaskRecoveryFixture();
 });
-afterEach(() => {
-  releaseSpendHome?.();
-  releaseSpendHome = undefined;
+afterEach(async () => {
+  try { await caseFixture.close(); } finally {
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
+  }
 });
 
 describe("agent task recovery (opt-in, default off)", () => {
@@ -43,12 +159,8 @@ describe("agent task recovery (opt-in, default off)", () => {
     resetAgentTaskRecoveryState();
   });
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-    resetAgentTaskRecoveryState();
-  });
 
-  for (const messageType of ["NEW_TASK", "MESSAGE"] as const) {
+  for (const messageType of ["NEW_TASK", "MESSAGE", "FOLLOWUP_TASK"] as const) {
     test(`typed ${messageType} recovery preserves boolean, replay and discard contracts`, async () => {
       const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
       const config = routedConfig();
@@ -142,7 +254,7 @@ describe("agent task recovery (opt-in, default off)", () => {
     let cancels = 0;
     let reads = 0;
     let releaseCancel: (() => void) | undefined;
-    const cancellation = new Promise<void>(resolve => { releaseCancel = resolve; });
+    const cancellation = caseFixture.track(new Promise<void>(resolve => { releaseCancel = resolve; }));
     globalThis.fetch = (async () => new Response(new ReadableStream({
       pull() { reads++; },
       cancel() {
@@ -178,7 +290,7 @@ describe("agent task recovery (opt-in, default off)", () => {
         pull(controller) {
           controller.enqueue(new Uint8Array([0xe2, 0x82]));
           started();
-          return new Promise<void>(() => {});
+          return caseFixture.track(new Promise<void>(resolve => { caseFixture.releaseOnClose(resolve); }));
         },
       }, { highWaterMark: 0 })));
       return new Promise<Response>((_resolve, reject) => {
@@ -749,6 +861,7 @@ describe("agent task recovery (opt-in, default off)", () => {
     }) as typeof fetch;
     const headers = codexHeaders("acct-flight", { "x-codex-parent-thread-id": "parent-flight" });
 
+    caseFixture.releaseOnClose(() => releaseRecovery?.());
     const first = post(routedConfig(), "xai/grok-4.5", encryptedInput(), headers);
     const second = post(routedConfig(), "xai/grok-4.5", encryptedInput(), headers);
     for (let turn = 0; turn < 200 && agentTaskRecoveryWaiterCountForTests() < 2; turn += 1) {
@@ -887,10 +1000,6 @@ describe("mid-thread encrypted agent task recovery (#4089)", () => {
     resetAgentTaskRecoveryState();
   });
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-    resetAgentTaskRecoveryState();
-  });
 
   /** A mid-thread model switch: same Codex caller, same credentials, no spawn markers. */
   const midThreadHeaders = (accountId = "acct-caller"): Headers => {
@@ -996,13 +1105,12 @@ describe("mid-thread encrypted agent task recovery (#4089)", () => {
 
 describe("bounded multipart encrypted task recovery", () => {
   beforeEach(() => resetAgentTaskRecoveryState());
-  afterEach(() => { globalThis.fetch = originalFetch; resetAgentTaskRecoveryState(); });
   const multipart = (tokens: string[] = [FERNET_TASK, SECOND_FERNET_TASK]) => agentMessage([
     { type: "input_text", text: ROUTING_ENVELOPE },
     ...tokens.map(encrypted_content => ({ type: "encrypted_content", encrypted_content })),
   ]);
 
-  test.each(["NEW_TASK", "MESSAGE"] as const)("recovers ordered %s parts in one request and isolates sequence caches", async messageType => {
+  test.each(["NEW_TASK", "MESSAGE", "FOLLOWUP_TASK"] as const)("recovers ordered %s parts in one request and isolates sequence caches", async messageType => {
     let sends = 0;
     const sent: Array<{ input: Array<{ content: Array<{ encrypted_content?: string }> }> }> = [];
     globalThis.fetch = (async (_url, init) => {
@@ -1078,6 +1186,7 @@ describe("bounded multipart encrypted task recovery", () => {
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve; });
     globalThis.fetch = (() => { started(); return new Promise<Response>(resolve => { release = resolve; }); }) as typeof fetch;
+    caseFixture.releaseOnClose(() => release(new Response(recoverySse("Abandoned mutation fixture."))));
     const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
     const input = multipart();
     const pending = recoverEncryptedAgentTaskWithResult(req, input, {}, routedConfig());
@@ -1125,4 +1234,287 @@ describe("bounded multipart encrypted task recovery", () => {
     expect(result).toEqual({ recovered: false, reason: "recovery_http_rejected" });
     expect(sends).toBe(1);
   });
+});
+
+describe("FINAL_ANSWER encrypted task recovery", () => {
+  beforeEach(() => resetAgentTaskRecoveryState());
+
+  test("recovers a FINAL_ANSWER without a Task name line and replays it from cache", async () => {
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse("Recovered final answer."));
+    }) as typeof fetch;
+    const input = () => agentMessage([
+      { type: "input_text", text: FINAL_ANSWER_ENVELOPE },
+      { type: "encrypted_content", encrypted_content: FERNET_TASK },
+    ]);
+    const typedInput = input();
+    expect(await recoverEncryptedAgentTaskWithResult(req, typedInput, {}, routedConfig())).toEqual({ recovered: true });
+    expect(typedInput).toEqual([{
+      type: "message", role: "user", content: [
+        { type: "input_text", text: FINAL_ANSWER_ENVELOPE },
+        { type: "input_text", text: "Recovered final answer." },
+      ],
+    }]);
+    expect(restoreCachedEncryptedAgentTasks(req, input(), routedConfig())).toBe(1);
+    expect(fetches).toBe(1);
+    discardEncryptedAgentTaskRecovery(req, input(), routedConfig());
+    expect(restoreCachedEncryptedAgentTasks(req, input(), routedConfig())).toBe(0);
+  });
+
+  test("does not share a cache entry when a NUL byte moves between recipient and sender", async () => {
+    // Both envelopes below carry the same admission scope, parent thread, message type, absent
+    // Task name and ciphertext, and their recipient/sender fields concatenate to the same bytes
+    // once a separator is placed between them. Moving where the NUL sits must not move the key.
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse("Recovered final answer."));
+    }) as typeof fetch;
+    const input = (recipient: string, sender: string) => [{
+      type: "agent_message",
+      author: sender,
+      recipient,
+      content: [
+        {
+          type: "input_text",
+          text: ["Message Type: FINAL_ANSWER", `Sender: ${sender}`, "Payload:", ""].join("\n"),
+        },
+        { type: "encrypted_content", encrypted_content: FERNET_TASK },
+      ],
+    }];
+    expect(await recoverEncryptedAgentTaskWithResult(req, input("r", "s\0t"), {}, routedConfig()))
+      .toEqual({ recovered: true });
+    expect(fetches).toBe(1);
+    // A different split of the same concatenation is a different envelope, not a cache hit.
+    expect(restoreCachedEncryptedAgentTasks(req, input("r\0s", "t"), routedConfig())).toBe(0);
+    // The envelope the cache was actually filled from still replays, so the line above is not
+    // passing because nothing was cached at all.
+    expect(restoreCachedEncryptedAgentTasks(req, input("r", "s\0t"), routedConfig())).toBe(1);
+  });
+
+  test("recovers a FINAL_ANSWER whose Task name matches the structured recipient", async () => {
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse("Recovered final answer."));
+    }) as typeof fetch;
+    const input = agentMessage([
+      { type: "input_text", text: FINAL_ANSWER_TASK_ENVELOPE },
+      { type: "encrypted_content", encrypted_content: FERNET_TASK },
+    ]);
+    expect(await recoverEncryptedAgentTaskWithResult(req, input, {}, routedConfig())).toEqual({ recovered: true });
+    expect(fetches).toBe(1);
+  });
+
+  test("accepts a FINAL_ANSWER assignment that echoes its own header", async () => {
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse(`${FINAL_ANSWER_ENVELOPE}Recovered final answer.`));
+    }) as typeof fetch;
+    const input = agentMessage([
+      { type: "input_text", text: FINAL_ANSWER_ENVELOPE },
+      { type: "encrypted_content", encrypted_content: FERNET_TASK },
+    ]);
+    expect(await recoverEncryptedAgentTaskWithResult(req, input, {}, routedConfig())).toEqual({ recovered: true });
+    expect(input).toEqual([{
+      type: "message", role: "user", content: [
+        { type: "input_text", text: FINAL_ANSWER_ENVELOPE },
+        { type: "input_text", text: "Recovered final answer." },
+      ],
+    }]);
+    expect(fetches).toBe(1);
+  });
+
+  test.each([
+    ["sender mismatch", () => [{
+      type: "agent_message",
+      author: "/other",
+      recipient: "/root/worker",
+      content: [
+        { type: "input_text", text: FINAL_ANSWER_ENVELOPE },
+        { type: "encrypted_content", encrypted_content: FERNET_TASK },
+      ],
+    }]],
+    ["recipient mismatch against the Task name line", () => agentMessage([
+      { type: "input_text", text: FINAL_ANSWER_TASK_ENVELOPE.replace("/root/worker", "/root/other-worker") },
+      { type: "encrypted_content", encrypted_content: FERNET_TASK },
+    ])],
+  ] as const)("refuses %s FINAL_ANSWER without a recovery dispatch", async (_label, makeInput) => {
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse("must not run"));
+    }) as typeof fetch;
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    const input = makeInput();
+    const before = structuredClone(input);
+    expect(await recoverEncryptedAgentTaskWithResult(req, input, {}, routedConfig())).toEqual({ recovered: false, reason: "unsupported_envelope" });
+    expect(input).toEqual(before);
+    expect(fetches).toBe(0);
+  });
+});
+
+describe("recovery refuses a wrong-family echoed routing header", () => {
+  beforeEach(() => resetAgentTaskRecoveryState());
+
+  const echoCases: Array<[string, string, string]> = [
+    ["FINAL_ANSWER envelope echoing a NEW_TASK header", FINAL_ANSWER_ENVELOPE, `${ROUTING_ENVELOPE}Recovered final answer.`],
+    ["FINAL_ANSWER envelope echoing a NEW_TASK header mid-assignment", FINAL_ANSWER_ENVELOPE, `Recovered final answer.\n\n${ROUTING_ENVELOPE}`],
+    ["FINAL_ANSWER echo followed by a NEW_TASK header", FINAL_ANSWER_ENVELOPE, `${FINAL_ANSWER_ENVELOPE}${ROUTING_ENVELOPE}Recovered final answer.`],
+    ["NEW_TASK envelope echoing a FINAL_ANSWER header", ROUTING_ENVELOPE, `${FINAL_ANSWER_ENVELOPE}Recovered final answer.`],
+    ["NEW_TASK echo followed by a FINAL_ANSWER header", ROUTING_ENVELOPE, `${ROUTING_ENVELOPE}${FINAL_ANSWER_ENVELOPE}Recovered task.`],
+    ["MESSAGE envelope echoing a FINAL_ANSWER header", ROUTING_ENVELOPE.replace("NEW_TASK", "MESSAGE"), `${FINAL_ANSWER_ENVELOPE}Recovered final answer.`],
+  ];
+
+  test.each(echoCases)("refuses %s", async (_label, envelopeText, assignment) => {
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(recoverySse(assignment));
+    }) as typeof fetch;
+    const req = new Request("http://localhost/v1/responses", { headers: codexHeaders() });
+    const input = agentMessage([
+      { type: "input_text", text: envelopeText },
+      { type: "encrypted_content", encrypted_content: FERNET_TASK },
+    ]);
+    const before = structuredClone(input);
+    expect(await recoverEncryptedAgentTaskWithResult(req, input, {}, routedConfig())).toEqual({ recovered: false, reason: "recovery_invalid_output" });
+    expect(input).toEqual(before);
+    expect(fetches).toBe(1);
+  });
+});
+
+describe("agent task recovery transient retry (#3661)", () => {
+  beforeEach(() => resetAgentTaskRecoveryState());
+
+  const req = () => caseFixture.request();
+
+  test.each([500, 502, 503, 504, 520] as const)("a transient %d refusal retries within the configured budget and recovers", async status => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return fetches === 1
+        ? new Response("private failure", { status })
+        : new Response(recoverySse("Recovered after outage."));
+    }) as typeof fetch);
+    const input = encryptedInput();
+    expect(await recoverEncryptedAgentTaskWithResult(req(), input, { retries: 1 }, routedConfig()))
+      .toEqual({ recovered: true });
+    expect(fetches).toBe(2);
+    expect((input[0] as { content: unknown[] }).content.at(-1))
+      .toEqual({ type: "input_text", text: "Recovered after outage." });
+  });
+
+  test.each([400, 401, 403, 404, 429] as const)("a %d refusal stays terminal under a configured retry budget", async status => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return new Response("private failure", { status });
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 2 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_http_rejected" });
+    expect(fetches).toBe(1);
+  });
+
+  test("persistent transient rejections exhaust the bounded retry budget", async () => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return new Response("private failure", { status: 503 });
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 2 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_http_rejected" });
+    expect(fetches).toBe(3); // 1 initial + 2 retries
+  });
+
+  test("an over-budget retries value is clamped to the same bound", async () => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return new Response("private failure", { status: 503 });
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 99 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_http_rejected" });
+    expect(fetches).toBe(3);
+  });
+
+  test("transport failures retry while invalid recovery output stays terminal", async () => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      if (fetches === 1) throw new TypeError("private transport failure");
+      return new Response("data: {not-json}\n\n");
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 2 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_invalid_output" });
+    expect(fetches).toBe(2);
+  });
+
+  test("persistent transport failures exhaust the same bounded budget", async () => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      throw new TypeError("private transport failure");
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 2 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_transport_error" });
+    expect(fetches).toBe(3);
+  });
+
+  test("caller cancellation during retry backoff reports caller_cancelled without another send", async () => {
+    const caller = new AbortController();
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return new Response("private failure", { status: 503 });
+    }) as typeof fetch);
+    const pending = recoverEncryptedAgentTaskWithResult(
+      req(), encryptedInput(), { retries: 2 }, routedConfig(), { abortSignal: caller.signal },
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    caller.abort();
+    expect(await pending).toEqual({ recovered: false, reason: "caller_cancelled" });
+    expect(fetches).toBe(1);
+  });
+
+  test("a Retry-After past the recovery deadline ends with the failure instead of resending early", async () => {
+    let fetches = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      return new Response("private failure", { status: 503, headers: { "retry-after": "30" } });
+    }) as typeof fetch);
+    const started = Date.now();
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 2, timeoutMs: 5_000 }, routedConfig()))
+      .toEqual({ recovered: false, reason: "recovery_http_rejected" });
+    // Before the fix the 30 s instruction was clamped to the 2 s backoff cap and resent.
+    expect(fetches).toBe(1);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a Retry-After inside the deadline is honoured as a floor, not capped", async () => {
+    let fetches = 0;
+    let firstAt = 0;
+    let secondAt = 0;
+    caseFixture.stub((async () => {
+      fetches += 1;
+      if (fetches === 1) {
+        firstAt = Date.now();
+        return new Response("private failure", { status: 503, headers: { "retry-after": "2.5" } });
+      }
+      secondAt = Date.now();
+      return new Response(recoverySse("Recovered after outage."));
+    }) as typeof fetch);
+    expect(await recoverEncryptedAgentTaskWithResult(req(), encryptedInput(), { retries: 1 }, routedConfig()))
+      .toEqual({ recovered: true });
+    expect(fetches).toBe(2);
+    // 2.5 s exceeds RECOVERY_RETRY_MAX_DELAY_MS (2 s), so a capped wait would resend sooner.
+    expect(secondAt - firstAt).toBeGreaterThanOrEqual(2_400);
+  }, 10_000);
 });

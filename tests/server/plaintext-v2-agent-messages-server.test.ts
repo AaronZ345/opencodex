@@ -1,6 +1,6 @@
 import { warnPlaintextV2AgentMessagesStartup } from "../../src/server";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
@@ -16,19 +16,35 @@ import { clearResponseStateForTests, expandPreviousResponseInput } from "../../s
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
+const originalWebSocket = globalThis.WebSocket;
 let releaseInheritedSpendHome: (() => void) | undefined;
+let previousCatalogStateOverride: string | undefined;
 // Taken per inherited-home dispatch because the pool retry row installs a different home. The
 // ??= keeps a second call inside one case idempotent rather than replacing the release callback
 // it would need; no row here calls it twice today, so this is defence, not a fixed regression.
 const takeInheritedSpendHome = (): void => { releaseInheritedSpendHome ??= acquireOwnedSpendHome(); };
-beforeEach(() => { clearResponseStateForTests(); });
+beforeEach(() => {
+  // These fixtures own HTTP responses; a WebSocket upgrade must never contact a real provider.
+  globalThis.WebSocket = class {
+    constructor() { throw new Error("unexpected WebSocket in HTTP response fixture"); }
+  } as unknown as typeof WebSocket;
+  previousCatalogStateOverride = process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE;
+  // Response rewriting is independent of the host's running Codex processes. Without
+  // this fixture, V2 guidance enumerates real Windows processes and can outlive a case.
+  process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE = "fresh";
+  clearResponseStateForTests();
+});
 afterEach(() => {
+  if (previousCatalogStateOverride === undefined) delete process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE;
+  else process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE = previousCatalogStateOverride;
   // Released first so a failed row cannot leak its writer lease into the next case.
   releaseInheritedSpendHome?.();
   releaseInheritedSpendHome = undefined;
   globalThis.fetch = originalFetch;
+  globalThis.WebSocket = originalWebSocket;
   clearResponseStateForTests();
 });
 
@@ -36,6 +52,7 @@ function config(
   enabled: boolean,
   snapshotRepair = false,
   streamMode?: "auto" | "legacy-tee" | "eager-relay",
+  stallTimeoutSec?: number,
 ): OcxConfig {
   return {
     defaultProvider: "native",
@@ -44,11 +61,13 @@ function config(
         adapter: "openai-responses",
         baseUrl: CODEX_FORWARD_BASE_URL,
         authMode: "forward",
+        upstreamWebsocket: false,
         ...(snapshotRepair ? { responsesSnapshotRepair: true } : {}),
       },
     },
     plaintextV2AgentMessages: enabled,
     ...(streamMode ? { streamMode } : {}),
+    ...(stallTimeoutSec ? { stallTimeoutSec } : {}),
   } as OcxConfig;
 }
 
@@ -111,7 +130,7 @@ async function withPoolHome<T>(run: () => Promise<T>): Promise<T> {
     clearCodexUpstreamHealth();
     clearThreadAccountMap();
     clearAccountQuota();
-    rmSync(home, { recursive: true, force: true });
+    removeTreeWithRetry(home);
     if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousOpencodexHome;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -221,6 +240,31 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
     expect(clientBody).toContain('"encrypted_function_args":[]');
   });
 
+  test("rewrites a Responses Lite default catalog and restores its delegated call", async () => {
+    takeInheritedSpendHome();
+    let sent: Record<string, any> | undefined;
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify(completedResponsePayload()), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const { tools, ...body } = await collaborationRequest().json() as Record<string, any>;
+    body.input.unshift({ type: "additional_tools", role: "developer", tools });
+    const request = new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    const response = await handleResponses(request, config(true), { model: "", provider: "" });
+    expect(response.status).toBe(200);
+    expect(sent?.tools).toBeUndefined();
+    expect(sent?.input[0].tools[0].name).toBe(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
+    expect(sent?.input[0].tools[0].tools[0].parameters.properties.message.encrypted).toBeUndefined();
+    const result = await response.json() as { output: Array<Record<string, unknown>> };
+    expect(result.output[0]!.namespace).toBe("collaboration");
+    expect(result.output[0]!.name).toBe("spawn_agent");
+    expect(result.output[0]!.encrypted_function_args).toEqual([]);
+  });
+
   test("restores the namespace in bounded JSON responses", async () => {
     takeInheritedSpendHome();
     globalThis.fetch = (async () => new Response(JSON.stringify(completedResponsePayload()), {
@@ -238,6 +282,222 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
     expect(clientBody).not.toContain(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
     expect(clientBody).toContain('"namespace":"collaboration"');
     expect(clientBody).toContain('"encrypted_function_args":[]');
+  });
+
+  test.each(["missing", "text/plain"] as const)(
+    "restores plaintext V2 calls from valid SSE with %s upstream content type",
+    async contentType => {
+      takeInheritedSpendHome();
+      const payload = completedResponsePayload(`resp-plaintext-v2-${contentType}`);
+      const wire = `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: payload })}\n\ndata: [DONE]\n\n`;
+      globalThis.fetch = (async () => new Response(new TextEncoder().encode(wire), {
+        status: 200,
+        ...(contentType === "missing" ? {} : { headers: { "content-type": contentType } }),
+      })) as typeof fetch;
+
+      const response = await handleResponses(collaborationRequest(), config(true), { model: "", provider: "" });
+      const clientBody = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      expect(clientBody).toContain('"namespace":"collaboration"');
+      expect(clientBody).toContain('"name":"spawn_agent"');
+      expect(clientBody).not.toContain(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
+      expect(clientBody).not.toContain('"name":"start_delegated_task"');
+      const replay = expandPreviousResponseInput({ previous_response_id: payload.id, input: [] }) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(replay.input.find(value => value.type === "function_call"))
+        .toMatchObject({ namespace: "collaboration", name: "spawn_agent" });
+    },
+  );
+
+  test("bounds the headerless prefix probe when the upstream body produces no chunk", async () => {
+    takeInheritedSpendHome();
+    jest.useFakeTimers();
+    const firstRead = Promise.withResolvers<void>();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let cancels = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; },
+      pull() { firstRead.resolve(); },
+      cancel: () => { cancels += 1; },
+    }, { highWaterMark: 0 });
+    globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    let settled = false;
+    const pending = handleResponses(
+      collaborationRequest(),
+      config(true, false, undefined, 1),
+      { model: "", provider: "" },
+    ).then(response => { settled = true; return response; });
+    try {
+      // Anchor to the probe's read, not dispatch latency under a busy CI runner.
+      // Checking both sides of the deadline also rejects premature cancellation.
+      await firstRead.promise;
+      jest.advanceTimersByTime(999);
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(cancels).toBe(0);
+      jest.advanceTimersByTime(1);
+      const response = await pending;
+      expect(response.status).toBe(502);
+      expect(await response.text()).toContain("unsupported content type");
+      expect(cancels).toBe(1);
+    } finally {
+      try {
+        if (cancels === 0) controller.close();
+        await pending;
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  test("fails closed when the headerless prefix probe reads a failed body", async () => {
+    takeInheritedSpendHome();
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.error(new Error("upstream body read failed")); },
+    }), { status: 200 })) as typeof fetch;
+
+    const response = await handleResponses(
+      collaborationRequest(),
+      config(true, false, undefined, 1),
+      { model: "", provider: "" },
+    );
+    const clientBody = await response.text();
+
+    expect(response.status).toBe(502);
+    expect(clientBody).toContain("unsupported content type");
+  });
+
+  test("drops the prefix probe deadline once the body is recognized as SSE", async () => {
+    takeInheritedSpendHome();
+    const payload = completedResponsePayload("resp-plaintext-v2-slow-tail");
+    const item = payload.output[0]!;
+    const encoder = new TextEncoder();
+    // Chunk 1 classifies the body at once; every later chunk is a separate event, so the terminal
+    // is the last one and the tail lands after the probe's own one-second budget has passed.
+    const chunks = [
+      `event: response.output_item.added\ndata: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item,
+      })}\n\n`,
+      `event: response.function_call_arguments.done\ndata: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc-spawn",
+        namespace: PLAINTEXT_V2_COLLABORATION_NAMESPACE,
+        name: `${PLAINTEXT_V2_COLLABORATION_NAMESPACE}__start_delegated_task`,
+        arguments: JSON.stringify({ message: "plain assignment" }),
+        encrypted_function_args: [],
+      })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({
+        type: "response.completed",
+        response: payload,
+      })}\n\ndata: [DONE]\n\n`,
+    ];
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(chunks[0]!));
+        const later = (index: number): void => {
+          timers.push(setTimeout(() => {
+            controller.enqueue(encoder.encode(chunks[index]!));
+            if (index + 1 < chunks.length) later(index + 1);
+            else controller.close();
+          }, 700));
+        };
+        later(1);
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const started = performance.now();
+    try {
+      const response = await handleResponses(
+        collaborationRequest(),
+        config(true, false, undefined, 1),
+        { model: "", provider: "" },
+      );
+      const clientBody = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      expect(clientBody).toContain("data: [DONE]");
+      expect(clientBody).toContain('"namespace":"collaboration"');
+      expect(clientBody).toContain('"name":"spawn_agent"');
+      expect(clientBody).not.toContain(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
+      expect(performance.now() - started).toBeGreaterThan(1_000);
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+    }
+  });
+
+  test("fails closed when a headerless body drip-feeds bytes that never classify", async () => {
+    takeInheritedSpendHome();
+    jest.useFakeTimers();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let nextRead = Promise.withResolvers<void>();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; },
+      pull() { nextRead.resolve(); },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    let settled = false;
+    const pending = handleResponses(
+      collaborationRequest(), config(true, false, undefined, 1), { model: "", provider: "" },
+    ).then(response => { settled = true; return response; });
+    try {
+      // highWaterMark 0 anchors time to the probe's first read, not fetch or stream creation.
+      await nextRead.promise;
+      for (let byte = 0; byte < 3; byte++) {
+        jest.advanceTimersByTime(300);
+        nextRead = Promise.withResolvers<void>();
+        controller.enqueue(new TextEncoder().encode("x"));
+        // The next pull acknowledges consumption and renewal of the inactivity window.
+        await nextRead.promise;
+      }
+      jest.advanceTimersByTime(99);
+      // Drain pending microtasks so a premature settlement at 999 ms would be observed.
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(cancelled).toBe(false);
+      jest.advanceTimersByTime(1);
+      const response = await pending;
+      // The probe cancels the upstream before it answers, so cancellation is settled here.
+      expect(cancelled).toBe(true);
+      expect(response.status).toBe(502);
+      expect(await response.text()).toContain("unsupported content type");
+    } finally {
+      try {
+        if (!cancelled) controller.close();
+        await pending;
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  test("recognizes a headerless SSE event split across upstream chunks", async () => {
+    takeInheritedSpendHome();
+    const payload = completedResponsePayload("resp-plaintext-v2-split");
+    const wire = `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: payload })}\n\ndata: [DONE]\n\n`;
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(wire.slice(0, 12)));
+        controller.enqueue(new TextEncoder().encode(wire.slice(12)));
+        controller.close();
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const response = await handleResponses(collaborationRequest(), config(true), { model: "", provider: "" });
+    const clientBody = await response.text();
+    expect(response.status).toBe(200);
+    expect(clientBody).toContain('"name":"spawn_agent"');
+    expect(clientBody).not.toContain(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
   });
 
   test("rejects an unclassified successful response while restoration is required", async () => {
@@ -387,6 +647,7 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
             baseUrl: CODEX_FORWARD_BASE_URL,
             authMode: "forward",
             codexAccountMode: "pool",
+            upstreamWebsocket: false,
           },
         },
         codexAccounts: ["pool-a", "pool-b"].map(id => ({

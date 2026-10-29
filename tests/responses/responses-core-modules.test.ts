@@ -77,22 +77,28 @@ describe("Responses core module boundaries", () => {
   });
 
   test("lease transfer retains both finally owners until response construction settles", () => {
-    const ingress = readResponsesCoreModule("core.ts");
+    const ingress = readResponsesCoreModule("core-pipeline.ts");
     const native = readResponsesCoreModule("passthrough-execution.ts");
-    expect(ingress).toContain("return await executePassthroughResponse(");
-    // Delivery is awaited inside the try, and its direct body is wrapped before
-    // the return. What matters is that both awaits stay inside the lease owner,
-    // not that the delivery call is itself the return expression.
+    expect(ingress).toContain("const passthroughResult = await executePassthroughResponse(");
+    expect(ingress).toContain("if (passthroughResult instanceof Response) return passthroughResult;");
+    expect(ingress).toContain("sendBudgetState.pendingHopPermit === unclaimedHop");
+    expect(ingress.indexOf("await executePassthroughResponse("))
+      .toBeLessThan(ingress.indexOf("const sidecarPlans = await executeResponsesSidecars("));
+    expect(native).toContain('if (nativeExchange instanceof Response || nativeExchange.kind === "adapter-handoff") return nativeExchange;');
+    // Delivery is awaited inside the try, and its direct body is wrapped with
+    // tool ownership before return. Both awaits must stay inside the lease owner;
+    // the delivery call itself need not be the return expression.
     expect(native).toContain("const response = await deliverPassthroughResponse(");
-    expect(native).toContain("return guardDirectPassthroughBodyInactivity(");
+    const guardedReturn = "return attachResponseToolOwnership(guardDirectPassthroughBodyInactivity(";
+    expect(native).toContain(guardedReturn);
     expect(native.indexOf("await deliverPassthroughResponse("))
-      .toBeLessThan(native.indexOf("return guardDirectPassthroughBodyInactivity("));
-    expect(native.indexOf("return guardDirectPassthroughBodyInactivity("))
+      .toBeLessThan(native.indexOf(guardedReturn));
+    expect(native.indexOf(guardedReturn))
       .toBeLessThan(native.indexOf("} finally {"));
     expect(native.indexOf("admissionState.pendingHostAdmissionLease = null;"))
       .toBeLessThan(native.indexOf("await preparePassthroughExchange("));
     expect(native).toMatch(/finally\s*\{\s*if \(nativeHostState\.lease\)\s*\{\s*releaseUpstreamHostAdmission\(nativeHostState\.lease\);\s*releaseCodexAuthContextProbeLease\(admissionState\.authCtx\);/);
-    expect(ingress).toMatch(/finally\s*\{\s*if \(admissionState\.pendingHostAdmissionLease\)/);
+    expect(ingress).toMatch(/finally\s*\{\s*releasePendingSend\(\);\s*if \(admissionState\.pendingHostAdmissionLease\)/);
   });
 
   test("local admission decisions cannot shadow the outer lease owner", () => {
@@ -161,7 +167,7 @@ describe("Responses request-owned send budget after extraction", () => {
       expect(owner.pendingHopPermit).toBeUndefined();
       expect(hop.permit.use()).toBe(true);
       expect(hop.permit.use()).toBe(false);
-      owner.noteTransientSends(1);
+      owner.transientSendReporter(allowance.permit)(1);
       expect(holder.used).toBe(4);
       expect(owner.remainingTransientSendBudget(3)).toBe(0);
     } finally { dispose(); }

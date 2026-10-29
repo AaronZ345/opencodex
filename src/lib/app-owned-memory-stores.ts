@@ -54,6 +54,7 @@ import { translatorObservedBufferSnapshot } from "./translator-budget";
 import { imageFulfillmentTailSnapshot } from "../images/fulfill";
 import { oauthMutationTailSnapshot } from "../oauth/store";
 import { grokApplyFlightSnapshot } from "../server/management/agent-settings-routes";
+import { nativeControlReplayRetainedStoreSnapshot } from "../server/responses/native-steering-replay";
 
 function ringSnapshot(metrics: { entries: number; bytes: number; oldestAt: number | null }): RetainedStoreSnapshot {
   return {
@@ -168,12 +169,16 @@ export const APP_OWNED_RETAINED_STORE_REGISTRATIONS = [
     category: "caches",
     snapshot: usageSummaryRetainedStoreSnapshot,
     evictOldest: evictOldestUsageSummaryForBudget,
+    // Deletes one in-memory summary entry.
+    passiveEvictable: true,
   },
   {
     id: "usage_snapshot",
     category: "caches",
     snapshot: usageSnapshotRetainedStoreSnapshot,
     evictOldest: evictOldestUsageSnapshot,
+    // Drops the retained ledger snapshot or one unpinned aggregate, both in memory.
+    passiveEvictable: true,
   },
   {
     id: "cursor_blobs",
@@ -186,6 +191,12 @@ export const APP_OWNED_RETAINED_STORE_REGISTRATIONS = [
     category: "continuation",
     snapshot: responseContinuationRetainedStoreSnapshot,
     evictOldest: evictOldestResponseContinuationForBudget,
+  },
+  {
+    id: "native_control_replay",
+    category: "continuation",
+    snapshot: nativeControlReplayRetainedStoreSnapshot,
+    evictOldest: () => 0,
   },
 ] as const satisfies readonly RetainedStoreRegistration[];
 

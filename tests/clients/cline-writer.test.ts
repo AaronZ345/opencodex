@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { clineConfigPath } from "../../src/clients/config-export";
@@ -138,6 +138,33 @@ describe("Cline journaled pair", () => {
     expect(refused.ok).toBe(false);
     expect(readFileSync(settings, "utf8")).toBe(originalSettings);
     expect(readFileSync(catalog, "utf8")).toBe(originalCatalog);
+  });
+
+  // Skipped on Windows with the other symlink regressions: link creation needs
+  // a privilege the hosted runners do not grant, and the boundary under test is
+  // the platform-independent lstat-plus-rename path in the shared writer.
+  test.skipIf(process.platform === "win32")("a member exchanged for a symlink at the write boundary cannot redirect replacement", () => {
+    seed();
+    const victim = join(root, "victim.json");
+    const displaced = `${settings}.attacker-saved`;
+    writeFileSync(victim, '{"sentinel":true}');
+    const io = input.store!.io();
+    let exchanged = false;
+    const result = applyIntegration({ ...input, io: {
+      ...io,
+      writeText: (path, text) => {
+        if (path === settings && !exchanged) {
+          exchanged = true;
+          renameSync(settings, displaced);
+          symlinkSync(victim, settings);
+        }
+        io.writeText(path, text);
+      },
+    } });
+    expect(result.ok).toBe(false);
+    expect(readFileSync(victim, "utf8")).toBe('{"sentinel":true}');
+    expect(lstatSync(settings).isSymbolicLink()).toBe(true);
+    expect(readFileSync(displaced, "utf8")).toBe(originalSettings);
   });
 
   test("occupied custom provider requires explicit overwrite and remains reversible", () => {
@@ -326,5 +353,31 @@ describe("Cline journaled pair", () => {
     if (result.kind !== "text") throw new Error("pair missing");
     expect(decodeClinePair(result.text)).toEqual({ settings: originalSettings, catalog: originalCatalog });
     expect(adapter.statKind(dirname(settings))).toBe("dir");
+  });
+
+  test("a transaction journal past the read bound refuses before either file moves", () => {
+    /*
+     * The pending marker embeds the before-and-after pair, so a pair near the
+     * bound serializes past it. beginTransaction must refuse: writing the
+     * marker would leave a pending file recovery itself could never read
+     * back, stranding every later Cline operation behind an unreadable
+     * transaction.
+     */
+    const pad = "x".repeat(3 * 1024 * 1024);
+    const seeded = `{"pad":"${pad}","version":1,"providers":{"mine":{"settings":{"provider":"mine"},"updatedAt":"2026-01-01T00:00:00.000Z","tokenSource":"manual"}}}\n`;
+    writeFileSync(settings, seeded);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = applyIntegration(input);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("write_failed");
+        expect(result.snapshotPath).toBeUndefined();
+      }
+      expect(input.store!.countSnapshots("cline")).toBe(0);
+      expect(input.store!.listOperations("cline")).toEqual([]);
+    }
+    expect(readFileSync(settings, "utf8")).toBe(seeded);
+    expect(existsSync(catalog)).toBe(false);
+    expect(existsSync(clinePendingPath(input.store!, settings))).toBe(false);
   });
 });

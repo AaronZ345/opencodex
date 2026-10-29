@@ -1,3 +1,4 @@
+import { isApprovedCodexProviderUrl } from "../provider-routing";
 import { existsSync, readFileSync } from "node:fs";
 import {
   hasInjectedCodexRouting,
@@ -11,7 +12,7 @@ import { CODEX_CONFIG_PATH } from "../paths";
 export type CodexRoutingKind =
   "native" | "opencodex-local" | "custom-local" | "custom-remote" | "unknown";
 
-type RoutingEndpointKind = "local" | "remote" | "unknown";
+export type RoutingEndpointKind = "local" | "remote" | "unknown";
 
 function ipv4Octets(hostname: string): number[] | null {
   const dotted = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
@@ -26,7 +27,8 @@ function ipv4Octets(hostname: string): number[] | null {
   return [high >>> 8, high & 0xff, low >>> 8, low & 0xff];
 }
 
-function classifyRoutingEndpoint(value: string): RoutingEndpointKind {
+/** The one loopback rule for routing URLs; the drift detector (`routing-drift.ts`) shares it. */
+export function classifyRoutingEndpoint(value: string): RoutingEndpointKind {
   try {
     const url = new URL(value);
     if (url.protocol !== "http:" && url.protocol !== "https:") return "unknown";
@@ -53,7 +55,7 @@ function classifyRoutingEndpoint(value: string): RoutingEndpointKind {
 }
 
 /** Classify actual routing dependency separately from opencodex ownership. */
-export function classifyCodexRouting(content: string): CodexRoutingKind {
+export function classifyCodexRouting(content: string, approvedProviderUrl?: (id: string, url: string) => boolean): CodexRoutingKind {
   const rootBaseUrl = rootTomlString(content, "openai_base_url");
   if (rootBaseUrl) {
     const endpoint = classifyRoutingEndpoint(rootBaseUrl);
@@ -73,7 +75,7 @@ export function classifyCodexRouting(content: string): CodexRoutingKind {
     if (providerBaseUrl) {
       const endpoint = classifyRoutingEndpoint(providerBaseUrl);
       if (endpoint === "unknown") return "unknown";
-      if (rootProvider === "opencodex") return "opencodex-local";
+      if (rootProvider === "opencodex" || endpoint === "local" && approvedProviderUrl?.(rootProvider, providerBaseUrl)) return "opencodex-local";
       return endpoint === "local" ? "custom-local" : "custom-remote";
     }
     if (
@@ -101,7 +103,7 @@ export function getCodexRoutingKind(): CodexRoutingKind {
   const path = CODEX_CONFIG_PATH;
   if (!existsSync(path)) return "native";
   try {
-    return classifyCodexRouting(readFileSync(path, "utf8"));
+    return classifyCodexRouting(readFileSync(path, "utf8"), isApprovedCodexProviderUrl);
   } catch {
     return "unknown";
   }

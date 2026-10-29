@@ -17,6 +17,8 @@ import {
   shadowCallModelOptions,
   webSearchSidecarSelectionForModel,
   updateJobLabel,
+  webSearchEnabledPatch,
+  sidecarCodexWritePending,
   visionEnabledPatch,
   visionMaxDescriptionsPatch,
   visionReasoningLadder,
@@ -29,7 +31,8 @@ import {
   VISION_TIMEOUT_MS_MAX,
   VISION_TIMEOUT_MS_MIN,
 } from "./dashboard-shared";
-import { shadowSourceModelBadge } from "./shadow-call-source";
+import { shadowBackgroundModelBadge } from "./shadow-call-source";
+import { ShadowCallSourceToggles } from "./shadow-call-source-toggles";
 import type { useDashboardData } from "./use-dashboard-data";
 
 type Dash = ReturnType<typeof useDashboardData>;
@@ -441,10 +444,18 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
     t, settings, settingsSaving, syncing, toggleCodexAutoStart, toggleCodexDesktopAuthless,
     toggleCodexClientCompaction,
     sidecar, sidecarSaving, sidecarModels, visionModels, models, saveSidecar,
-    shadowCall, shadowCallSaving, shadowCallHelpTriggerRef, shadowCallHelpOpen, setShadowCallHelpOpen, saveShadowCall,
+    sidecarCodexApply,
+    shadowCall, shadowCallSaving, shadowCallError, shadowCallHelpTriggerRef, shadowCallHelpOpen, setShadowCallHelpOpen, saveShadowCall,
   } = d;
+  const shadowMemoryLabel = t("shadowCall.memoryLabel");
   const visionEnabled = sidecar?.vision?.enabled !== false;
   const visionModel = visionEnabled ? (sidecar?.vision?.model ?? "gpt-5.6-luna") : "";
+  const visionBackend = sidecar?.vision.backend ?? visionModels.find(option => option.value === sidecar?.vision.model)?.backend;
+  // Same derivation as Vision: a stored setting without a backend takes the picker option's backend.
+  const webSearchBackend = sidecar?.webSearch.backend ?? sidecarModels.find(option => option.value === sidecar?.webSearch.model)?.backend;
+  const webSearchEnabled = sidecar?.webSearch?.enabled !== false;
+  // Same shape as the Vision card: Off is a row in the picker, and choosing a model is the way back.
+  const webSearchModel = webSearchEnabled ? (sidecar?.webSearch?.model ?? "gpt-5.6-luna") : "";
   const persistedVisionReasoning = sidecar?.vision?.reasoning ?? "low";
   const visionLadder = visionReasoningLadder(models, visionModel);
   const visionReasoning = clampVisionReasoningToLadder(visionLadder, persistedVisionReasoning);
@@ -511,6 +522,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="font-semibold">{t("dash.codexDesktopAuthless")}</div>
             <div className="muted setting-hint">{t("dash.codexDesktopAuthlessHint")}</div>
+            {settings?.codexDesktopAuthless && <div className="muted setting-hint">{t("dash.codexRemoteHistoryHint")}</div>}
             {settings?.catalogRefreshPending && <div className="muted setting-hint" role="status">{t("codexAuth.catalogRefreshPending")}</div>}
           </div>
           <button
@@ -531,6 +543,9 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="font-semibold">{t("dash.codexClientCompaction")}</div>
             <div className="muted setting-hint">{t("dash.codexClientCompactionHint")}</div>
+            {!settings?.codexDesktopAuthless && settings?.codexClientCompaction && (
+              <div className="muted setting-hint">{t("dash.codexRemoteHistoryHint")}</div>
+            )}
             {settings?.catalogRefreshPending && <div className="muted setting-hint" role="status">{t("codexAuth.catalogRefreshPending")}</div>}
           </div>
           <button
@@ -553,6 +568,15 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div className="dash-sidecar-copy">
             <div className="font-semibold">{t("dash.webSearchSidecar")}</div>
             <div className="muted setting-hint">{t("dash.webSearchSidecarHint")}</div>
+            {/* The switch is stored even when Codex's own key was not rewritten. Saying nothing
+                here would read as "the native tool is off now", which is exactly the state the
+                operator asked for and may not have. */}
+            {sidecarCodexWritePending(sidecarCodexApply) && (
+              <div className="notice-warn" role="status">
+                <IconAlert />
+                <span>{t("dash.webSearchCodexSync")}</span>
+              </div>
+            )}
           </div>
           {/* Same two-row shape as the vision card: the model select owns the first row,
               and the secondary control sits right-aligned on its own row below. Sharing the
@@ -561,16 +585,38 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div className="dash-delegation-controls">
             <div className="dash-sidecar-select-row">
               <Select
-                value={sidecar?.webSearch?.model ?? "gpt-5.6-luna"}
-                options={sidecarModels}
+                value={webSearchModel}
+                options={[{ value: "", label: t("dash.webSearchOff") }, ...sidecarModels]}
                 onChange={model => {
-                  void saveSidecar({ webSearch: webSearchSidecarSelectionForModel(models, sidecarModels, model) });
+                  if (model === "") {
+                    void saveSidecar(webSearchEnabledPatch(false));
+                    return;
+                  }
+                  const patch: SidecarPatch = { webSearch: webSearchSidecarSelectionForModel(models, sidecarModels, model) };
+                  // Choosing a model is the activation control: turning the sidecar back on from Off.
+                  if (!webSearchEnabled) patch.webSearch = { ...patch.webSearch, enabled: true };
+                  void saveSidecar(patch);
                 }}
                 disabled={!sidecar || sidecarSaving}
                 label={t("dash.sidecarModel")}
                 align="right"
               />
             </div>
+            {sidecar && webSearchBackend === "anthropic" && (
+              <div className="dash-sidecar-trailing-row">
+                <Select value={sidecar.webSearch.anthropicInstance ?? ""} label={t("sidecar.pool")}
+                  options={[
+                    { value: "", label: t("sidecar.poolCurrent") },
+                    { value: "anthropic", label: t("sidecar.poolA") },
+                    { value: "anthropic2", label: t("sidecar.poolB") },
+                  ]}
+                  disabled={sidecarSaving} align="right"
+                  onChange={value => { void saveSidecar({ webSearch: {
+                    anthropicInstance: value === "anthropic" || value === "anthropic2" ? value : null,
+                  } }); }} />
+                {sidecar.webSearch.anthropicPool?.mixed && <span className="muted setting-hint">{t("sidecar.poolMixed")}</span>}
+              </div>
+            )}
             <div className="dash-sidecar-trailing-row" title={t("dash.webSearchStreamHint")}>
               <span className="muted setting-hint dash-sidecar-toggle-label">{t("dash.webSearchStream")}</span>
               <button
@@ -579,7 +625,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
                 onClick={() => {
                   void saveSidecar({ webSearch: { streamRoutedModelOutput: !sidecar?.webSearch?.streamRoutedModelOutput } });
                 }}
-                disabled={!sidecar || sidecarSaving}
+                disabled={!webSearchEnabled || !sidecar || sidecarSaving}
                 aria-label={t("dash.webSearchStream")}
                 aria-pressed={sidecar?.webSearch?.streamRoutedModelOutput === true}
               >
@@ -627,6 +673,21 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
                 label={`${t("dash.visionSidecar")} — ${t("dash.injectionEffortLabel")}`}
               />
             </div>
+            {sidecar && visionBackend === "anthropic" && (
+              <div className="dash-sidecar-trailing-row">
+                <Select value={sidecar.vision.anthropicInstance ?? ""} label={t("sidecar.pool")}
+                  options={[
+                    { value: "", label: t("sidecar.poolCurrent") },
+                    { value: "anthropic", label: t("sidecar.poolA") },
+                    { value: "anthropic2", label: t("sidecar.poolB") },
+                  ]}
+                  disabled={sidecarSaving} align="right"
+                  onChange={value => { void saveSidecar({ vision: {
+                    anthropicInstance: value === "anthropic" || value === "anthropic2" ? value : null,
+                  } }); }} />
+                {sidecar.vision.anthropicPool?.mixed && <span className="muted setting-hint">{t("sidecar.poolMixed")}</span>}
+              </div>
+            )}
             <div className="dash-sidecar-trailing-row">
               <button
                 type="button"
@@ -683,7 +744,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             >
               <IconInfo width={13} height={13} aria-hidden="true" />
             </button>
-            <code className="muted text-caption">{`⚠ ${shadowSourceModelBadge(shadowCall?.sourceModels)}`}</code>
+            <code className="muted text-caption">{`⚠ ${shadowBackgroundModelBadge(shadowCall?.sourceModels, shadowMemoryLabel)}`}</code>
           </div>
           <div className="setting-controls dash-shadow-controls">
             <button
@@ -706,6 +767,19 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             />
           </div>
         </div>
+        <ShadowCallSourceToggles
+          className="dash-shadow-sources"
+          options={shadowCall?.sourceModelOptions}
+          sourceModels={shadowCall?.sourceModels}
+          disabled={!shadowCall?.enabled}
+          saving={shadowCallSaving}
+          onChange={sourceModels => void saveShadowCall({ sourceModels })}
+        />
+        {shadowCallError && (
+          <div className="notice notice-err" role="alert" style={{ marginTop: 8 }}>
+            <IconAlert /><span>{shadowCallError}</span>
+          </div>
+        )}
       </div>
     </>
   );

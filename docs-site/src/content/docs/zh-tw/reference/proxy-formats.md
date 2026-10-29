@@ -18,6 +18,25 @@ Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯�
 
 攜帶憑證的模型、圖片、影片和搜尋請求不會自動跟隨 HTTP 重新導向，包括同源重新導向。請設定最終上游 API URL，而非會重新導向的別名。伺服器不會向重新導向目標再次傳送憑證或請求內文。各回應處理路徑保留原有的錯誤處理或轉送行為；原生 Responses 和 compact 路徑仍可向用戶端回傳原始 3xx 與 `Location`。用戶端的重新導向行為與此伺服器傳輸政策屬於不同邊界。
 
+## xAI policy refusals
+
+部分 xAI Chat Completions 拒絕不是以 HTTP 200 加 `finish_reason: content_filter` 回傳，而是以 HTTP 403 加上一句完全相符的拒絕語句（例如 `I can't help with that request.`）回傳。Codex 把 403 視為傳輸失敗，因此使用者回合不會被記錄，同一個請求會被重送。
+
+在非 combo 的 Responses 請求上，OpenCodex 會把這種在允許清單中的 403 改寫為 HTTP 200 的 Responses 內容，帶有 `status: "incomplete"` 與 `incomplete_details.reason: "content_filter"`。改寫同時作用於 openai-chat 轉接器路徑與 openai-responses 直通（grok-4.6 / grok-4.5 OAuth）。串流使用相同的 incomplete 邊界。空白的 403 本文仍是錯誤。訂閱、點數、權限與 `not allowed to use this model` 的 403 仍是錯誤。Combo failover 仍看到原始的 HTTP 403。
+
+## 未宣告的工具呼叫
+
+在 Responses 端點上，當請求宣告了工具目錄時，原生直通回應若呼叫目錄之外由用戶端執行的工具，本回合會失敗而不會轉送該呼叫：串流回應傳送帶有錯誤碼 `undeclared_tool_call` 的 `response.failed` 事件，接著傳送 `data: [DONE]`；緩衝式 JSON 傳回 HTTP 502 與相同錯誤碼。拒絕發生在回應進入延續狀態之前。只有 `authMode: "forward"` 供應商或未宣告目錄的請求才略過這項拒絕。
+
+Chat Completions 與 Messages 端點支援延後提供的工具目錄：用戶端可先宣告部分目錄，再透過自己的工具登錄表於執行期間探索其餘工具；完整宣告邊界由用戶端登錄表決定，而非轉譯後的目錄快照。目錄之外的呼叫會轉送給用戶端驗證；但針對明確空目錄 `tools: []` 的呼叫仍會被拒絕。這些拒絕在每種協定中都保留 `undeclared_tool_call`：
+
+- **Chat Completions：**傳送包含帶有該錯誤碼的 OpenAI 格式 `error` 物件的 `data:` frame，然後關閉串流，不傳送成功完成訊號或 `[DONE]`；緩衝式 JSON 傳回 HTTP 502 與該錯誤碼。
+- **Messages：**傳送 Anthropic `event: error` frame，內文為 `{ "type": "error", "error": { "type": "api_error", "code": "undeclared_tool_call", ... } }`，不傳送成功的 `message_stop` 或 `[DONE]`；緩衝式 JSON 傳回 HTTP 502 `api_error` 與該錯誤碼。確定性的目錄違規不會被回報為可重試的 `overloaded_error`（HTTP 529）。
+
+此外，在所有輸入協定中，供應商回傳的 `default.` 命名空間呼叫都會正規化為用戶端宣告的裸名稱，即使延後目錄規則停用了上述拒絕檢查。
+
+原生 Messages 也會辨識與 `tools: []` 一同提供的系統訊息行內工具定義。這些名稱在被永久移除前仍可呼叫，但不會授權其他用戶端工具。託管 MCP 呼叫和伺服器工具的參數串流保留原生格式。
+
 ## 端點概覽
 
 | 客戶端介面 | 端點 | 成功的非串流結果 | 成功的串流或 socket 結果 |
@@ -56,6 +75,13 @@ Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯�
 在 `stream: true` 時，回應為 `text/event-stream`。橋接發出 Responses 事件如 `response.created`、output-item 與 text/tool delta，以及恰好一個終端 `response.completed`、`response.failed` 或 `response.incomplete` 事件。正常串流以 `data: [DONE]` 結束。
 
 在 `stream: false` 或無 `stream` 時，相同的 adapter 事件被收集為一個 Responses JSON 物件。兩種形式都保留所選模型、輸出項目、終端狀態與 usage。
+
+canonical ChatGPT Codex 路由的上游只接受 SSE，因此僅對上游請求使用 `stream: true`。OpenCodex
+會在有界限制內驗證終端串流，再將其折疊成客戶端要求的 JSON 形式；明確的 `store` 值不會改變。
+驗證失敗時會傳回錯誤，而不會以 HTTP 200 傳回部分 JSON。限制為每個 frame 4 MiB、transcript
+與重建來源各 32 MiB、100,000 個 SSE frame，以及 10,000 個重建 output item。
+`stallTimeoutSec` 同時控制第一個 body byte 與後續靜默間隔；當它是 `0`，或因本機 upstream
+預設停用時，不會立即逾時，只保留獨立的 15 分鐘整體上限。串流客戶端的行為不變。
 
 每個終端 Responses usage 物件都包含兩個 detail 物件，即使供應商未回報那些細節：
 
@@ -213,7 +239,13 @@ Compaction 為需要縮短長 Responses 對話的客戶端回傳取代歷史。
 | 路由型別 | 行為 |
 | --- | --- |
 | 規範 ChatGPT 或官方 OpenAI 路由 | 以解析的帳號與模型認證將請求轉發到原生 `/responses/compact` 端點 |
+| Explicitly opted-in custom `openai-responses` gateway | `supportsNativeCompactEndpoint: true` tries the native v1 endpoint for key/local/forward auth using the provider's normal Responses transport; HTTP 404 uses portable fallback; OAuth retains routed compaction and credential resolution |
 | 其他路由模型 | 執行一個內部、非串流、無工具的 compaction 回合，帶有 `compaction_trigger`；需要恰好一個合成的 `compaction` 項目，其 `encrypted_content` 為 `ocx1:` 封裝；將該摘要解碼為 v1 取代歷史 |
+
+The custom v1 capability is independent of v2 `supportsNativeCompactionTrigger` and
+`decodesNativeCompactionBlobs` for replay. None grants canonical identity or caller credential
+forwarding; cross-provider overrides remain portable. See the canonical
+[provider configuration](/reference/configuration/providers/) before opting in.
 
 原生 compact 回應以 32 MiB 上限緩衝，包含其宣告的 `Content-Length` 已超過限制的回應。Compact 專屬失敗包含：
 
@@ -270,3 +302,19 @@ Anthropic 來源的失敗以 Anthropic 的錯誤封裝渲染，因此該方言�
 代理將真實的後端密文視為不透明。結構有效的密文被逐位元組保留：opencodex 不解密它、轉譯其內容，或為另一個供應商重新加密它。
 
 某些 agent hook 在歷史上曾將明文控制文字放入 `encrypted_content` 插槽。為相容性，代理將該明文分離為 text 部分，同時保留任何結構有效的 Fernet run 不變。若 `agent_message` 在該修復期間失去所有加密部分，它成為普通使用者訊息。若目前的 v2 task 保持真正加密但所選路由目標無法讀取原生 ChatGPT 密文，opencodex 以 `unreadable_encrypted_agent_task` 失敗，而非發送不可讀的位元組給該供應商。關於 worker task 周圍的客戶端行為，請見[子代理介面](/zh-tw/guides/sub-agent-surface/)。
+
+### 在既有對話中切換供應商
+
+重放的推理項攜帶的 `encrypted_content` 只有產生它的供應商與憑證才能讀取。若 opencodex 知道該對話上一次由另一個供應商處理，它會在送出前移除這個 blob，並保留該項的摘要。若那個供應商還使用了不同的 endpoint 或憑證，該項的 `rs_…` id 也會被移除，因為它指向新目標查不到的項目。若 opencodex 無從得知，例如代理重新啟動之後，新目標會拒絕這個 blob：OpenAI 與 Azure OpenAI 回傳 `400 invalid_encrypted_content`。此時 opencodex 會去掉上一個供應商的推理狀態（blob 與 `rs_…` id）後只重送一次請求；保留 id 會導致 `Item with id 'rs_…' not found`。
+
+這項復原適用於所有使用 Responses 協定的 adapter，因此 `openai-responses` 與 `azure-openai` 的行為相同。復原成功後，該對話在同一目標上的後續輪次會在接下來五分鐘內於首次送出前移除這些狀態。重送計入請求的一般傳送預算。一般的 400 與 429 不會以這種方式重送，5xx 也不會，只有一個狹窄的例外：對於攜帶加密工具輸出的請求，回應本文恰好是該解密拒絕的 502 會得到同樣的一次重送。第二次拒絕會原樣回傳給客戶端。遇到這種情況，請在目標供應商上開始新的對話。
+
+## Codex 原生一般 Lite 請求的搜尋歷史
+
+當最終送出的請求未宣告任何 hosted 搜尋工具時（`tools` 或 Lite `additional_tools` 中都沒有 `web_search` 或 `web_search_preview`，包括移除供應商不支援的 hosted 工具之後），所有 Responses 目的地都會將未被同一輸入引用的回放 `web_search_call` 歷史轉為下文所述的附標籤 assistant 參考說明，與是否啟用該選項無關。原生 Sol 對這類歷史會回傳通用 `server_error`（#7250），因此在其他模型上搜尋過的對話可以在目前請求沒有搜尋工具的路由上繼續。名為 `web_search` 的 function 工具不算 hosted 宣告。不會新增搜尋工具、重新搜尋或捏造結果；被同一輸入 `item_reference` 引用的項目保持結構化。已宣告 hosted 搜尋的請求保留結構化歷史，除非下述選項生效。
+
+已宣告 hosted 搜尋的一般請求預設保留結構化 hosted-search 歷史，Responses Lite 請求也一樣。若要選用有損參考說明，請在 `config.json` 中設定 `providers.openai.projectResponsesLiteHostedSearchHistory: true`（必須是布林值，不能是字串 `"true"`）。此設定按供應商配置且預設關閉；省略或設為 `false` 時保留結構化歷史。即使已啟用，也只有最終目的地精確為標準 ChatGPT Codex `/responses` 且目前有效意圖明確選擇 Responses Lite 的一般請求及原生 v2 `compaction_trigger` 壓縮請求，才會將未被同一輸入引用的剩餘 `web_search_call` 歷史轉為附標籤的 assistant 參考說明。最終 `x-openai-internal-codex-responses-lite` 標頭值精確為 `true` 時選擇 Lite；明確的 `false` 優先於訊框中繼資料。沒有可辨識的標頭值時，採用有效字串 map 中 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite` 的 `true` 值，沿用既有 WS 中繼資料語意。非 Lite 或無法辨識的有效意圖保留結構化歷史；格式無效的中繼資料不會覆寫明確的 HTTP `true`。模型名稱、訂閱認證、缺少 hosted 宣告或僅有 `additional_tools` 都不會選擇此策略；不會為觸發轉換而改寫標頭或中繼資料。啟用後適用於新對話、分支、跨模型接續、快取未命中或重新啟動，且不依賴診斷設定。只有有效、同範圍的 bridge memo 能證明並先還原原始函式呼叫及結果；ID 前綴、模型名稱或缺少 memo 不能判定來源。同一輸入的 `item_reference.id` 精確指向某 hosted 項目時，該項目會保留；`store:false` 會先移除引用，剩餘 hosted 歷史可被投影。工具宣告、Lite `additional_tools`、選擇、用戶端呼叫／結果配對、推理／原生密文、非 hosted 順序及呼叫端原始歷史均維持既有契約。
+
+這是只在上述明確啟用的 Lite 邊界內採用的**有損歷史策略**，不是 hosted schema 無效或所有上游錯誤都已修復的斷言。說明是非可信的 status/action 參考中繼資料，只複製 action 與頂層 sources 中允許的 URL/title/type，並非指令或網頁內文。每個字串最多 2,048 個 UTF-16 單位、每份清單 20 項、所有投影說明合計 65,536 個序列化位元組，超出後改用省略說明。已轉換項目的 ID 和未知欄位會被捨棄。HTTP/SSE 與 WS 共用一般請求的最終 builder。
+
+公開 OpenAI API 與其他目的地不新增一般或 native-compact 投影。原生 `/responses/compact` 保留既有端點、帳號清理、官方不透明輸出路徑及結構化 hosted 歷史。Portable/routed 摘要沿用既有投影觸發條件與預設引用行為；共用 renderer 在這些既有路徑也保留允許的頂層 sources。不會新增重試、來源分類或 compaction summarizer。

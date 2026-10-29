@@ -7,8 +7,62 @@ import { buildTools } from "../../src/responses/parser-tools";
 import { parseTextFormat } from "../../src/responses/parser-text-format";
 import { buildToolBridgeMaps } from "../../src/server/responses";
 import { repoPath } from "../helpers/repo-root";
+import { normalizeThinkingOptions, resolveThinkingEnabled } from "../../src/clients/reasoning-controls";
+import type { OcxProviderConfig } from "../../src/types";
+
+describe("generic effort-only client compatibility", () => {
+  const provider: OcxProviderConfig = {
+    adapter: "openai-chat", baseUrl: "https://fixture.invalid/v1",
+    modelCapabilities: { fixed: { supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: false, defaultThinkingEnabled: true } },
+  };
+  test("decodes switch aliases without a vendor identity or a real strength ladder", () => {
+    expect(resolveThinkingEnabled(provider, "fixed", { reasoning: "none" })).toBe(false);
+    expect(resolveThinkingEnabled(provider, "fixed", { reasoning: "high" })).toBe(true);
+    expect(resolveThinkingEnabled(provider, "fixed", {})).toBe(true);
+    expect(resolveThinkingEnabled(provider, "fixed", { thinkingEnabled: false, reasoning: "high" })).toBe(false);
+    expect(resolveThinkingEnabled(provider, "fixed", { thinkingEnabled: true, reasoning: "none" })).toBe(true);
+  });
+  test("keeps real effort independent from a switch and does not invent missing controls", () => {
+    const both = { ...provider, modelCapabilities: { fixed: { supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: true } } };
+    expect(resolveThinkingEnabled(both, "fixed", { reasoning: "high" })).toBe(true);
+    expect(resolveThinkingEnabled(both, "fixed", { reasoning: "none" })).toBe(false);
+    expect(resolveThinkingEnabled(both, "fixed", { thinkingEnabled: false, reasoning: "high" })).toBe(false);
+    expect(resolveThinkingEnabled({ ...provider, modelCapabilities: { fixed: { supportsReasoning: true, supportsThinkingToggle: false } } }, "fixed", { reasoning: "none" })).toBeUndefined();
+    expect(resolveThinkingEnabled(provider, "unknown", { reasoning: "high" })).toBeUndefined();
+  });
+  test("honors explicit compatibility mappings and leaves an empty strength list independent", () => {
+    expect(resolveThinkingEnabled({ ...provider, modelReasoningEfforts: { fixed: [] } }, "fixed", { reasoning: "none" })).toBe(false);
+    expect(resolveThinkingEnabled({ ...provider, reasoningEffortMap: { high: "__omit__" } }, "fixed", { reasoning: "high" })).toBeUndefined();
+    expect(resolveThinkingEnabled({ ...provider, reasoningEffortMap: { high: "none" } }, "fixed", { reasoning: "high" })).toBe(false);
+    expect(resolveThinkingEnabled({ ...provider, reasoningEffortMap: { none: "high" } }, "fixed", { reasoning: "none" })).toBe(true);
+  });
+  test("canonical negative declarations constrain requests while unknown axes remain untouched", () => {
+    for (const flags of [{ supportsReasoning: false }, { supportsThinkingToggle: false, supportsReasoningEffort: false }]) {
+      const options = { thinkingEnabled: true, reasoning: "high" };
+      normalizeThinkingOptions({ ...provider, modelCapabilities: { fixed: flags } }, "fixed", options);
+      expect(options).toEqual({});
+    }
+    const both = { ...provider, modelCapabilities: { fixed: { supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: true, defaultThinkingEnabled: false } } };
+    const options = { reasoning: "low" };
+    normalizeThinkingOptions(both, "fixed", options);
+    expect(options).toEqual({ thinkingEnabled: true, reasoning: "low" });
+    const unknown = { thinkingEnabled: true, reasoning: "high" };
+    normalizeThinkingOptions(provider, "unknown", unknown);
+    expect(unknown).toEqual({ thinkingEnabled: true, reasoning: "high" });
+  });
+});
 
 describe("Responses parser", () => {
+  test("keeps thinking enablement separate from effort and summary visibility", () => {
+    const on = parseRequest({ model: "fixed-depth", input: "test", reasoning: { enabled: true } });
+    expect(on.options.thinkingEnabled).toBe(true);
+    expect(on.options.reasoning).toBeUndefined();
+    expect(on.options.hideThinkingSummary).toBeUndefined();
+    const off = parseRequest({ model: "adjustable", input: "test", reasoning: { enabled: false, effort: "high" } });
+    expect(off.options.thinkingEnabled).toBe(false);
+    expect(off.options.reasoning).toBe("high");
+    expect(off.options.hideThinkingSummary).toBe(true);
+  });
   test("normalizes function tool schemas to an object root without corrupting valid schemas (#745)", () => {
     const validParameters = {
       type: "object",
@@ -591,6 +645,62 @@ describe("Responses parser", () => {
       { type: "text", text: "Looked at Google Chrome" },
       { type: "image", imageUrl: "data:image/png;base64,aGVsbG8=", detail: "high" },
     ]);
+  });
+
+  test("repairs a history function_call that lost its JSON opening brace", () => {
+    const parsed = parseRequest({
+      model: "codebuddy-cn/glm-5.3",
+      input: [
+        { type: "function_call", call_id: "call_6c903fcfec9947a8b7aff270", name: "js", arguments: 'code":"let log = [];","timeout_ms":90000}' },
+        { type: "function_call_output", call_id: "call_6c903fcfec9947a8b7aff270", output: "" },
+      ],
+    });
+    const assistant = parsed.context.messages.find(m => m.role === "assistant");
+    const toolCall = assistant?.content.find(part => part.type === "toolCall") as
+      | { arguments: Record<string, unknown> }
+      | undefined;
+
+    expect(toolCall?.arguments).toEqual({ code: "let log = [];", timeout_ms: 90000 });
+  });
+
+  test("repairs the same missing opening brace for a non-CodeBuddy model", () => {
+    const parsed = parseRequest({
+      model: "test-model",
+      input: [{ type: "function_call", call_id: "call_other", name: "lookup", arguments: 'query":"status"}' }],
+    });
+    const assistant = parsed.context.messages.find(m => m.role === "assistant");
+    const toolCall = assistant?.content.find(part => part.type === "toolCall") as
+      | { arguments: Record<string, unknown> }
+      | undefined;
+    expect(toolCall?.arguments).toEqual({ query: "status" });
+  });
+
+  test.each(["freeform}", '{"query":"status"', "[1,2]"])("keeps {} for a different malformed argument shape: %s", argumentsText => {
+    const parsed = parseRequest({
+      model: "test-model",
+      input: [{ type: "function_call", call_id: "call_malformed", name: "lookup", arguments: argumentsText }],
+    });
+    const assistant = parsed.context.messages.find(m => m.role === "assistant");
+    const toolCall = assistant?.content.find(part => part.type === "toolCall") as
+      | { arguments: Record<string, unknown> }
+      | undefined;
+    expect(toolCall?.arguments).toEqual({});
+  });
+
+  test("keeps the tolerated-{} fallback for arguments that are not a repairable envelope", () => {
+    const parsed = parseRequest({
+      model: "codebuddy-cn/glm-5.3",
+      input: [
+        { type: "function_call", call_id: "call_freeform", name: "js", arguments: "not json at all" },
+        { type: "function_call_output", call_id: "call_freeform", output: "" },
+      ],
+    });
+    const assistant = parsed.context.messages.find(m => m.role === "assistant");
+    const toolCall = assistant?.content.find(part => part.type === "toolCall") as
+      | { arguments: Record<string, unknown> }
+      | undefined;
+
+    expect(toolCall?.arguments).toEqual({});
   });
 });
 

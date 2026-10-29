@@ -1,4 +1,4 @@
-import { afterEach } from "bun:test";
+import { afterEach, onTestFinished } from "bun:test";
 import type { IncomingMeta, ProviderAdapter } from "../../src/adapters/base";
 import {
   createTranslatorBudget,
@@ -8,24 +8,36 @@ import {
 
 const liveTestBudgets = new Set<TranslatorBudget>();
 
-export function createTestTranslatorBudget(options?: Parameters<typeof createTranslatorBudget>[0]): TranslatorBudget {
-  const budget = createTranslatorBudget(options);
-  liveTestBudgets.add(budget);
-  return budget;
-}
-
-afterEach(() => {
+function disposeTestTranslatorBudgets(): void {
   for (const budget of liveTestBudgets) budget.dispose();
   liveTestBudgets.clear();
   resetTranslatorAggregateForTests();
-});
+}
+
+export function createTestTranslatorBudget(options?: Parameters<typeof createTranslatorBudget>[0]): TranslatorBudget {
+  const budget = createTranslatorBudget(options);
+  liveTestBudgets.add(budget);
+  // The `afterEach` below only runs for the first test file that imports this module: a
+  // shared Bun process evaluates it once, so every later importer keeps its budgets and the
+  // aggregate for the rest of the run. `onTestFinished` belongs to the running test, whatever
+  // file it is in. Outside a test (module scope, `beforeAll`) it throws, and the `afterEach`
+  // stays the only cleanup.
+  try {
+    onTestFinished(disposeTestTranslatorBudgets);
+  } catch {
+    // Not inside a running test.
+  }
+  return budget;
+}
+
+afterEach(disposeTestTranslatorBudgets);
 
 type TestAdapter<T extends ProviderAdapter> = Omit<T, "buildRequest" | "parseStream" | "parseResponse"> & {
   buildRequest(
     parsed: Parameters<T["buildRequest"]>[0],
     incoming?: Partial<IncomingMeta>,
   ): ReturnType<T["buildRequest"]>;
-  parseStream(response: Response, budget?: TranslatorBudget): ReturnType<T["parseStream"]>;
+  parseStream(response: Response, budget?: TranslatorBudget, tierMetadata?: Parameters<ProviderAdapter["parseStream"]>[2], streamContext?: Parameters<ProviderAdapter["parseStream"]>[3]): ReturnType<T["parseStream"]>;
   parseResponse?: (
     response: Response,
     budget?: TranslatorBudget,
@@ -47,8 +59,8 @@ export function withTestTranslatorBudget<T extends ProviderAdapter>(adapter: T):
         translatorBudget: incoming?.translatorBudget ?? budget,
       });
     },
-    parseStream(response: Response, explicitBudget?: TranslatorBudget) {
-      return parseStream(response, explicitBudget ?? budget);
+    parseStream(response: Response, explicitBudget?: TranslatorBudget, tierMetadata?: Parameters<ProviderAdapter["parseStream"]>[2], streamContext?: Parameters<ProviderAdapter["parseStream"]>[3]) {
+      return parseStream(response, explicitBudget ?? budget, tierMetadata, streamContext);
     },
     ...(parseResponse ? {
       parseResponse(response: Response, explicitBudget?: TranslatorBudget) {

@@ -1,16 +1,19 @@
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
-import type { ProviderQuota } from "../providers/quota-types";
+import type { ProviderQuota, ProviderQuotaWindow } from "../providers/quota-types";
 import { sleepWithAbort } from "../lib/upstream-retry";
 import {
+  clearComboTargetCooldownIfUnchanged,
+  comboTargetCooldownRevision,
   coolComboTarget,
   earliestComboCooldown,
   isComboTargetInCooldown,
+  snapshotComboQuotaCooldowns as snapshotTargetQuotaCooldowns,
   type ComboFailureCooldownScope,
 } from "./failover";
 import { quotaResetRemainingMs } from "./reset-window";
 import { getCombo, resolveComboId, targetKey } from "./types";
-import type { NormalizedComboConfig } from "./types";
+import type { NormalizedComboConfig, NormalizedComboTarget } from "./types";
 import {
   captureConfigGeneration,
   type GenerationContext,
@@ -18,13 +21,16 @@ import {
 
 export interface ComboPick {
   comboId: string;
-  target: Required<OcxComboTarget>;
+  target: NormalizedComboTarget;
   targetIndex: number;
   attempted: string[];
   writerGeneration: number;
+  /** Cooled targets this request alone may probe, each bound to the cooldown write it reserved. */
+  cooldownReprobeTargets?: Record<string, number>;
 }
 
 interface SelectionState {
+  lastCooldownReprobeAt?: number;
   activeKey?: string;
   successes: number;
   currentWeights: Map<string, number>;
@@ -54,17 +60,72 @@ export class UnknownComboError extends Error {
 export class NoAvailableComboTargetsError extends Error {
   readonly code = "combo_unavailable";
 
-  constructor(readonly comboId: string) {
-    super(`No available targets for combo: ${comboId}`);
+  constructor(readonly comboId: string, readonly reasons = "") {
+    super(`No available targets for combo: ${comboId}${reasons ? ` (${reasons})` : ""}`);
     this.name = "NoAvailableComboTargetsError";
   }
 }
 
+function providerExclusionReason(config: OcxConfig, target: OcxComboTarget, now: number): string | undefined {
+  const provider = Object.hasOwn(config.providers, target.provider) ? config.providers[target.provider] : undefined;
+  if (!provider) return "provider missing";
+  if (provider.disabled === true) return "provider disabled";
+  return cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now, target.model)
+    ? "quota exhausted"
+    : undefined;
+}
+
 function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: number): boolean {
-  if (!Object.hasOwn(config.providers, target.provider)) return false;
-  const provider = config.providers[target.provider];
-  if (!provider || provider.disabled === true) return false;
-  return !cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now);
+  return providerExclusionReason(config, target, now) === undefined;
+}
+
+/**
+ * OCX-11: the coarse fallback trigger for a target the picker passed over for a reason other
+ * than a cooldown (provider missing or disabled, cached quota spent, ineligible for the request).
+ */
+export function comboTargetSkipTrigger(
+  config: OcxConfig,
+  target: OcxComboTarget,
+  now = Date.now(),
+): "quota_exhausted" | "unavailable" {
+  return providerExclusionReason(config, target, now) === "quota exhausted" ? "quota_exhausted" : "unavailable";
+}
+
+/**
+ * Why each target of a combo cannot be picked right now, for a zero-attempt refusal. Only the
+ * configured provider/model and a coarse label are named, never account or request data.
+ */
+export function comboExclusionReasons(
+  config: OcxConfig,
+  comboId: string,
+  eligible?: (target: NormalizedComboTarget) => boolean,
+  now = Date.now(),
+): string {
+  return (getCombo(config, comboId)?.targets ?? []).flatMap(target => {
+    let reason = providerExclusionReason(config, target, now);
+    const cooldown = reason ? undefined : earliestComboCooldown(comboId, [target], now);
+    if (cooldown) reason = `cooldown ${Math.max(1, Math.ceil((cooldown.expiry - now) / 1000))}s`;
+    if (!reason && eligible) {
+      try {
+        if (!eligible(target)) reason = "ineligible for this request";
+      } catch {
+        // An eligibility check can exhaust the translator budget; the target still was not picked.
+        reason = "ineligible for this request";
+      }
+    }
+    return reason ? [`${targetKey(target)}: ${reason}`] : [];
+  }).join("; ");
+}
+
+/** Capture usable providers' quota cooldowns; request eligibility is deferred to exhaustion. */
+export function snapshotComboQuotaCooldowns(
+  config: OcxConfig,
+  comboId: string,
+  now = Date.now(),
+): Array<{ target: NormalizedComboTarget; cooldownUntil: number }> {
+  const targets = getCombo(config, comboId)?.targets.filter(target =>
+    targetProviderIsUsable(config, target, now)) ?? [];
+  return snapshotTargetQuotaCooldowns(comboId, targets, now);
 }
 
 function quotaWindowExhausted(percent: number | undefined, resetAt: number | undefined, now: number): boolean {
@@ -72,15 +133,42 @@ function quotaWindowExhausted(percent: number | undefined, resetAt: number | und
   return typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt > now;
 }
 
+// `customWindows` is a generic carrier. Most labels are provider-wide counters ("Prepaid
+// credits", "Free trial", "burst", "Spark") and must gate every model. Anthropic also rides it
+// for per-model family counters, where a spent Opus week says nothing about a Sonnet request.
+// `routing/quota.ts` already scopes those per model when it ranks accounts
+// (`anthropicFamilyWindow`); this is the same fact applied to combo target selection.
+//
+// The scoping keys on `window.scope`, which the PRODUCER sets only where it proved model scope
+// structurally, NEVER on the label text: `quota/antigravity.ts` forwards an upstream
+// `group.displayName` unchanged, so a provider-wide group named "Opus" read as per-model would
+// leave a spent window unenforced and send a doomed request. Every unproven direction keeps
+// gating everything, which is the behaviour before this change: no scope on the window, no
+// model on the request, or a family this gateway cannot match against a model id. Failing
+// closed there costs at most a diverted target.
+const MODEL_FAMILY_WINDOW_LABELS = new Set(["fable", "opus", "sonnet"]);
+
+function customWindowAppliesToModel(window: ProviderQuotaWindow, model: string | undefined): boolean {
+  // Exact Antigravity model readings are diagnostic only. They are not permission or
+  // provider-wide exhaustion evidence until a separate eligibility contract consumes them.
+  if (window.modelId !== undefined) return false;
+  if (window.scope !== "model" || model === undefined) return true;
+  const family = window.label.trim().toLowerCase();
+  if (!MODEL_FAMILY_WINDOW_LABELS.has(family)) return true;
+  return model.toLowerCase().includes(family);
+}
+
 export function cachedProviderQuotaIsExhausted(
   quota: ProviderQuota | null,
   now = Date.now(),
+  model?: string,
 ): boolean {
   if (!quota) return false;
   if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
   if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
   if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
-  if (quota.customWindows?.some(window => quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
+  if (quota.customWindows?.some(window => customWindowAppliesToModel(window, model)
+    && quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
   if (quota.creditsUsd?.unlimited !== true
       && typeof quota.creditsUsd?.percent === "number"
       && Number.isFinite(quota.creditsUsd.percent)
@@ -120,7 +208,9 @@ export type QuotaInactiveReason = "no_credit";
  */
 export function quotaInactiveReason(
   config: OcxConfig,
-  targets: readonly { provider: string }[],
+  // A combo votes over its own targets, which carry a model; the single-provider case has none,
+  // and an absent model keeps gating on every window exactly as before.
+  targets: readonly { provider: string; model?: string }[],
   now = Date.now(),
 ): QuotaInactiveReason | undefined {
   const usable = targets.filter(target => {
@@ -132,15 +222,15 @@ export function quotaInactiveReason(
   for (const target of usable) {
     const provider = config.providers[target.provider]!;
     const quota = getCachedProviderRoutingQuota(target.provider, provider, now);
-    if (!quota || !cachedProviderQuotaIsExhausted(quota, now)) return undefined;
+    if (!quota || !cachedProviderQuotaIsExhausted(quota, now, target.model)) return undefined;
   }
   return "no_credit";
 }
 
 function smoothWeightedIndex(
-  targets: Required<OcxComboTarget>[],
+  targets: NormalizedComboTarget[],
   state: SelectionState,
-  eligible: (target: Required<OcxComboTarget>) => boolean,
+  eligible: (target: NormalizedComboTarget) => boolean,
 ): number {
   let best = -1;
   let bestScore = Number.NEGATIVE_INFINITY;
@@ -175,8 +265,8 @@ function smoothWeightedIndex(
  */
 function resetWindowIndex(
   config: OcxConfig,
-  targets: Required<OcxComboTarget>[],
-  eligible: (target: Required<OcxComboTarget>) => boolean,
+  targets: NormalizedComboTarget[],
+  eligible: (target: NormalizedComboTarget) => boolean,
   now = Date.now(),
 ): number {
   let selected = -1;
@@ -185,7 +275,11 @@ function resetWindowIndex(
     const target = targets[index]!;
     if (!eligible(target)) continue;
     const remaining = quotaResetRemainingMs(
-      getCachedProviderRoutingQuota(target.provider, config.providers[target.provider], now), now,
+      getCachedProviderRoutingQuota(target.provider, config.providers[target.provider], now),
+      now,
+      // Rank by the windows that gate this target: a model-scoped window of another family
+      // says nothing about when this model regains capacity.
+      window => customWindowAppliesToModel(window, target.model),
     );
     // Strict comparison deliberately retains configured order for ties,
     // including the no-snapshot fallback where every value is Infinity.
@@ -197,13 +291,56 @@ function resetWindowIndex(
   return selected;
 }
 
+/** Reserve one request-scoped recovery pass; preview and in-flight picks never call this. */
+function reserveAllCooledTargets(
+  config: OcxConfig, comboId: string, now: number,
+  eligible?: (target: NormalizedComboTarget) => boolean,
+): Map<string, number> | undefined {
+  const combo = getCombo(config, comboId);
+  if (!combo?.cooldownReprobe?.enabled) return;
+  const state = selectionState.get(comboId);
+  if (state?.lastCooldownReprobeAt !== undefined
+    && now - state.lastCooldownReprobeAt < combo.cooldownReprobe.intervalMs) return;
+  const reprobeEligible = (target: NormalizedComboTarget): boolean => {
+    if (!targetProviderIsUsable(config, target, now)) return false;
+    try { return eligible?.(target) ?? true; } catch { return false; }
+  };
+  // Ordinary selection skips cooled targets without evaluating their request predicate.
+  // Preserve that behavior when a sibling is already available.
+  if (combo.targets.some(target => !isComboTargetInCooldown(comboId, target, now)
+    && reprobeEligible(target))) return;
+  const usable = combo.targets.filter(reprobeEligible);
+  if (usable.length === 0) return;
+  // Each reserved key is bound to the cooldown entry observed here. A replacement entry —
+  // a provider-scoped failure's, or one this request's own failed hop wrote — is newer
+  // evidence and cancels that target's bypass instead of being probed through.
+  const reserved = new Map<string, number>();
+  for (const target of usable) {
+    const revision = comboTargetCooldownRevision(comboId, target, now);
+    if (revision === undefined) return;
+    reserved.set(targetKey(target), revision);
+  }
+  // No await between reservation and reset: concurrent requests cannot reserve another pass.
+  const next = state ?? { successes: 0, currentWeights: new Map<string, number>(), successfulUses: new Map<string, number>() };
+  next.lastCooldownReprobeAt = now;
+  selectionState.set(comboId, next);
+  console.warn(`[combo] ${comboId}: reserving all-cooled targets for one request; minimum reprobe interval ${combo.cooldownReprobe.intervalMs}ms`);
+  return reserved;
+}
+
 export function pickComboTarget(
   config: OcxConfig,
   comboId: string,
   options: {
     exclude?: Iterable<string>;
-    eligible?: (target: Required<OcxComboTarget>) => boolean;
+    eligible?: (target: NormalizedComboTarget) => boolean;
+    /** Disable recovery for picks without request context or picks already in flight. */
+    allowCooldownReprobe?: boolean;
+    /** Request-scoped cooldown bypasses, each bound to the write it was reserved against. */
+    cooldownReprobeTargets?: Iterable<readonly [string, number]>;
     now?: number;
+    /** Inspect a round-robin choice without mutating its sticky/weight state. */
+    preview?: boolean;
   } = {},
 ): ComboPick | null {
   const writerGeneration = captureConfigGeneration();
@@ -211,9 +348,19 @@ export function pickComboTarget(
   if (!combo) throw new UnknownComboError(comboId);
   const excluded = new Set(options.exclude ?? []);
   const now = options.now ?? Date.now();
-  const eligible = (target: Required<OcxComboTarget>): boolean =>
+  const cooldownReprobeTargets = new Map(options.cooldownReprobeTargets);
+  if (options.allowCooldownReprobe !== false && !options.preview && excluded.size === 0) {
+    for (const [key, revision] of reserveAllCooledTargets(config, comboId, now, options.eligible) ?? []) {
+      cooldownReprobeTargets.set(key, revision);
+    }
+  }
+  const reprobeBypass = (target: NormalizedComboTarget): boolean => {
+    const revision = cooldownReprobeTargets.get(targetKey(target));
+    return revision !== undefined && revision === comboTargetCooldownRevision(comboId, target, now);
+  };
+  const eligible = (target: NormalizedComboTarget): boolean =>
     targetProviderIsUsable(config, target, now)
-    && !isComboTargetInCooldown(comboId, target, now)
+    && (reprobeBypass(target) || !isComboTargetInCooldown(comboId, target, now))
     && !excluded.has(targetKey(target))
     && (options.eligible?.(target) ?? true);
 
@@ -222,7 +369,13 @@ export function pickComboTarget(
     let state = selectionState.get(comboId);
     if (!state) {
       state = { successes: 0, currentWeights: new Map(), successfulUses: new Map() };
-      selectionState.set(comboId, state);
+      if (!options.preview) selectionState.set(comboId, state);
+    } else if (options.preview) {
+      state = {
+        ...state,
+        currentWeights: new Map(state.currentWeights),
+        successfulUses: new Map(state.successfulUses),
+      };
     }
     if (state.activeKey) {
       targetIndex = combo.targets.findIndex(target => targetKey(target) === state.activeKey && eligible(target));
@@ -285,13 +438,14 @@ export function pickComboTarget(
     targetIndex,
     attempted: [...excluded, targetKey(target)],
     writerGeneration,
+    ...(cooldownReprobeTargets.size > 0 ? { cooldownReprobeTargets: Object.fromEntries(cooldownReprobeTargets) } : {}),
   };
 }
 
 export function noteComboSuccess(
   comboId: string,
   combo: NormalizedComboConfig,
-  target: Required<OcxComboTarget>,
+  target: NormalizedComboTarget,
   writerGeneration = captureConfigGeneration(),
 ): void {
   const key = targetKey(target);
@@ -315,6 +469,17 @@ export function noteComboSuccess(
   }
 }
 
+/**
+ * A request that proved a reserved target healthy lifts exactly the cooldown entry it
+ * probed; a replacement entry written while the request was in flight stays. Targets
+ * the pass reserved but never dispatched keep their cooldowns.
+ */
+export function settleComboReprobeSuccess(pick: ComboPick): void {
+  const revision = pick.cooldownReprobeTargets?.[targetKey(pick.target)];
+  if (revision === undefined) return;
+  clearComboTargetCooldownIfUnchanged(pick.comboId, pick.target, revision);
+}
+
 export function noteComboFailure(
   comboId: string,
   target: OcxComboTarget,
@@ -336,34 +501,62 @@ export function advanceComboAfterFailure(
     resetAt?: unknown | unknown[];
     now?: number;
     cooldownMs?: number;
-    eligible?: (target: Required<OcxComboTarget>) => boolean;
+    eligible?: (target: NormalizedComboTarget) => boolean;
     cooldownScope?: ComboFailureCooldownScope;
+    onCooldownRecorded?: (target: Pick<OcxComboTarget, "provider" | "model">) => void;
     status?: number;
     code?: string | null;
     message?: string;
+    /** Account-qualified provider label of the account this failure came from, when a pool resolved one. */
+    failedAccount?: string;
   } = {},
 ): ComboPick | null {
   noteComboFailure(pick.comboId, pick.target, pick.writerGeneration);
   const combo = getCombo(config, pick.comboId);
+  // A 429 from a pooled provider names the ACCOUNT that is spent, not the target. The pool
+  // records that account's own cooldown and rotates past it, so cooling the target here blacks
+  // out the accounts that still answer: on 2026-09-28 one Anthropic account replied
+  // `Retry-After: 318747` (88.5h) and anthropic/claude-opus-5-5 left selection for four hours
+  // while four of five accounts still returned 200.
+  //
+  // Only a pool-resolved account qualifies, and an unidentified account still cools the target --
+  // including the pool's OWN "all accounts are cooled" 429, which refuses locally before it picks
+  // one. That is what keeps this from trading a blackhole for a hammer: when nothing else is
+  // holding the target back, the target cooldown still does.
+  // A 402 credit refusal is the provider-scoped twin: the caller names an account only after the
+  // pool has cooled it and still holds an eligible sibling.
+  const accountScoped = options.failedAccount !== undefined
+    && (options.status === 429 ? options.cooldownScope === "target" : options.status === 402);
   // "none" records no cooldown at all: the failure described the request, not the target, so
   // the target must stay immediately selectable for the next (differently shaped) request.
-  if (options.cooldownScope !== "none") {
+  if (options.cooldownScope !== "none" && !accountScoped) {
     const cooldownTargets = options.cooldownScope === "provider" && combo
       ? combo.targets.filter(target => target.provider === pick.target.provider)
       : [pick.target];
     for (const target of cooldownTargets) {
-      coolComboTarget(pick.comboId, target, {
+      const recorded = coolComboTarget(pick.comboId, target, {
         ...options,
         cooldownMs: options.cooldownMs ?? combo?.cooldownMs,
         writerGeneration: pick.writerGeneration,
       });
+      if (recorded) options.onCooldownRecorded?.(target);
     }
   }
+  // #5691: under `cooldownWaitPolicy: "before-last-resort"` this final synchronous pick
+  // must not dispatch an emergency target while a normal one is merely cooling. Returning
+  // null hands the decision to `pickComboTargetWithWait`, which waits a normal target out
+  // inside the combo's wait budget or dispatches the last resort when none is reachable.
+  // Without the policy the eligible set is unchanged and the pick is exactly as before.
+  const defersLastResort = combo?.cooldownWaitPolicy === "before-last-resort"
+    && combo.targets.some(target => !target.lastResort);
   return pickComboTarget(config, pick.comboId, {
     exclude: pick.attempted,
     now: options.now,
-    eligible: target => !isComboTargetInCooldown(pick.comboId, target, options.now)
-      && (options.eligible?.(target) ?? true),
+    cooldownReprobeTargets: pick.cooldownReprobeTargets
+      ? Object.entries(pick.cooldownReprobeTargets)
+      : undefined,
+    eligible: target => (options.eligible?.(target) ?? true)
+      && (!defersLastResort || !target.lastResort),
   });
 }
 
@@ -372,9 +565,13 @@ export async function pickComboTargetWithWait(
   comboId: string,
   options: {
     exclude?: Iterable<string>;
-    eligible?: (target: Required<OcxComboTarget>) => boolean;
+    eligible?: (target: NormalizedComboTarget) => boolean;
     waitForCooldownMs: number;
     abortSignal?: AbortSignal;
+    /** Disable recovery when retrying a target after its normal cooldown. */
+    allowCooldownReprobe?: boolean;
+    /** Request-scoped cooldown bypasses carried through the wait, each bound to its write. */
+    cooldownReprobeTargets?: Iterable<readonly [string, number]>;
     now?: number;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   },
@@ -382,23 +579,100 @@ export async function pickComboTargetWithWait(
   const now = options.now ?? Date.now();
   const excluded = new Set(options.exclude ?? []);
   const customEligible = options.eligible;
-  const eligible = (target: Required<OcxComboTarget>): boolean =>
-    !isComboTargetInCooldown(comboId, target, now)
-    && (customEligible?.(target) ?? true);
-  const pick = pickComboTarget(config, comboId, { exclude: excluded, eligible, now });
-  if (pick || options.waitForCooldownMs <= 0 || options.abortSignal?.aborted) return pick;
+  const cooldownReprobeTargets = new Map(options.cooldownReprobeTargets);
+  if (options.allowCooldownReprobe !== false && excluded.size === 0 && !options.abortSignal?.aborted) {
+    for (const [key, revision] of reserveAllCooledTargets(config, comboId, now, customEligible) ?? []) {
+      cooldownReprobeTargets.set(key, revision);
+    }
+  }
+  // Milliseconds already slept inside this call. `waitForCooldownMs` is documented as a cap
+  // per *selection attempt*, so a deferral wait and the ordinary wait below must share it —
+  // otherwise a 3s deferral followed by a 9s ordinary wait spends 12s against a 10s budget.
+  let spentWaitMs = 0;
+
+  // #5691: `cooldownWaitPolicy: "before-last-resort"` makes one extra attempt
+  // over the normal targets alone, so a *brief* cooldown on a preferred target
+  // waits rather than dispatching a target the operator marked emergency-only.
+  //
+  // It only ever defers. Every exit below falls through to the unchanged
+  // selection, which still sees the last-resort target — a policy that could
+  // withhold it when no normal target is reachable would turn a fallback into
+  // an outage, which is worse than the premature routing it prevents.
+  const policyCombo = getCombo(config, comboId);
+  const defersLastResort = policyCombo?.cooldownWaitPolicy === "before-last-resort"
+    && policyCombo.targets.some(target => !target.lastResort);
+  if (defersLastResort && !options.abortSignal?.aborted) {
+    const normalOnly = (target: NormalizedComboTarget): boolean =>
+      !target.lastResort && (customEligible?.(target) ?? true);
+    const normalPick = pickComboTarget(config, comboId, {
+      allowCooldownReprobe: false,
+      cooldownReprobeTargets,
+      exclude: excluded,
+      eligible: normalOnly,
+      now,
+    });
+    if (normalPick) return normalPick;
+
+    const waitable = policyCombo.targets.filter(target =>
+      !target.lastResort
+      && targetProviderIsUsable(config, target, now)
+      && !excluded.has(targetKey(target))
+      && isComboTargetInCooldown(comboId, target, now)
+      && (customEligible?.(target) ?? true),
+    );
+    const soonest = earliestComboCooldown(comboId, waitable, now);
+    const normalDelay = soonest === undefined ? undefined : soonest.expiry - now;
+    if (normalDelay !== undefined && normalDelay <= options.waitForCooldownMs) {
+      console.warn(
+        `[combo] ${comboId}: deferring last resort, waiting ${normalDelay}ms for ${targetKey(soonest!.target)}`,
+      );
+      try {
+        await (options.sleep ?? sleepWithAbort)(normalDelay, options.abortSignal);
+      } catch (error) {
+        if (options.abortSignal?.aborted) return null;
+        throw error;
+      }
+      spentWaitMs += normalDelay;
+      if (options.abortSignal?.aborted) return null;
+      // The combo can be deleted or renamed while this request sleeps.
+      if (!getCombo(config, comboId)) return null;
+      const waited = pickComboTarget(config, comboId, {
+        allowCooldownReprobe: false,
+        cooldownReprobeTargets,
+        exclude: excluded,
+        now: now + normalDelay,
+        eligible: normalOnly,
+      });
+      if (waited) return waited;
+    }
+    // No normal target is reachable. Fall through; the last resort is eligible.
+  }
+
+  // Both advance when the deferral above slept; they are identical to `now` and
+  // `options.waitForCooldownMs` when it did not, so the non-policy path is unchanged.
+  const clock = now + spentWaitMs;
+  const remainingWaitMs = options.waitForCooldownMs - spentWaitMs;
+
+  const pick = pickComboTarget(config, comboId, {
+    allowCooldownReprobe: false,
+    cooldownReprobeTargets,
+    exclude: excluded,
+    eligible: customEligible,
+    now: clock,
+  });
+  if (pick || remainingWaitMs <= 0 || options.abortSignal?.aborted) return pick;
   const combo = getCombo(config, comboId);
   if (!combo) throw new UnknownComboError(comboId);
   const waitingTargets = combo.targets.filter(target =>
-    targetProviderIsUsable(config, target, now)
+    targetProviderIsUsable(config, target, clock)
     && !excluded.has(targetKey(target))
-    && isComboTargetInCooldown(comboId, target, now)
+    && isComboTargetInCooldown(comboId, target, clock)
     && (customEligible?.(target) ?? true),
   );
-  const earliest = earliestComboCooldown(comboId, waitingTargets, now);
+  const earliest = earliestComboCooldown(comboId, waitingTargets, clock);
   if (earliest === undefined) return null;
-  const delay = earliest.expiry - now;
-  if (delay > options.waitForCooldownMs) return null;
+  const delay = earliest.expiry - clock;
+  if (delay > remainingWaitMs) return null;
   // The expiry computation above is the single source of truth for the wait budget.
   // Its target preserves configured order for ties.
   const target = earliest.target;
@@ -416,10 +690,10 @@ export async function pickComboTargetWithWait(
   if (!getCombo(config, comboId)) return null;
   return pickComboTarget(config, comboId, {
     exclude: excluded,
-    now: now + delay,
-    eligible: targetCandidate =>
-      !isComboTargetInCooldown(comboId, targetCandidate, now + delay)
-      && (customEligible?.(targetCandidate) ?? true),
+    allowCooldownReprobe: false,
+    cooldownReprobeTargets,
+    now: clock + delay,
+    eligible: customEligible,
   });
 }
 
@@ -463,11 +737,11 @@ export function clearComboSelectionState(comboId?: string): void {
   selectionState.delete(comboId);
 }
 
-export function tryPickComboModel(config: OcxConfig, modelId: string): ComboPick | null {
+export function tryPickComboModel(config: OcxConfig, modelId: string, preview = false): ComboPick | null {
   const comboId = resolveComboId(config, modelId);
   if (!comboId) return null;
   if (!getCombo(config, comboId)) throw new UnknownComboError(comboId);
-  const picked = pickComboTarget(config, comboId);
-  if (!picked) throw new NoAvailableComboTargetsError(comboId);
+  const picked = pickComboTarget(config, comboId, { preview, allowCooldownReprobe: false });
+  if (!picked) throw new NoAvailableComboTargetsError(comboId, comboExclusionReasons(config, comboId));
   return picked;
 }

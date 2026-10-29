@@ -5,7 +5,12 @@ import { assertClientLifecycleHeld, withClientLifecycle } from "../client/lifecy
 import { inspectRemoteDesktopCleanup, readDesktopDisconnectReceipt } from "../claude/desktop-remote-store";
 import { removeOwnedConfigState, type ConfigRemovalResult } from "../lib/config-ownership";
 import { windowsSecretAclReapPendingAtOrBelow } from "../lib/windows-secret-acl";
+import { supportsDesktopPicker } from "../claude/desktop-picker-platform";
 import { sharedTeardownAuthorized, type UninstallObservation } from "./uninstall-plan";
+import { cleanupOwnedIntegrationsBeforeUninstall } from "./uninstall-integrations";
+
+/** Outcome of retiring the Desktop picker profile and every picker root this install trusted. */
+export interface PickerUninstallCleanup { ok: boolean; residual?: string[] }
 
 export interface UninstallClientStateDeps {
   readConnection: typeof readClientConnectionState;
@@ -13,9 +18,29 @@ export interface UninstallClientStateDeps {
   readReceipt: typeof readDesktopDisconnectReceipt;
   disconnect: (options?: Parameters<typeof disconnectClient>[0]) => Promise<unknown>;
   withLifecycle: typeof withClientLifecycle;
+  cleanupIntegrations: typeof cleanupOwnedIntegrationsBeforeUninstall;
   remove: () => ConfigRemovalResult;
   /** True while a timed-out icacls child still owns a path at or below the config directory. */
   aclReapPending: (rootPath: string) => boolean;
+  /** Release the picker profile, then untrust the current and any pending predecessor picker root. */
+  removePickerArtifacts: () => Promise<PickerUninstallCleanup>;
+}
+
+/**
+ * The picker root lives in the OS trust store (login keychain, CurrentUser Root on Windows), outside
+ * the config directory. Deleting config first would erase ca.pem and the pending-untrust journal,
+ * the only records naming which root to remove, and strand a trusted root after uninstall.
+ */
+async function removePickerArtifactsBeforeUninstall(): Promise<PickerUninstallCleanup> {
+  if (!supportsDesktopPicker()) return { ok: true };
+  const configDir = getConfigDir();
+  const [{ removeDesktopPickerArtifacts }, { drainPendingPickerCaUntrust }] = await Promise.all([
+    import("../claude/desktop-picker"),
+    import("../claude/intercept/picker-ca-cleanup"),
+  ]);
+  const removed = await removeDesktopPickerArtifacts({ configDir });
+  if (!removed.ok) return removed;
+  return await drainPendingPickerCaUntrust(configDir) ? { ok: true } : { ok: false, residual: ["pending_trust"] };
 }
 
 const defaults: UninstallClientStateDeps = {
@@ -24,8 +49,10 @@ const defaults: UninstallClientStateDeps = {
   readReceipt: readDesktopDisconnectReceipt,
   disconnect: options => disconnectClient(options),
   withLifecycle: withClientLifecycle,
+  cleanupIntegrations: cleanupOwnedIntegrationsBeforeUninstall,
   remove: () => removeOwnedConfigState(getConfigDir()),
   aclReapPending: rootPath => windowsSecretAclReapPendingAtOrBelow(rootPath),
+  removePickerArtifacts: removePickerArtifactsBeforeUninstall,
 };
 
 /** Restore connection-owned client artifacts before removing their ownership/recovery records. */
@@ -64,6 +91,14 @@ export async function removeOwnedConfigAfterDesktopCleanup(
     throw new Error("Client cleanup refused: finish Desktop recovery before uninstalling.");
   }
 
+  // Picker cleanup takes L itself, so it runs before the final lock. A residual keeps every
+  // record the retry needs: the config directory still names the root to untrust.
+  const picker = await deps.removePickerArtifacts();
+  if (!picker.ok) {
+    throw new Error(`Client cleanup refused: Claude Desktop picker cleanup left ${picker.residual?.join(", ") || "state"} behind; `
+      + "approve the certificate removal prompt or run 'ocx claude desktop picker off', then rerun 'ocx uninstall'.");
+  }
+
   // A connection can appear while asynchronous cleanup is finishing. The final
   // inspection and actual remover share L, but never hold C while deleting its DB.
   return deps.withLifecycle(async held => {
@@ -85,6 +120,9 @@ export async function removeOwnedConfigAfterDesktopCleanup(
     if (deps.aclReapPending(getConfigDir())) {
       throw new Error("Client cleanup refused: ACL hardening still owns a path under the config directory.");
     }
+    // Integration records are the authority that permits removing only OpenCodex-owned fragments
+    // from third-party files. Delete them only after every recorded contribution is retired.
+    await deps.cleanupIntegrations();
     return deps.remove();
   });
 }

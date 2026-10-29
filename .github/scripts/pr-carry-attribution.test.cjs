@@ -2,7 +2,11 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { assessCarryAttribution } = require("./pr-carry-attribution.cjs");
+const {
+  assessCarryAttribution,
+  carryWindow,
+  referencedCarryNumbers,
+} = require("./pr-carry-attribution.cjs");
 
 const RRMLIMA = {
   login: "rrmlima",
@@ -120,6 +124,122 @@ describe("assessCarryAttribution", () => {
     );
   });
 
+  it("scans many unclosed fence-like lines without repeatedly searching the tail", () => {
+    const body = "```x\n".repeat(20_000) + "Reimplements #2797.";
+    const started = performance.now();
+
+    assert.deepEqual([...referencedCarryNumbers(body)], [2797]);
+    assert.ok(performance.now() - started < 2_000, "fence scan should remain linear");
+  });
+
+  it("scans many openers past exhausted close lengths in near-linear time", () => {
+    // Pure fence lines are also openers, so descending lengths pair up cheaply and
+    // leave every close-list entry exhausted: the first long opener then walks the
+    // whole parent chain from 2,002 down to 3, and later openers must stay cheap
+    // after path compression. Ascending lengths would link each exhausted entry
+    // straight to an already-dead lower entry and never exercise the walk.
+    const closes = Array.from({ length: 2_000 }, (_, index) => "`".repeat(2_002 - index)).join("\n");
+    const openers = ("`".repeat(2_003) + "x\n").repeat(2_000);
+    const body = `${closes}\n${openers}Reimplements #2797.`;
+    const started = performance.now();
+
+    assert.deepEqual([...referencedCarryNumbers(body)], [2797]);
+    assert.ok(performance.now() - started < 2_000, "fence scan should remain near-linear");
+  });
+
+  it("strips a complete tilde fence that follows an unmatched backtick opener", () => {
+    // The unclosed opener stays ordinary text, but it must not swallow the
+    // independent fenced block after it.
+    assert.deepEqual(
+      assessCarryAttribution(
+        base({
+          body: [
+            "\u0060\u0060\u0060unclosed",
+            "~~~",
+            "Reimplements #2797",
+            "~~~",
+          ].join("\n"),
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("strips a longer fence that follows an unmatched shorter opener", () => {
+    assert.deepEqual(
+      assessCarryAttribution(
+        base({
+          body: [
+            "\u0060\u0060\u0060unclosed",
+            "\u0060\u0060\u0060\u0060",
+            "Reimplements #2797",
+            "\u0060\u0060\u0060\u0060",
+          ].join("\n"),
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("strips a fence whose closing run is shorter than its opening run", () => {
+    // The backreferenced regex gave back opener delimiters until a close
+    // matched: a pure ``` line still closes a ```` opener. An exact-length
+    // lookup would leave "Reimplements #2797" readable as a declaration.
+    assert.deepEqual(
+      assessCarryAttribution(
+        base({
+          body: [
+            "\u0060\u0060\u0060\u0060",
+            "Reimplements #2797",
+            "\u0060\u0060\u0060",
+          ].join("\n"),
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("prefers the longest closing run, the way the backreference backtracked", () => {
+    // Greedy capture tries the full opener run first: a pure ```` line
+    // farther down outranks a nearer ``` line, so the whole span is removed.
+    assert.deepEqual(
+      assessCarryAttribution(
+        base({
+          body: [
+            "\u0060\u0060\u0060\u0060",
+            "\u0060\u0060\u0060",
+            "Reimplements #2797",
+            "\u0060\u0060\u0060\u0060",
+          ].join("\n"),
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("strips a fenced block written with CRLF line endings", () => {
+    assert.deepEqual(
+      assessCarryAttribution(
+        base({
+          body: "\u0060\u0060\u0060\r\nReimplements #2797\r\n\u0060\u0060\u0060\r\n",
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("still reads carry language around an unmatched opener", () => {
+    // Falling back to ordinary text is not a license to hide a real claim:
+    // the unmatched opener line itself remains in the scanned text.
+    const failures = assessCarryAttribution(
+      base({
+        body: ["\u0060\u0060\u0060unclosed", "Reimplements #2797."].join("\n"),
+      }),
+    );
+    assert.equal(failures.length, 1);
+    assert.deepEqual(failures[0].paths, ["#2797"]);
+  });
+
   it("ignores carry language after an unclosed HTML comment", () => {
     // GitHub renders nothing after an unterminated `<!--`, so neither does the
     // gate. The closing-delimiter-only pattern used to match nothing here and
@@ -170,6 +290,38 @@ describe("assessCarryAttribution", () => {
       }),
     );
     assert.deepEqual(failures[0].paths, ["#3193"]);
+  });
+
+  it("keeps the complete references from the #7223 subject", () => {
+    const subject = "carry Combo visibility, workspace panes, Windows picker and Gentle Shell (#7195, #6767";
+    assert.deepEqual([...referencedCarryNumbers(subject)], [7195, 6767]);
+  });
+
+  it("finishes a number or hash at the cap without admitting the next reference", () => {
+    for (const reference of ["#6767", "other/repo#6767"]) {
+      for (let included = 1; included <= 5; included++) {
+        const padding = " ".repeat(80 - reference.length + 5 - included);
+        const text = padding + reference + " #3192";
+        assert.equal(carryWindow(text, 0), padding + reference);
+        assert.deepEqual(
+          [...referencedCarryNumbers("carry" + text)],
+          reference.startsWith("#") ? [6767] : [],
+        );
+      }
+    }
+  });
+
+  it("excludes references starting at or beyond the cap and after a newline", () => {
+    for (const padding of [80, 81]) {
+      assert.deepEqual([...referencedCarryNumbers("carry" + " ".repeat(padding) + "#3192")], []);
+    }
+    assert.deepEqual([...referencedCarryNumbers("carry #3193\n#3192")], [3193]);
+  });
+
+  it("completes a long numeric suffix without scanning the following text", () => {
+    const digits = "7".repeat(100_000);
+    const text = " ".repeat(79) + "#" + digits;
+    assert.equal(carryWindow(text + " #3192", 0), text);
   });
 
   it("reads a trailer that only exists on a branch commit", () => {

@@ -41,12 +41,12 @@ import {
   clearAccountNeedsReauth,
   clearAccountQuota,
   getAccountQuota,
-  handleCodexAuthAPI,
   isAccountNeedsReauth,
   parseUsageQuota,
   setAccountQuotaFromParsed,
   updateAccountQuota,
 } from "../../src/codex/auth-api";
+import { handleCodexAuthAPI } from "../../src/codex/auth-api/routes";
 import { CODEX_UNKNOWN_USAGE_SCORE, isCodexQuotaExhausted } from "../../src/codex/quota";
 import { setCodexAccountPriority } from "../../src/codex/account-priority";
 import { MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
@@ -3174,7 +3174,7 @@ describe("codex account selection order", () => {
       activeCodexAccountPinned: "b",
     });
     updateAccountQuota("a", 10);
-    updateAccountQuota("b", 90);
+    updateAccountQuota("b", 100);
 
     expect(resolveCodexAccountForThreadDetailed(
       null,
@@ -3218,7 +3218,7 @@ describe("codex account selection order", () => {
       activeCodexAccountPinned: "b",
     });
     updateAccountQuota("a", 10);
-    updateAccountQuota("b", 90);
+    updateAccountQuota("b", 100);
 
     expect(resolveCodexAccountForThreadDetailed(
       null,

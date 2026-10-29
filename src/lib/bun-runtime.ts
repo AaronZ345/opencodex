@@ -11,9 +11,11 @@
  * back to `process.execPath` (which is itself Bun when run via `bun src/cli/index.ts`).
  */
 import { createRequire } from "node:module";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isRealBunBinary } from "./bun-binary-validator.mjs";
+import { scopeTranspilerCacheToRuntime } from "./bun-transpiler-cache-scope.mjs";
+import { isStandaloneBinary } from "./standalone";
 
 export { isRealBunBinary };
 
@@ -38,10 +40,10 @@ export const BUN_RUNTIME_SOURCE_ENV = "OCX_BUN_RUNTIME_SOURCE";
  */
 export const BUN_RUNTIME_PATH_ENV = "OCX_BUN_RUNTIME_PATH";
 
-export type BunRuntimeSource = "override" | "bundled" | "process";
+export type BunRuntimeSource = "override" | "bundled" | "process" | "standalone";
 
 /** The only provenance values any surface may accept off the wire or out of the env. */
-export const BUN_RUNTIME_SOURCES: readonly BunRuntimeSource[] = ["override", "bundled", "process"];
+export const BUN_RUNTIME_SOURCES: readonly BunRuntimeSource[] = ["override", "bundled", "process", "standalone"];
 
 export type DurableBunRuntime = {
   path: string;
@@ -165,6 +167,9 @@ function unmarkedDurableBunRuntime(): DurableBunRuntime {
 }
 
 export function durableBunRuntime(): DurableBunRuntime {
+  if (isStandaloneBinary()) {
+    return { path: process.execPath, source: "standalone", overrideEnv: BUN_OVERRIDE_ENV };
+  }
   // A durable artifact must use the runtime selected BEFORE Bun auto-loaded a
   // project dotenv. The Node launcher and owned service/shim launchers stamp the
   // selected source/path pair; it is accepted only when it names this exact
@@ -181,4 +186,20 @@ export function durableBunRuntime(): DurableBunRuntime {
  */
 export function durableBunPath(): string {
   return durableBunRuntime().path;
+}
+
+/**
+ * Environment for a child started on {@link durableBunPath}. When that is the bundled runtime
+ * and this process is a different Bun (the CI test runner), an inherited transpiler cache is
+ * scoped to the child's version: the two releases' .pile formats evict each other.
+ */
+export function durableBunChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const runtime = durableBunRuntime();
+  if (runtime.source !== "bundled" || samePath(runtime.path, process.execPath)) return env;
+  let version: unknown;
+  try {
+    version = JSON.parse(readFileSync(join(dirname(dirname(runtime.path)), "package.json"), "utf8")).version;
+  } catch { return env; }
+  if (typeof version !== "string" || version === Bun.version) return env;
+  return scopeTranspilerCacheToRuntime(env, version, join);
 }

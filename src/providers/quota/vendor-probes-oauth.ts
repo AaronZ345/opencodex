@@ -1,8 +1,14 @@
+import { markAnthropicFamilyEnumeration } from "./anthropic-family-headers";
 import { effectiveCodexAuthAccountId, fetchMainAccountInfoSnapshot, listCodexAuthAccountsSnapshot } from "../../codex/auth-api";
 import { MAIN_CODEX_ACCOUNT_ID } from "../../codex/main-account";
 import { getValidAccessToken } from "../../oauth";
-import { getAccountCredential, getAccountSet } from "../../oauth/store";
+import { loadConfig } from "../../config";
+import { configuredAnthropicInstance, type AnthropicInstanceId } from "../anthropic-instance";
+import { captureOAuthAccountSelection, credentialGeneration, getAccountCredential, getAccountSet } from "../../oauth/store";
+import { hydrateKiroAccountState, persistKiroAccountState } from "../kiro-account-state-disk";
+import { kiroProbeCurrent, kiroProbeIdentity } from "./kiro-account-probe";
 import { fetchMuseKeyQuotaSnapshot } from "../muse-key-quota";
+import { probeAnthropicUsageQuota, type AnthropicUsageProbe } from "../claude-cli-usage";
 import { XAI_GROK_CLIENT_VERSION, XAI_GROK_COMPATIBILITY } from "../xai-transport";
 import {
   commitKiroAccountUsageState,
@@ -15,17 +21,20 @@ import { aggregateCodexPoolCapacity, CODEX_CAPACITY_MAX_QUOTA_AGE_MS, type Codex
 import { asRecord, normalizePercent, normalizeResetAt, readQuotaJson, REQUEST_TIMEOUT_MS, toFiniteNumber } from "../quota-wire";
 import { providerCodexAccountMode } from "../registry";
 import {
-  hasQuotaRows,
+  accountReportCurrent,
+  TERMINAL_QUOTA_FAILURE,
   providerLabel,
   providerQuotaFromCodexQuota,
   publicCapacityAggregation,
   report,
   tagNativeMainReport,
   type CodexAuthAccountsSnapshotPromise,
+  type ProviderQuotaProbeResult,
   type ProviderQuotaReport,
 } from "./report-cache";
 import {
   accountCacheKey,
+  captureProviderAccountQuotaEpoch,
   accountQuotaCache,
   hydrateAccountQuotaCache,
   mayCommitAccountQuotaKey,
@@ -33,6 +42,7 @@ import {
 } from "./account-cache";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
 import type { ProviderQuota, ProviderQuotaWindow } from "../quota-types";
+import { AnthropicQuotaProbeOwnershipError, anthropicCooldownRecoveryFor } from "./anthropic-cooldown-recovery";
 
 const XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const XAI_CREDITS_URL = `${XAI_BILLING_URL}?format=credits`;
@@ -43,9 +53,11 @@ export async function fetchChatGptForwardQuota(
   providerConfig: OcxProviderConfig,
   forceRefresh: boolean,
   prefetchedSnapshot?: CodexAuthAccountsSnapshotPromise,
-): Promise<ProviderQuotaReport | null> {
+): Promise<ProviderQuotaProbeResult> {
   if (providerCodexAccountMode(provider, providerConfig) === "direct") {
-    const snapshot = await fetchMainAccountInfoSnapshot(forceRefresh);
+    const snapshot = await fetchMainAccountInfoSnapshot(forceRefresh, config);
+    // A parsed return from a replaced credential cannot retain an older cached report either.
+    if (snapshot.infoUnpublished) return TERMINAL_QUOTA_FAILURE;
     const quota = providerQuotaFromCodexQuota(snapshot.info.quota);
     if (quota) quota.updatedAt = Date.now();
     return quota
@@ -215,35 +227,7 @@ export async function fetchXaiQuota(provider: string, context: { accessToken: st
   }
 }
 
-function parseClaudeBucket(value: unknown): { percent?: number; resetAt?: number } | null {
-  const rec = asRecord(value);
-  if (!rec) return null;
-  const percent = normalizePercent(rec.utilization);
-  const resetAt = normalizeResetAt(rec.resets_at);
-  if (percent === undefined && resetAt === undefined) return null;
-  return { percent, resetAt };
-}
-
-function parseClaudeLimit(value: unknown): { label: string; percent: number; resetAt?: number } | null {
-  const rec = asRecord(value);
-  if (!rec) return null;
-  const percent = normalizePercent(rec.percent);
-  if (percent === undefined) return null;
-  const scope = asRecord(rec.scope);
-  const model = asRecord(scope?.model);
-  const rawLabel = String(model?.display_name ?? "").trim();
-  if (!rawLabel) return null;
-  const lowerLabel = rawLabel.toLowerCase();
-  const label = lowerLabel.includes("fable") ? "Fable"
-    : lowerLabel.includes("opus") ? "Opus"
-      : lowerLabel.includes("sonnet") ? "Sonnet"
-        : rawLabel;
-  const resetAt = normalizeResetAt(rec.resets_at);
-  return { label, percent, ...(resetAt !== undefined ? { resetAt } : {}) };
-}
-
-/** Claude's OAuth usage endpoint, probed with ONE account's own bearer token. */
-const anthropicUsageInflight = new Map<string, Promise<ProviderQuota | null>>();
+const anthropicUsageInflight = new Map<string, Promise<AnthropicUsageProbe>>();
 
 /**
  * Anthropic per-credential usage.
@@ -251,97 +235,110 @@ const anthropicUsageInflight = new Map<string, Promise<ProviderQuota | null>>();
  * This endpoint reports quota only. Its body carries `five_hour`, `seven_day`, the
  * model-scoped weekly buckets (`seven_day_fable`/`_opus`/`_sonnet`) and a `limits` array,
  * and **no subscription or tier field** — nor does the OAuth token response, which yields only
- * `account.uuid` and `account.email_address` (`src/oauth/anthropic.ts`). That is why
- * `OAuthAccountSummary.plan` is `null` for Anthropic rather than populated here (#3777); it is
- * a missing upstream field, not an unfinished mapping.
+ * `account.uuid` and `account.email_address` (`src/oauth/anthropic.ts`). Subscription labels
+ * instead come from the authenticated profile in `src/oauth/anthropic-identity.ts`, never
+ * from this quota response.
  *
  * A tier must not be inferred from what is here. Percentages are normalized per account, so a
  * Max x5 seat at 50% is byte-identical to a Max x20 seat at 50%, and the presence of a
  * model-scoped window tracks entitlement rather than seat size. Populate `plan` only when
  * upstream returns the tier itself.
  */
-export async function fetchAnthropicUsageQuota(accessToken: string): Promise<ProviderQuota | null> {
-  const joinable = anthropicUsageInflight.get(accessToken);
+export async function fetchAnthropicUsageQuota(
+  accessToken: string,
+  requireFreshDispatch = false,
+): Promise<ProviderQuota | null> {
+  return fetchAnthropicUsageQuotaForInstance("anthropic", accessToken, requireFreshDispatch);
+}
+
+export async function fetchAnthropicUsageQuotaForInstance(
+  instance: AnthropicInstanceId,
+  accessToken: string,
+  requireFreshDispatch = false,
+): Promise<ProviderQuota | null> {
+  return (await fetchAnthropicUsageProbeForInstance(instance, accessToken, requireFreshDispatch)).quota;
+}
+
+/** The same shared flight as `fetchAnthropicUsageQuotaForInstance`, keeping the closed failure reason. */
+export async function fetchAnthropicUsageProbeForInstance(
+  instance: AnthropicInstanceId,
+  accessToken: string,
+  requireFreshDispatch = false,
+): Promise<AnthropicUsageProbe> {
+  // Recovery evidence must be requested after the claimed cooldown. Joining an older request
+  // can return after the 429 while still describing provider state from before that refusal.
+  const credentialIdentity = getAccountSet(instance)?.accounts.filter(row => row.credential.access === accessToken)
+    .map(row => [row.id, row.loginId, row.addedAt, credentialGeneration(row.credential)]);
+  const key = `${instance}\0${captureProviderAccountQuotaEpoch(instance)}\0${JSON.stringify(credentialIdentity)}\0${accessToken}`;
+  const joinable = requireFreshDispatch ? undefined : anthropicUsageInflight.get(key);
   if (joinable) return joinable;
 
-  const probe = (async (): Promise<ProviderQuota | null> => {
-    const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Accept: "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "claude-cli/2.1.63 (external, cli)",
-        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    if (!response.ok) return null;
-    const body = asRecord(await readQuotaJson(response));
-    if (!body) return null;
-    const fiveHour = parseClaudeBucket(body.five_hour);
-    const sevenDay = parseClaudeBucket(body.seven_day);
-    const fable = parseClaudeBucket(body.seven_day_fable);
-    const opus = parseClaudeBucket(body.seven_day_opus);
-    const sonnet = parseClaudeBucket(body.seven_day_sonnet);
-    const customWindows: ProviderQuotaWindow[] = [];
-    if (fable?.percent !== undefined) customWindows.push({ label: "Fable", percent: fable.percent, ...(fable.resetAt !== undefined ? { resetAt: fable.resetAt } : {}) });
-    if (opus?.percent !== undefined) customWindows.push({ label: "Opus", percent: opus.percent, ...(opus.resetAt !== undefined ? { resetAt: opus.resetAt } : {}) });
-    if (sonnet?.percent !== undefined) customWindows.push({ label: "Sonnet", percent: sonnet.percent, ...(sonnet.resetAt !== undefined ? { resetAt: sonnet.resetAt } : {}) });
-    const knownLabels = new Set(customWindows.map(window => window.label.toLowerCase()));
-    const limits = Array.isArray(body.limits) ? body.limits : [];
-    for (const rawLimit of limits) {
-      const limitRecord = asRecord(rawLimit);
-      // `session` and `weekly_all` mirror the canonical five-hour and weekly
-      // buckets above; only model-scoped weekly limits add a third window.
-      if (String(limitRecord?.kind ?? "").trim().toLowerCase() !== "weekly_scoped") continue;
-      const limit = parseClaudeLimit(rawLimit);
-      if (!limit || knownLabels.has(limit.label.toLowerCase())) continue;
-      knownLabels.add(limit.label.toLowerCase());
-      customWindows.push(limit);
-    }
-    const quota: ProviderQuota = {
-      // Claude's 5-hour window is a first-class rate limit, same as the Codex login 5h/weekly
-      // rows: report it in the canonical fields so the dashboard renders it with the standard
-      // "5-hour limit" label and ordering instead of as a generic extra window.
-      ...(fiveHour?.percent !== undefined ? { fiveHourPercent: fiveHour.percent } : {}),
-      ...(fiveHour?.resetAt !== undefined ? { fiveHourResetAt: fiveHour.resetAt } : {}),
-      ...(sevenDay?.percent !== undefined ? { weeklyPercent: sevenDay.percent } : {}),
-      ...(sevenDay?.resetAt !== undefined ? { weeklyResetAt: sevenDay.resetAt } : {}),
-      ...(customWindows.length > 0 ? { customWindows } : {}),
-      updatedAt: Date.now(),
-    };
-    // Empty / schema-changed payloads must not cache as "success with no bars".
-    return hasQuotaRows(quota) ? quota : null;
-  })().finally(() => {
-    if (anthropicUsageInflight.get(accessToken) === probe) anthropicUsageInflight.delete(accessToken);
+  const probe = probeAnthropicUsageQuota(accessToken).finally(() => {
+    if (anthropicUsageInflight.get(key) === probe) anthropicUsageInflight.delete(key);
   });
-  anthropicUsageInflight.set(accessToken, probe);
+  anthropicUsageInflight.set(key, probe);
   return probe;
 }
 
-export async function fetchAnthropicQuota(provider: string): Promise<ProviderQuotaReport | null> {
+/** `config` is the caller's live object; currency re-reads it instead of reloading the file. */
+export async function fetchAnthropicQuota(provider: string, config: OcxConfig = loadConfig()): Promise<ProviderQuotaReport | null> {
+  const instance = configuredAnthropicInstance(config, provider);
+  const target = config.providers[provider];
+  if (!instance || target?.disabled || target && target.authMode !== "oauth") return null;
+  const targetIdentity = JSON.stringify(target);
+  const targetCurrent = () => configuredAnthropicInstance(config, provider) === instance
+    && JSON.stringify(config.providers[provider]) === targetIdentity;
+  const recovery = anthropicCooldownRecoveryFor(instance);
   // Capture the account we intend to probe before awaiting — a mid-flight active
   // switch must not seed the wrong account's cache with this response.
-  const probedAccountId = getAccountSet("anthropic")?.activeAccountId;
-  const probedAccountKey = probedAccountId ? accountCacheKey("anthropic", probedAccountId) : null;
+  const selection = captureOAuthAccountSelection(instance);
+  const probedAccountId = selection?.accountId;
+  const initialRow = getAccountSet(instance)?.accounts.find(row => row.id === probedAccountId);
+  const epoch = captureProviderAccountQuotaEpoch(instance);
+  const incarnation = probedAccountId ? recovery.reserveAnthropicAccountIncarnation(probedAccountId) : undefined;
+  const probedAccountKey = probedAccountId ? accountCacheKey(instance, probedAccountId) : null;
   const writerGeneration = captureConfigGeneration();
   let accessToken: string;
   try {
-    accessToken = await getValidAccessToken("anthropic");
+    accessToken = await getValidAccessToken(instance);
   } catch {
     return null;
   }
-  const quota = await fetchAnthropicUsageQuota(accessToken);
+  if (!probedAccountId || !probedAccountKey) return null;
+  const currentRow = getAccountSet(instance)?.accounts.find(row => row.id === probedAccountId);
+  if (!initialRow || !currentRow || initialRow.loginId !== currentRow.loginId || initialRow.addedAt !== currentRow.addedAt
+    || epoch !== captureProviderAccountQuotaEpoch(instance) || recovery.anthropicAccountIncarnation(probedAccountId) !== incarnation) return null;
+  let quota: ProviderQuota | null;
+  let anthropicCurrent: (() => boolean) | undefined; let anthropicPublish: (() => void) | undefined;
+  try {
+    const result = await recovery.probeAnthropicQuotaWithRecovery(probedAccountId, accessToken,
+      fresh => {
+        if (!targetCurrent()) throw new AnthropicQuotaProbeOwnershipError("quota target changed");
+        recovery.assertAnthropicQuotaSendAllowed(probedAccountId, accessToken);
+        return fetchAnthropicUsageQuotaForInstance(instance, accessToken, fresh);
+      },
+      () => targetCurrent() && mayCommitAccountQuotaKey(probedAccountKey, writerGeneration));
+    if (result && !result.isCurrent()) return null;
+    quota = result?.quota ?? null;
+    anthropicCurrent = result?.isCurrent; anthropicPublish = result?.publishDecisionQuota;
+  } catch (error) {
+    if (error instanceof AnthropicQuotaProbeOwnershipError) return null;
+    throw error;
+  }
   if (!quota) return null;
   // Share the active-account probe with the per-account cache so Providers-page
   // loads do not double-hit Anthropic's rate-limited usage endpoint.
   if (probedAccountId && probedAccountKey) {
-    const stillOwnsToken = getAccountCredential("anthropic", probedAccountId)?.access === accessToken;
-    if (stillOwnsToken && mayCommitAccountQuotaKey(probedAccountKey, writerGeneration)) {
-      accountQuotaCache.set(probedAccountKey, { ts: Date.now(), quota });
+    const stillOwnsToken = getAccountCredential(instance, probedAccountId)?.access === accessToken;
+    if (stillOwnsToken && anthropicCurrent?.() && mayCommitAccountQuotaKey(probedAccountKey, writerGeneration)) {
+      accountQuotaCache.set(probedAccountKey, { ts: Date.now(), quota, isCurrent: anthropicCurrent }); anthropicPublish?.();
     }
   }
-  return report(provider, "anthropic:oauth-usage", quota);
+  const quotaReport = report(provider, "anthropic:oauth-usage", quota);
+  if (quotaReport && anthropicCurrent) {
+    accountReportCurrent.set(quotaReport, () => anthropicCurrent() && getAccountSet(instance)?.activeAccountId === probedAccountId);
+  }
+  return quotaReport;
 }
 
 /**
@@ -352,8 +349,10 @@ export async function fetchAnthropicQuota(provider: string): Promise<ProviderQuo
  * concurrent account switch cannot file this answer under the wrong account.
  */
 export async function fetchKiroQuota(provider: string): Promise<ProviderQuotaReport | null> {
+  hydrateKiroAccountState();
   const probedAccountId = getAccountSet("kiro")?.activeAccountId;
   if (!probedAccountId) return null;
+  const identity = kiroProbeIdentity(probedAccountId);
   const probedAccountKey = accountCacheKey("kiro", probedAccountId);
   const writerGeneration = captureConfigGeneration();
   let snapshot: KiroUsageSnapshot | null;
@@ -363,9 +362,11 @@ export async function fetchKiroQuota(provider: string): Promise<ProviderQuotaRep
     return null;
   }
   if (!snapshot) return null;
+  if (!kiroProbeCurrent(probedAccountId, identity)) return null;
   if (mayCommitAccountQuotaKey(probedAccountKey, writerGeneration)) {
-    accountQuotaCache.set(probedAccountKey, { ts: Date.now(), quota: snapshot.quota });
-    commitKiroAccountUsageState(probedAccountKey, snapshot);
+    accountQuotaCache.set(probedAccountKey, { ts: Date.now(), quota: snapshot.quota, identity });
+    commitKiroAccountUsageState(probedAccountKey, snapshot, identity);
+    persistKiroAccountState();
   }
   return report(provider, "kiro:usage-limits", snapshot.quota);
 }
@@ -383,6 +384,8 @@ export async function fetchKiroQuota(provider: string): Promise<ProviderQuotaRep
 export async function fetchMuseKeyQuota(provider: string): Promise<ProviderQuotaReport | null> {
   const probedAccountId = getAccountSet(provider)?.activeAccountId;
   if (!probedAccountId) return null;
+  // A paused account is excluded from every automatic upstream use; a key mint is one.
+  if (getAccountSet(provider)?.accounts.find(account => account.id === probedAccountId)?.paused === true) return null;
   const oauthAccessToken = getAccountCredential(provider, probedAccountId)?.muse?.oauthAccessToken;
   // An imported or pasted credential has no account token and never will: it is
   // capability, not provider id, that decides whether a probe is possible.
@@ -434,7 +437,6 @@ export async function fetchCursorQuota(provider: string, accessToken: string): P
   const authHeaders = {
     Accept: "application/json",
     Authorization: `Bearer ${accessToken}`,
-    "User-Agent": "opencodex-quota",
   } as const;
 
   // Prefer dashboard period usage (Pro/Team/Ultra spend allowance in USD cents).

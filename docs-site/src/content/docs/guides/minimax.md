@@ -12,6 +12,11 @@ the protocol boundary it actually exposes:
 
 ## MiniMax Code
 
+In the OpenCodex Models page, both MiniMax Coding Plan regions advertise image input for
+`MiniMax-M3` and `MiniMax-M3.1-Flash`. A Combo's **Image / multimodal** switch is
+available only when every selected model supports image input. The switch controls image
+attachments; it does not enable video uploads.
+
 Install and sign in to MiniMax Code using MiniMax's instructions first. Then start
 OpenCodex and connect the reversible file integration:
 
@@ -42,9 +47,9 @@ custom_provider:
           context: 1000000
 ```
 
-The real generated model list and its known context windows and reasoning-effort ladders
-come from the running OpenCodex catalog. A model with no authoritative context window or
-effort ladder omits that field instead of receiving a guessed value. MCode keeps the
+The generated model list, context windows, and reasoning-effort ladders come from the running
+OpenCodex catalog. Context windows can include [custom-provider estimates](/reference/configuration/providers/#context-windows-on-custom-providers); if the catalog
+has no window or effort ladder, the corresponding field is omitted. MCode keeps the
 currently selected effort in the session, so OpenCodex exports `effortOptions` without
 overwriting that selection. The block does not write a real key, does not replace
 `defaultModel`, and does not change your MiniMax login. In MCode, choose a model under

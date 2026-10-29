@@ -1,3 +1,6 @@
+import { decisionQuotaSinkActive, invalidateDecisionKeyQuotas, replaceCollectedDecisionQuotas, type AntigravityQuotaObservation, type AntigravityQuotaReceipt, type DecisionKeyObservation } from "../../lib/decision-quota-sink";
+import { providerDecisionWindows } from "../quota-decision-publication";
+import type { DecisionQuotaWindow } from "../quota-decision-snapshot";
 import { createHash } from "node:crypto";
 import { effectiveCodexAuthAccountId, listCodexAuthAccountsSnapshot } from "../../codex/auth-api";
 import { withoutRetiredCodexQuota, type StoredAccountQuota } from "../../codex/quota";
@@ -8,7 +11,7 @@ import { apiKeyPoolEntryId } from "../api-keys";
 import { getProviderRegistryEntry, providerCodexAccountMode } from "../registry";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../openai-tiers";
 import { CODEX_CAPACITY_MAX_QUOTA_AGE_MS, type CodexCapacityAggregation, type CodexCapacityQuota } from "../codex-capacity";
-import { clearCachedProviderQuotas, providerQuotaRoutingBinding, type ProviderQuotaRoutingEvidence } from "../quota-routing-cache";
+import { clearCachedProviderQuotas, providerQuotaRoutingBinding, replaceCachedProviderQuotas, type ProviderQuotaRoutingEvidence } from "../quota-routing-cache";
 import { clearProviderApiKeyQuotaCache } from "../quota-key-accounts";
 import { QUOTA_JSON_READ_FAILURE, readQuotaJson } from "../quota-wire";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
@@ -19,6 +22,8 @@ export const LAST_GOOD_MAX_AGE_MS = CODEX_CAPACITY_MAX_QUOTA_AGE_MS;
 const nativeMainReportGenerations = new WeakMap<ProviderQuotaReport, number>();
 export const accountReportCurrent = new WeakMap<ProviderQuotaReport, () => boolean>();
 export const routingEvidence = new WeakMap<ProviderQuotaReport, ProviderQuotaRoutingEvidence>();
+/** Only the live Antigravity probe binds this projection; display/last-good rows cannot create it. */
+export const antigravityEvidence = new WeakMap<ProviderQuotaReport, { receipt: AntigravityQuotaReceipt; windows: readonly DecisionQuotaWindow[] }>();
 export let providerQuotaBeforePublishForTests: (() => void | Promise<void>) | null = null;
 
 /** Test-only seam for identity/config invalidation after probes but before publication. */
@@ -98,7 +103,31 @@ export function clearProviderQuotaCache(): void {
   cache = null;
   clearCachedProviderQuotas();
   clearProviderApiKeyQuotaCache();
+  invalidateDecisionKeyQuotas();
   invalidationEpoch += 1;
+}
+
+const providerReportEpochs = new Map<string, number>();
+
+export function captureProviderReportEpochs(): ReadonlyMap<string, number> {
+  return new Map(providerReportEpochs);
+}
+
+export function providerReportEpochChanged(captured: ReadonlyMap<string, number>, provider: string): boolean {
+  return (providerReportEpochs.get(provider) ?? 0) !== (captured.get(provider) ?? 0);
+}
+
+/**
+ * Provider-scoped invalidation: drop one provider's report and routing row. The global epoch
+ * is untouched, so another provider's cached row and in-flight commit authority survive; an
+ * aggregate already in flight drops only this provider's row when it publishes.
+ */
+export function clearProviderQuotaCacheFor(provider: string): void {
+  providerReportEpochs.set(provider, (providerReportEpochs.get(provider) ?? 0) + 1);
+  if (!cache) return;
+  const reports = cache.response.reports.filter(report => report.provider !== provider);
+  cache = { ...cache, response: { ...cache.response, reports } };
+  replaceCachedProviderQuotas(reports, routingEvidence);
 }
 
 function cacheKey(config: OcxConfig): string {
@@ -320,4 +349,35 @@ export function isProviderQuotaReportCurrent(value: ProviderQuotaReport): boolea
   const generation = nativeMainReportGenerations.get(value);
   return (generation === undefined || isMainAccountIdentityGenerationLive(generation))
     && (accountReportCurrent.get(value)?.() ?? true);
+}
+
+/** Called only by an accepted collector/cache publication, never the JEV read path. */
+export function publishCollectedDecisionQuota(reports: ProviderQuotaReport[], config: OcxConfig): void {
+  if (!decisionQuotaSinkActive()) return;
+  const keys: DecisionKeyObservation[] = [];
+  const oauth: AntigravityQuotaObservation[] = [];
+  for (const report of reports) {
+    const provider = config.providers[report.provider];
+    if (!provider || !isProviderQuotaReportCurrent(report)) continue;
+    const observation = antigravityEvidence.get(report);
+    if (observation) oauth.push({ name: report.provider, provider, ...observation });
+    const evidence = routingEvidence.get(report);
+    if (evidence && evidence.binding === providerQuotaRoutingBinding(report.provider, provider))
+      keys.push({ name: report.provider, provider, windows: providerDecisionWindows(evidence.quota) });
+  }
+  replaceCollectedDecisionQuotas(keys, oauth);
+}
+
+/**
+ * The reports this process already holds for the configured providers, for a passive read (#6959):
+ * no probe, token refresh, account snapshot or publication into routing evidence. The Home's own
+ * dashboard and traffic keep the cache current.
+ */
+export function heldProviderQuotaReports(configuredProviders: readonly string[]): ProviderQuotaResponse {
+  const held = getProviderQuotaReportCache()?.response;
+  const configured = new Set(configuredProviders);
+  return {
+    generatedAt: held?.generatedAt ?? Date.now(),
+    reports: (held?.reports ?? []).filter(item => configured.has(item.provider) && isProviderQuotaReportCurrent(item)),
+  };
 }

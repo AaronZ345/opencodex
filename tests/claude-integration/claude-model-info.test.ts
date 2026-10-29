@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildAnthropicModelInfos, nativeEffectiveLadder } from "../../src/claude/model-info";
+import { buildAnthropicModelInfos, configuredRoutedDisplayName, nativeEffectiveLadder } from "../../src/claude/model-info";
 import { gatherRoutedModels, nativeEffortClamp } from "../../src/codex/catalog";
+import { MIMO_THINKING_CAPABILITIES } from "../../src/providers/mimo-thinking";
+import { cursorFastCapableBases, cursorFastIdFor } from "../../src/adapters/cursor/catalog";
+import type { OcxConfig } from "../../src/types";
 
 describe("anthropic-flavor ModelInfo discovery entries (devlog 130 B4b)", () => {
   test.each(["anthropic", "anthropic-apikey"])("%s registry image inputs reach Claude discovery aliases", async (provider) => {
@@ -58,6 +61,78 @@ describe("anthropic-flavor ModelInfo discovery entries (devlog 130 B4b)", () => 
     expect(info!.max_input_tokens).toBeNull();
   });
 
+  test("generic toggle-only models publish enabled thinking without claiming adaptive", () => {
+    const [info] = buildAnthropicModelInfos([], [{
+      provider: "p",
+      id: "toggle-only",
+      supportsReasoning: true,
+      supportsThinkingToggle: true,
+      supportsReasoningEffort: false,
+    }]);
+    expect(info!.capabilities.thinking).toEqual({
+      supported: true,
+      types: { adaptive: { supported: false }, enabled: { supported: true } },
+    });
+  });
+
+  test.each([
+    {
+      name: "fixed reasoning",
+      capabilities: { supportsReasoning: true, supportsThinkingToggle: false, supportsReasoningEffort: false },
+      ladder: ["high"],
+      effort: false,
+      thinking: { supported: true, adaptive: false, enabled: false },
+    },
+    {
+      name: "effort-only reasoning",
+      capabilities: { supportsReasoning: true, supportsThinkingToggle: false, supportsReasoningEffort: true },
+      ladder: ["high"],
+      effort: true,
+      thinking: { supported: true, adaptive: true, enabled: false },
+    },
+    {
+      name: "combined controls",
+      capabilities: { supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: true },
+      ladder: ["high"],
+      effort: true,
+      thinking: { supported: true, adaptive: true, enabled: true },
+    },
+    {
+      name: "explicitly unsupported reasoning",
+      capabilities: { supportsReasoning: false, supportsThinkingToggle: true, supportsReasoningEffort: true },
+      ladder: ["high"],
+      effort: false,
+      thinking: { supported: false, adaptive: false, enabled: false },
+    },
+    {
+      name: "effort declaration without a usable Claude rung",
+      capabilities: { supportsReasoning: true, supportsThinkingToggle: false, supportsReasoningEffort: true },
+      ladder: [],
+      effort: false,
+      thinking: { supported: true, adaptive: false, enabled: false },
+    },
+  ])("$name preserves independent reasoning axes", ({ capabilities, ladder, effort, thinking }) => {
+    const [info] = buildAnthropicModelInfos([], [{ provider: "p", id: "model", reasoningEfforts: ladder, ...capabilities }]);
+    expect(info!.capabilities.effort.supported).toBe(effort);
+    expect(info!.capabilities.thinking).toEqual({
+      supported: thinking.supported,
+      types: { adaptive: { supported: thinking.adaptive }, enabled: { supported: thinking.enabled } },
+    });
+  });
+
+  test("MiMo V2.6 publishes its documented enabled-only thinking switch", () => {
+    const [info] = buildAnthropicModelInfos([], [{
+      provider: "xiaomi",
+      id: "mimo-v2.6-pro",
+      ...MIMO_THINKING_CAPABILITIES["mimo-v2.6-pro"],
+    }]);
+    expect(info!.capabilities.effort.supported).toBe(false);
+    expect(info!.capabilities.thinking).toEqual({
+      supported: true,
+      types: { adaptive: { supported: false }, enabled: { supported: true } },
+    });
+  });
+
   test("non-anthropic rungs (ultra) are filtered out of the capability set", () => {
     const [info] = buildAnthropicModelInfos([], [{ provider: "p", id: "m", reasoningEfforts: ["ultra"] }]);
     expect(info!.capabilities.effort.supported).toBe(false);
@@ -79,7 +154,7 @@ describe("anthropic-flavor ModelInfo discovery entries (devlog 130 B4b)", () => 
 
     expect(infos.map(info => info.id)).toEqual([
       "claude-fable-5-1",
-      "claude-ocx-native--claude-fable-5-1[1m]",
+      "ocx-claude-native--claude-fable-5-1[1m]",
     ]);
     expect(infos[1]!.display_name).toBe("claude-fable-5-1 (anthropic) · 1M");
     expect(infos[1]!.max_input_tokens).toBe(1_000_000);
@@ -191,7 +266,7 @@ describe("anthropic-flavor ModelInfo discovery entries (devlog 130 B4b)", () => 
     expect(variants[0]!.display_name.includes("claude-big-5")).toBe(true);
   });
 
-  test("readable id style serves claude-ocx ids with hash fallback + readable [1m] variants (devlog 050)", () => {
+  test("readable id style serves ocx-claude ids with hash fallback + readable [1m] variants (devlog 050)", () => {
     const auto = { enabled: true, compactWindow: 350_000 };
     const infos = buildAnthropicModelInfos(["gpt-5.5"], [
       { provider: "cursor", id: "gpt-5.6-luna", contextWindow: 1_000_000 },
@@ -199,16 +274,16 @@ describe("anthropic-flavor ModelInfo discovery entries (devlog 130 B4b)", () => 
       { provider: "weird--provider", id: "m1", contextWindow: 128_000 }, // unrepresentable -> hash fallback
     ], auto, "readable");
     const ids = infos.map(i => i.id);
-    expect(ids).toContain("claude-ocx-native--gpt-5.5");
+    expect(ids).toContain("ocx-claude-native--gpt-5.5");
     // 272k native: NO [1m] variant under the authoritative-window contract.
-    expect(ids).not.toContain("claude-ocx-native--gpt-5.5[1m]");
-    expect(ids).toContain("claude-ocx-cursor--gpt-5.6-luna");
-    expect(ids).toContain("claude-ocx-cursor--gpt-5.6-luna[1m]");
+    expect(ids).not.toContain("ocx-claude-native--gpt-5.5[1m]");
+    expect(ids).toContain("ocx-claude-cursor--gpt-5.6-luna");
+    expect(ids).toContain("ocx-claude-cursor--gpt-5.6-luna[1m]");
     expect(ids).toContain("claude-opus-4-8"); // anthropic canonical passthrough
     expect(ids.some(id => /^claude-opus-4-8-[a-z][0-9a-z]{2}$/.test(id))).toBe(true); // fallback row survives
     // Default style stays hashed (desktop contract untouched).
     const hashed = buildAnthropicModelInfos(["gpt-5.6-sol"], [], auto);
-    expect(hashed.map(i => i.id).some(id => id.startsWith("claude-ocx-"))).toBe(false);
+    expect(hashed.map(i => i.id).some(id => id.startsWith("ocx-claude-"))).toBe(false);
   });
 });
 
@@ -235,5 +310,100 @@ describe("saved picker order changes groups after identity selection", () => {
     const result = buildAnthropicModelInfos([], models, undefined, "desktop3p", () => "collision", undefined, false, undefined,
       { modelPickerOrder: ["p/b", "p/a"] });
     expect(result.map(row => [row.id, row.display_name])).toEqual([["collision", "a (p)"]]);
+  });
+});
+
+describe("Claude Code picker description (replaces the generic \"From gateway\" line)", () => {
+  test("readable rows describe the route OpenCodex serves them through", () => {
+    const infos = buildAnthropicModelInfos(["gpt-5.5"], [
+      { provider: "xai", id: "grok-4.7", contextWindow: 500_000 },
+    ], undefined, "readable");
+    const native = infos.find(i => i.display_name === "gpt-5.5 (native)");
+    const routed = infos.find(i => i.display_name === "grok-4.7 (xai)");
+    expect(native?.description).toBe("Routed by OpenCodex to native gpt-5.5");
+    expect(routed?.description).toBe("Routed by OpenCodex to xai/grok-4.7");
+  });
+
+  // A 1M row is the same route with a larger window; a Fast row selects a different tier or
+  // variant, so its description says so the way its display name does.
+  test("1M siblings keep the base description and Fast siblings name the Fast tier", () => {
+    const infos = buildAnthropicModelInfos([], [
+      { provider: "p", id: "big", contextWindow: 1_000_000 },
+    ], undefined, "readable", undefined, undefined, false, () => true);
+    expect(infos.map(i => [i.display_name, i.description])).toEqual([
+      ["big (p)", "Routed by OpenCodex to p/big"],
+      ["big (p) · 1M", "Routed by OpenCodex to p/big"],
+      ["big (p) · Fast", "Routed by OpenCodex to p/big · Fast"],
+    ]);
+  });
+
+  test("Desktop 3P rows stay unchanged (no description field)", () => {
+    const infos = buildAnthropicModelInfos(["gpt-5.5"], [{ provider: "xai", id: "grok-4.7" }], undefined, "desktop3p");
+    for (const info of infos) expect("description" in info).toBe(false);
+  });
+});
+
+describe("routed rows honour providers.<p>.modelDisplayNames", () => {
+  // A second subscription pool lists the same model ids as the client's own login; the
+  // operator label is what tells the picker rows apart without spelling the raw id.
+  const labels: Record<string, string> = { "claude-sonnet-5-5": "Sonnet 5.5" };
+  const routedDisplayName = (model: { provider: string; id: string }) =>
+    model.provider === "anthropic2" ? labels[model.id] : undefined;
+
+  test("a labelled row and its 1M and Fast siblings use the label; ids are unchanged", () => {
+    const routed = [
+      { provider: "anthropic2", id: "claude-sonnet-5-5", contextWindow: 1_000_000 },
+      { provider: "anthropic2", id: "claude-haiku-5-5", contextWindow: 200_000 },
+    ];
+    const plain = buildAnthropicModelInfos([], routed, undefined, "readable", undefined, undefined, false, () => true);
+    const named = buildAnthropicModelInfos([], routed, undefined, "readable", undefined, undefined, false, () => true,
+      undefined, routedDisplayName);
+    expect(named.map(i => i.id)).toEqual(plain.map(i => i.id));
+    expect(named.map(i => i.description)).toEqual(plain.map(i => i.description));
+    expect(named.map(i => i.display_name)).toEqual([
+      "Sonnet 5.5 (anthropic2)",
+      "Sonnet 5.5 (anthropic2) · 1M",
+      "Sonnet 5.5 (anthropic2) · Fast",
+      "claude-haiku-5-5 (anthropic2)",
+      "claude-haiku-5-5 (anthropic2) · Fast",
+    ]);
+  });
+
+  test("native rows never consult the resolver", () => {
+    const infos = buildAnthropicModelInfos(["gpt-5.5"], [], undefined, "readable", undefined, undefined, false,
+      undefined, undefined, () => "Renamed");
+    expect(infos[0]!.display_name).toBe("gpt-5.5 (native)");
+  });
+
+  test("a fastMode-rewritten Cursor row keeps its listed id rather than the base label", () => {
+    const base = [...cursorFastCapableBases()][0]!;
+    const fastId = cursorFastIdFor(base)!;
+    const [info] = buildAnthropicModelInfos([], [{ provider: "cursor", id: base }], undefined, "readable",
+      undefined, undefined, true, undefined, undefined, () => "Cursor Base");
+    expect(info!.display_name).toBe(`${fastId} (cursor)`);
+  });
+
+  test("labels gathered from provider config reach the row; unlabelled rows keep the raw id", async () => {
+    const config = {
+      port: 10100,
+      defaultProvider: "anthropic2",
+      providers: {
+        anthropic2: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "key",
+          apiKey: "k",
+          liveModels: false,
+          models: ["claude-sonnet-5-5", "claude-haiku-5-5"],
+          modelDisplayNames: { "claude-sonnet-5-5": "Sonnet 5.5" },
+        },
+      },
+    } as unknown as OcxConfig;
+    const routed = (await gatherRoutedModels(config)).filter(model => model.provider === "anthropic2");
+    const infos = buildAnthropicModelInfos([], routed, undefined, "readable", undefined, undefined, false, undefined,
+      undefined, configuredRoutedDisplayName(config));
+    const byId = new Map(infos.map(info => [info.id, info.display_name]));
+    expect(byId.get("ocx-claude-anthropic2--claude-sonnet-5-5")).toBe("Sonnet 5.5 (anthropic2)");
+    expect(byId.get("ocx-claude-anthropic2--claude-haiku-5-5")).toBe("claude-haiku-5-5 (anthropic2)");
   });
 });

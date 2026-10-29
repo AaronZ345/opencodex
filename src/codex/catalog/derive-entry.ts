@@ -1,6 +1,6 @@
 import type { OcxConfig } from "../../types";
 import { effectiveProviderAlias } from "../../providers/default-aliases";
-import { identifyRoutedModel } from "../../adapters/identity";
+import { neutralizeIdentity } from "../../adapters/identity";
 import { COMBO_NAMESPACE } from "../../combos";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
@@ -26,6 +26,8 @@ import {
   isGpt56NativeSlug,
 } from "./effort";
 import { CATALOG_INACTIVE_REASON_FIELD, SPAWN_PRIORITY_FIELD } from "./subagent-roster";
+import { OCX_NATIVE_SOURCE_PRIORITY_FIELD } from "./native-priority";
+import { applyRoutedDescription } from "./ownership";
 
 export function finishUpstreamNativeEntry(clone: RawEntry, priority: number, contextCap?: NativeContextLimitsInput): RawEntry {
   if (priority !== 9) clone.priority = priority;
@@ -126,9 +128,10 @@ export function deriveEntry(
     delete e.opencodex_native_display_name;
     // A cached template may carry display-order history; each new row owns its natural rank.
     delete e[SPAWN_PRIORITY_FIELD];
+    delete e[OCX_NATIVE_SOURCE_PRIORITY_FIELD];
     e.slug = slug;
     e.display_name = routedDisplayName(slug, model);
-    e.description = desc;
+    applyRoutedDescription(e, desc, model);
     e.priority = priority;
     e.visibility = "list";
     if ("upgrade" in e) e.upgrade = null;
@@ -144,14 +147,18 @@ export function deriveEntry(
         delete e.context_window;
         delete e.max_context_window;
         delete e.auto_compact_token_limit;
+        // Nor its comp_hash (#5796): template selection is not evidence of history
+        // compatibility. Normalization represents the unknown value as null, avoiding
+        // both rebuild-dependent hashes and a synthetic native/routed mismatch.
+        delete e.comp_hash;
       }
-      // Native id for identity text + metadata lookups — the slug may be an encoded
-      // alias (`provider/vendor-model`); the model object carries the native id.
-      const modelName = model?.id ?? slug.slice(slug.indexOf("/") + 1);
       if (typeof e.base_instructions === "string") {
         // Proxy-neutral: keep the GPT-5/OpenAI disclaimer but never advertise the opencodex proxy
         // (leaking that into base_instructions is a non-first-party signature → ToS risk).
-        e.base_instructions = identifyRoutedModel(e.base_instructions, modelName);
+        // Model-neutral on disk (#5217): Codex stores this block as the session's instructions and
+        // replays it verbatim into a sub-agent spawned on a DIFFERENT model, so a baked-in model id
+        // follows the worker and misnames it. The destination id is written at request time instead.
+        e.base_instructions = neutralizeIdentity(e.base_instructions);
       }
       applyReasoningLevels(
         e,
@@ -190,6 +197,7 @@ export function deriveEntry(
     return ensureStrictCatalogFields(normalizeServiceTiers(e), {
       preserveExactInputModalities: preserveExact,
       isRouted,
+      preserveNativeAccessPrograms: codexForwardNativeCapabilityAlias !== null,
     });
   }
   // Fallback when no template is available (best-effort; strict parser may need more).
@@ -207,6 +215,7 @@ export function deriveEntry(
         : { web_search_tool_type: "text_and_image", supports_search_tool: true }
       : {}),
   };
+  applyRoutedDescription(entry, desc, model);
   if (isRouted) {
     applyRoutedCodexToolMode(entry, model?.codexToolMode);
     applyReasoningLevels(

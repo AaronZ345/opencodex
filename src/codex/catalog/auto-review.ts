@@ -1,9 +1,11 @@
+import { isCodexControlPlaneModel } from "../control-plane-models";
 import { redactSecretString } from "../../lib/redact";
 import type { OcxConfig } from "../../types";
 import { encodeRoutedModelId } from "../../providers/slug-codec";
 import { canonicalAutoReviewModelKey, isValidAutoReviewModel as isValidAutoReviewTarget } from "../../config/provider-validation";
 import { readConfiguredAutoReviewModel } from "./parsing";
 import type { RawEntry } from "./parsing";
+import { hasOcxRoutedAuthorship } from "./ownership";
 import { configuredCatalogEntry } from "./subagent-roster";
 
 const AUTO_REVIEW_ROOT_MARKER = "opencodex_auto_review_root";
@@ -34,9 +36,10 @@ export type AutoReviewModelOverrideResult = "absent" | "applied" | "invalid" | "
 
 /** True when a catalog row was synthesized by opencodex instead of coming from upstream. */
 function isRoutedCatalogEntry(entry: RawEntry): boolean {
+  if (isCodexControlPlaneModel(entry.slug)) return false;
   const slug = typeof entry.slug === "string" ? entry.slug : "";
   return slug.includes("/")
-    || (typeof entry.description === "string" && entry.description.startsWith("Routed via opencodex → "));
+    || hasOcxRoutedAuthorship(entry);
 }
 
 /** Restore an owned native value, retaining provenance to avoid legacy reclassification. */
@@ -57,6 +60,7 @@ function clearAutoReviewOverrideValue(entry: RawEntry): void {
  * Returns the stamped values when the observed rows match that shape.
  */
 function legacyRootStampValues(observedModels: readonly RawEntry[]): ReadonlySet<string> | undefined {
+  observedModels = observedModels.filter(entry => !isCodexControlPlaneModel(entry?.slug));
   if (observedModels.some(entry => entry?.[AUTO_REVIEW_ROOT_MARKER] !== undefined)) return undefined;
   const configuredValues = new Set(observedModels.flatMap(entry => {
     const value = entry?.auto_review_model_override;
@@ -90,7 +94,7 @@ function clearLegacyRootStamps(models: readonly RawEntry[], sourceModels: readon
   const legacyStamp = legacyRootStampValues([...models, ...sourceModels]);
   if (legacyStamp === undefined) return;
   for (const entry of models) {
-    if (!entry || typeof entry !== "object") continue;
+    if (!entry || typeof entry !== "object" || isCodexControlPlaneModel(entry.slug)) continue;
     const current = entry.auto_review_model_override;
     if (entry[AUTO_REVIEW_ROOT_MARKER] === undefined
       && typeof current === "string" && legacyStamp.has(current)) clearAutoReviewOverrideValue(entry);
@@ -107,7 +111,7 @@ function clearAutoReviewModelOverride(
 ): void {
   const legacyStamp = legacyRootStampValues([...models, ...sourceModels]);
   for (const entry of models) {
-    if (!entry || typeof entry !== "object") continue;
+    if (!entry || typeof entry !== "object" || isCodexControlPlaneModel(entry.slug)) continue;
     const current = entry.auto_review_model_override;
     if (isRoutedCatalogEntry(entry)
       || (entry[AUTO_REVIEW_ROOT_MARKER] === true || rootAutoReviewStamp(entry) !== undefined)
@@ -188,6 +192,7 @@ function preserveNativeAutoReviewModelOverrides(
 
 /** Stamp a root-derived override and mark native rows so later root removal is durable. */
 function stampRootAutoReviewOverride(entry: RawEntry, target: string): void {
+  if (isCodexControlPlaneModel(entry.slug)) return;
   if (!isRoutedCatalogEntry(entry)) {
     const previous = rootAutoReviewStamp(entry);
     const current = entry.auto_review_model_override;
@@ -399,7 +404,7 @@ function applyRootSelectorToRemaining(
 ): AutoReviewModelOverrideResult {
   const clearRemaining = (): void => {
     for (const entry of models) {
-      if (!entry || providerStamped.has(entry)) continue;
+      if (!entry || providerStamped.has(entry) || isCodexControlPlaneModel(entry.slug)) continue;
       // Native rows written by releases before the root marker cannot be told apart from upstream
       // values once provider stamps diverge. clearLegacyRootStamps sweeps the ones the legacy
       // uniform signature still recognizes before provider plans land, because provider stamping
@@ -427,7 +432,7 @@ function applyRootSelectorToRemaining(
     return "unresolved";
   }
   for (const entry of models) {
-    if (!entry || providerStamped.has(entry)) continue;
+    if (!entry || providerStamped.has(entry) || isCodexControlPlaneModel(entry.slug)) continue;
     stampRootAutoReviewOverride(entry, trimmed);
   }
   return "applied";
@@ -449,7 +454,7 @@ export function applyConfiguredAutoReviewModelOverride(
   const { plans, failure } = buildProviderReviewPlans(models, config);
   const providerStamped = new Set<RawEntry>();
   for (const entry of models) {
-    if (!entry || typeof entry !== "object") continue;
+    if (!entry || typeof entry !== "object" || isCodexControlPlaneModel(entry.slug)) continue;
     const provider = catalogEntryProviderName(entry);
     if (!provider) continue;
     const plan = plans.get(provider);
@@ -476,17 +481,37 @@ function configHasProviderAutoReview(config: Pick<OcxConfig, "providers">): bool
     provider.autoReviewModel !== undefined || provider.autoReviewModelOverrides !== undefined);
 }
 
+/**
+ * The global override selector, when the operator enabled it and named a model.
+ *
+ * Occupies the same slot as Codex's root `auto_review_model` fallback and wins over it: an
+ * enabled Model-settings choice is the operator's explicit pick, while a disabled or blank block
+ * leaves the root selector in charge. Provider-scoped stamps keep their precedence separately.
+ */
+export function resolveAutoReviewOverrideSelector(
+  config?: Pick<OcxConfig, "autoReviewOverride">,
+): string | undefined {
+  const block = config?.autoReviewOverride;
+  if (block?.enabled !== true) return undefined;
+  const model = typeof block.model === "string" ? block.model.trim() : "";
+  return model.length > 0 ? model : undefined;
+}
+
 /** Apply the root Codex auto-review selector after the final catalog merge. */
 export function finalizeAutoReviewModelOverride(
   models: RawEntry[] | undefined,
   sourceModels: readonly RawEntry[] = [],
-  config?: Pick<OcxConfig, "providers">,
+  config?: Pick<OcxConfig, "providers" | "autoReviewOverride">,
 ): AutoReviewModelOverrideResult {
-  if (models && sourceModels.length > 0) preserveNativeAutoReviewModelOverrides(models, sourceModels);
+  if (models && sourceModels.length > 0) preserveNativeAutoReviewModelOverrides(
+    models.filter(entry => !isCodexControlPlaneModel(entry.slug)),
+    sourceModels.filter(entry => !isCodexControlPlaneModel(entry.slug)),
+  );
+  const rootValue = resolveAutoReviewOverrideSelector(config) ?? readConfiguredAutoReviewModel();
   if (config && configHasProviderAutoReview(config)) {
-    return applyConfiguredAutoReviewModelOverride(models, readConfiguredAutoReviewModel(), config, sourceModels);
+    return applyConfiguredAutoReviewModelOverride(models, rootValue, config, sourceModels);
   }
-  return applyAutoReviewModelOverride(models, readConfiguredAutoReviewModel(), sourceModels);
+  return applyAutoReviewModelOverride(models, rootValue, sourceModels);
 }
 /**
  * Why an account-gated native model stopped being offered, but only when the answer is one the

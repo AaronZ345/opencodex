@@ -8,6 +8,8 @@ import {
 } from "../../src/codex/model-entitlements";
 import { handleManagementAPI } from "../../src/server/management-api";
 import { startServer } from "../../src/server";
+import { NativeProfileManager } from "../../src/codex/native-profile-manager";
+import { waitForNativeMainStartupGate } from "../../src/codex/native-profile-startup";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { ManagementRequest } from "../helpers/management-auth";
@@ -20,6 +22,29 @@ setDefaultTimeout(30_000);
 let testDir = "";
 let previousHome: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
+
+// Discovery fixtures own their temporary homes; a live host service is not their subject.
+const startDiscoveryServer = async () => {
+  const manager = new NativeProfileManager({
+    codexHome: isolatedCodexHome!.path, configDir: testDir,
+    hardenPath: async () => {}, processProbe: async () => ({ status: "clear", count: 0 }),
+    keyProvider: {
+      async get() { return { keyRef: "memory:discovery", key: Buffer.alloc(32, 7) }; },
+      async create() { return { keyRef: "memory:discovery", key: Buffer.alloc(32, 7) }; },
+    },
+  });
+  const server = startServer(0, {
+    inspectNativeCodexOwnership: () => ({ ownership: "owned", reason: "isolated discovery fixture" }),
+    nativeMainStartup: { manager, owner: { hardenPath: async () => {} }, probeRecoveryState: () => "none" },
+  });
+  try {
+    expect((await waitForNativeMainStartupGate()).status).toBe("ready");
+    return server;
+  } catch (error) {
+    await server.stop(true);
+    throw error;
+  }
+};
 
 beforeEach(() => {
   previousHome = process.env.OPENCODEX_HOME;
@@ -58,7 +83,7 @@ function configWithStaticModels(claudeCode?: OcxConfig["claudeCode"]): OcxConfig
 
 test("anthropic-version header flips /v1/models to the discovery contract", async () => {
   saveConfig(configWithStaticModels());
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const response = await fetch(new URL("/v1/models?limit=1000", server.url), {
       headers: { "anthropic-version": "2023-06-01", "authorization": "Bearer placeholder" },
@@ -73,7 +98,7 @@ test("anthropic-version header flips /v1/models to the discovery contract", asyn
     expect(ids).toContain(mockAlias);
     // Every entry must satisfy the picker prefix rule (003 G3).
     for (const entry of json.data) {
-      expect(entry.id.startsWith("claude") || entry.id.startsWith("anthropic")).toBe(true);
+      expect(entry.id.includes("claude") || entry.id.includes("anthropic")).toBe(true);
       expect(typeof entry.display_name).toBe("string");
       // Full ModelInfo contract (devlog 130 B4b): capabilities ride discovery.
       expect(entry.type).toBe("model");
@@ -89,9 +114,33 @@ test("anthropic-version header flips /v1/models to the discovery contract", asyn
   }
 });
 
+test("Claude discovery exposes native Fast + 1M with the configured input ceiling", async () => {
+  const config = configWithStaticModels({ autoContext: true });
+  config.providers.openai = {
+    adapter: "openai-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    authMode: "forward",
+    liveModels: false,
+    modelContextWindows: { "gpt-6.1-sol": 872_000 },
+  };
+  saveConfig(config);
+  const server = await startDiscoveryServer();
+  try {
+    const response = await fetch(new URL("/v1/models?flavor=anthropic&ids=cli&limit=1000", server.url));
+    expect(response.status).toBe(200);
+    const json = await response.json() as { data: Array<{ id: string; display_name: string; max_input_tokens: number }> };
+    expect(json.data.find(info => info.id === "ocx-claude-native--gpt-6.1-sol--fast[1m]")).toMatchObject({
+      display_name: "gpt-6.1-sol (native) · Fast · 1M",
+      max_input_tokens: 872_000,
+    });
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("?flavor=anthropic works without the header; disabled -> empty data", async () => {
   saveConfig(configWithStaticModels());
-  let server = startServer(0);
+  let server = await startDiscoveryServer();
   try {
     const response = await fetch(new URL("/v1/models?flavor=anthropic", server.url));
     const json = await response.json() as { data: { id: string }[] };
@@ -102,7 +151,7 @@ test("?flavor=anthropic works without the header; disabled -> empty data", async
   }
 
   saveConfig(configWithStaticModels({ enabled: false }));
-  server = startServer(0);
+  server = await startDiscoveryServer();
   try {
     const response = await fetch(new URL("/v1/models?flavor=anthropic", server.url));
     const json = await response.json() as { data: unknown[] };
@@ -114,9 +163,9 @@ test("?flavor=anthropic works without the header; disabled -> empty data", async
 
 test("per-surface id style: ?ids= wins, claude-code UA gets readable, unknown UA stays hashed (devlog 050)", async () => {
   saveConfig(configWithStaticModels());
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
-    const readable = "claude-ocx-mock--test-model";
+    const readable = "ocx-claude-mock--test-model";
     // 1) explicit ?ids=cli -> readable
     let json = await fetch(new URL("/v1/models?flavor=anthropic&ids=cli", server.url)).then(r => r.json()) as { data: { id: string }[] };
     expect(json.data.some(m => m.id === readable)).toBe(true);
@@ -141,6 +190,28 @@ test("per-surface id style: ?ids= wins, claude-code UA gets readable, unknown UA
   }
 });
 
+test("Claude discovery labels routed rows from modelDisplayNames only; aliases stay Codex-only", async () => {
+  const config = configWithStaticModels();
+  Object.assign(config.providers.mock!, {
+    models: ["test-model", "other-model"],
+    modelContextWindows: { "test-model": 1_000_000 },
+    modelDisplayNames: { "test-model": "Test Model" },
+    modelAliases: { "other-model": "om" },
+  });
+  saveConfig(config);
+  const server = await startDiscoveryServer();
+  try {
+    const json = await fetch(new URL("/v1/models?flavor=anthropic&ids=cli", server.url))
+      .then(r => r.json()) as { data: { id: string; display_name: string }[] };
+    const byId = new Map(json.data.map(m => [m.id, m.display_name]));
+    expect(byId.get("ocx-claude-mock--test-model")).toBe("Test Model (mock)");
+    expect(byId.get("ocx-claude-mock--test-model[1m]")).toBe("Test Model (mock) · 1M");
+    expect(byId.get("ocx-claude-mock--other-model")).toBe("other-model (mock)");
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("Codex discovery bounds proven custom Astra before any disk sync including a gateway namesake", async () => {
   const config = configWithStaticModels();
   config.providers.openai = {
@@ -155,7 +226,7 @@ test("Codex discovery bounds proven custom Astra before any disk sync including 
     reasoningEfforts: ["none", "minimal", "low"], defaultReasoningEffort: "minimal",
   }));
   saveConfig(config);
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const response = await fetch(new URL("/v1/models?client_version=0.153.4", server.url));
     expect(response.status).toBe(200);
@@ -173,7 +244,7 @@ test("Codex discovery bounds proven custom Astra before any disk sync including 
 
 test("OpenAI list shape and Codex catalog shape stay unchanged", async () => {
   saveConfig(configWithStaticModels());
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url));
     const plainJson = await plain.json() as { object: string; data: { id: string; object: string }[] };
@@ -219,7 +290,7 @@ test("Codex discovery applies the OpenAI context cap to native rows (#1430)", as
   };
   config.providerContextCaps = { openai: 272_000 };
   saveConfig(config);
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const response = await fetch(new URL("/v1/models?client_version=1.0.0", server.url));
     expect(response.status).toBe(200);
@@ -262,7 +333,7 @@ test("exact account disables affect only the matching OpenAI and Codex discovery
   };
   config.disabledModels = ["team/gpt-5.5"];
   saveConfig(config);
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url)).then(response => response.json()) as {
       data: Array<{ id: string; reasoning_efforts?: unknown[] }>;
@@ -332,7 +403,7 @@ test("Codex discovery restores account rows for supported natives hidden on disk
   expect(visibleNativeSlugs(config)).toContain("gpt-5.5");
   expect(visibleNativeSlugs({ ...config, disabledModels: ["gpt-5.5"] })).not.toContain("gpt-5.5");
 
-  let server = startServer(0);
+  let server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };
@@ -355,7 +426,7 @@ test("Codex discovery restores account rows for supported natives hidden on disk
   expect(visibleNativeSlugs(config)).toContain("gpt-5.5");
   expect(visibleNativeSlugs(config)).not.toContain("gpt-5.6-sol");
   expect(visibleNativeSlugs(config)).not.toContain("gpt-5.4");
-  server = startServer(0);
+  server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as {
@@ -451,7 +522,7 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
     }
     return originalFetch(input, init);
   }) as typeof fetch;
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };
@@ -503,7 +574,7 @@ test("account selectors stay out of discovery when no canonical OpenAI provider 
   const config = configWithStaticModels();
   config.codexAccountNamespaces = { desktop: "@main" };
   saveConfig(config);
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url)).then(response => response.json()) as {
       data: Array<{ id: string }>;
@@ -537,7 +608,7 @@ test("disabled canonical OpenAI preserves bare bootstrap rows without advertisin
     codexAccountNamespaces: { team: "stored-side-account" },
   } as OcxConfig;
   saveConfig(config);
-  const server = startServer(0);
+  const server = await startDiscoveryServer();
   try {
     const plain = await fetch(new URL("/v1/models", server.url)).then(response => response.json()) as {
       data: Array<{ id: string }>;
@@ -589,7 +660,7 @@ test("the request's client_version reaches entitlement discovery (#2886)", async
   // restored, or every later test in this file inherits it.
   let server: ReturnType<typeof startServer> | null = null;
   try {
-    server = startServer(0);
+    server = await startDiscoveryServer();
     await fetch(new URL("/v1/models?client_version=0.151.7", server.url))
       .then(response => response.json());
     expect(askedVersions.length).toBeGreaterThan(0);
@@ -648,7 +719,7 @@ test("with no inbound or runtime version, /v1/models still exposes the gated row
 
   let server: ReturnType<typeof startServer> | null = null;
   try {
-    server = startServer(0);
+    server = await startDiscoveryServer();
     // No client_version on the request, and no persisted runtime in this isolated home.
     const catalog = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };

@@ -13,7 +13,14 @@ description: 多代理、組合、可觀測性、存取、整合、系統與設�
 
 ```bash
 ocx agent subagents set ark/model-a,openai/gpt-5.5
+ocx agent sidecar web --enabled off
 ```
+
+`--enabled off` 與儀表板中的 **關閉 (Off)** 列是同一個開關：OpenCodex 不再執行該 sidecar，
+Codex 整合會把 `web_search = "disabled"` 寫入 `~/.codex/config.toml`，這正是讓 MCP
+搜尋伺服器成為唯一搜尋路徑的前提。`--enabled on` 會再次移除該行。當儲存確實改變開關狀態時，
+指令會回報由此觸發的 Codex 端寫入（`--json` 中的 `codexWebSearch`，否則為結尾的
+`Codex config:` 行），並在無法寫入時提示 `ocx sync`。該旗標對 `vision` 同樣有效。
 
 ### `ocx v2 <status|on|off|mode <v1|default|v2>|threads <n>>`
 
@@ -89,12 +96,15 @@ ocx debug usage logs [-f|--follow]
 
 ### `ocx access <key|endpoints|models|test> ...`
 
-管理 OpenCodex 許可 API 金鑰並檢查外部端點與模型。`ocx api-key
-<list|create|remove> ...` 是 `ocx access key` 的別名。
+檢視 OpenCodex 存取用 API 金鑰清單、外部端點與模型。`ocx api-key` 是 `ocx access key` 指令群組的別名。
+
+建立金鑰與開始輪替時，無論使用文字或 JSON 輸出，都會傳回僅顯示一次的明文憑證。代理應將這些步驟交由人在代理工作階段之外直接操作的終端機完成。不要索取金鑰本身，也不要請使用者貼到聊天中；只接收設定與連線驗證的確認，以及非機密的金鑰 ID 和輪替 ID。
 
 ```bash
-ocx access key create deployment
+ocx access key list --json
 ```
+
+確認新金鑰已設定並通過連線驗證，不等於核准撤銷舊金鑰。確認輪替或刪除舊金鑰前，必須另行取得撤銷該金鑰的明確授權。執行獲准的操作後，請再次檢視清單。不要透過直接呼叫 API 繞過此流程。
 
 ## 客戶端整合
 
@@ -121,6 +131,39 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 家族為 `opus`、`fable`、`sonnet` 與 `haiku`；新路由從 `opus` 開始。`none` 僅在該家族為空時有效。舊版套用旗標 `--static`、`--hybrid` 與 `--discovery-only` 仍受支援。請用 `ocx claude config <status|set> ...` 管理 Claude Code 設定。
 
+### `ocx codex [codex args...]`
+
+只有設定及其命名空間受到保護、其他主體無法修改時才提供金鑰；目前使用者和特權 OS 主體受到信任。同一使用者的程序受到信任：具有該使用者寫入權限的主體已能讀取該使用者的 OpenCodex 金鑰檔案。驗證與原生啟動之間由同一使用者替換設定不在此威脅模型內，啟動器不會在交接時凍結設定。
+
+一般 Windows 安裝的預設 ProgramData 權限允許其他使用者建立目錄。因此即使 `ProgramData\OpenAI\Codex` 不存在，也會暫緩自動憑證。ProgramData 下的系統 Codex 設定資料夾必須存在，且僅 Administrators/SYSTEM 可寫入；其祖先目錄也必須防止其他使用者替換。請管理員檢查目錄原則。opencodex 絕不自行修改 ACL，也不提供設定目錄的命令。
+
+您也可以自行提供金鑰，例如匯出 `OPENCODEX_API_AUTH_TOKEN` 環境變數；`ocx codex` 會保留其值不變。既有系統設定檔仍會阻止自動憑證，需另行檢查。每種暫緩原因都會輸出一行簡短明確的 stderr 診斷，不含金鑰值、金鑰檔案內容或路徑。
+
+單字提示前請加 `--`，以免選取未知的 Codex 子命令。
+
+即使系統設定檔不存在，也必須阻止其他使用者建立這些檔案。無法驗證 Windows ProgramData/OpenAI/Codex 路徑保護時不自動注入權杖，也不建立目錄。macOS 接受僅拒絕的 ACL 與唯讀允許項。任何允許寫入、附加、刪除、修改屬性、安全或擁有者的項目都會被拒絕，即使前面已有拒絕項。未知標籤與檢查錯誤也會被拒絕。
+
+只有 argv 位於下方允許清單內、環境中沒有非空 HTTP(S)/ALL proxy 或 `CODEX_*`/`OPENAI_*`/`AZURE_OPENAI_*` 覆寫（允許標準的 `CODEX_HOME`），且主目錄、設定與系統命名空間通過擁有權檢查時，才讀取新服務權杖。設定必須只包含已稽核鍵與準確的受管 loopback provider，沒有額外憑證消費者或設定層。`-c`/`--config`、`-p`/`--profile`、未知旗標和 `resume`/`fork` 等清單外引數都會暫緩權杖，並輸出不含值的診斷；明確提供的使用者憑證與原始引數保持不變。
+
+標準主目錄與 `config.toml` 必須屬於目前使用者。POSIX 拒絕 group/other 寫入權限；Windows 驗證擁有者 SID，並拒絕目前使用者、SYSTEM、Administrators 以外的 DACL 寫入授權。也會檢查祖先路徑替換權限。macOS 還要求不存在強制 Codex 設定 preference。這些檢查無法隔離相同使用者或管理員執行的惡意程序。
+
+| Allowlist | Flags |
+| --- | --- |
+| Switches | `--no-daemon`, `--json`, `--ephemeral`, `--skip-git-repo-check`, `--no-alt-screen`, `--full-auto`, `--dangerously-bypass-approvals-and-sandbox`, `--search` |
+| One value | `--model`/`-m`, `--sandbox`/`-s`, `--ask-for-approval`/`-a`, `--image`/`-i` |
+
+
+
+自動憑證讀取會將 `CODEX_HOME` 中的 `~` 與空白視為字面路徑，驗證後將同一個正規絕對路徑傳給子程序。無法讀取主目錄時不讀取權杖。只要存在非空的 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`（不分大小寫），就會略過自動讀取，不受 `NO_PROXY` 影響；拒絕的啟動和使用者匯出的憑證保持不變。傳遞新權杖時，子程序的 `NO_PROXY` 與 `no_proxy` 會保留既有排除項目並加入 `127.0.0.1` 和 `::1`。啟用 `features.respect_system_proxy` 或傳入 `--enable`/`--disable` 會略過自動讀取。
+
+使用原始引數啟動 Codex 前嘗試啟動代理。路由仍由 Codex 設定擁有，啟動器不會改寫。原生及其他閘道路由略過代理啟動；未知路由會警告並嘗試啟動，失敗後仍警告並繼續。說明、版本及 `login`、`doctor`、`help` 等內部命令略過代理啟動和自動權杖讀取。
+
+只有所選 provider 的完整傳輸設定與本次安裝的回環監聽器或已儲存的本機用戶端連線對應的管理區塊一致時，才從本次安裝的 `service-api-token` 讀取缺少的 `OPENCODEX_API_AUTH_TOKEN`。名稱或注入註解本身不構成授權。未知或遠端目的地、預設 profile、專案設定、`OPENAI_BASE_URL` 及傳入的 `-c`/`--config`、`-p`/`--profile`、`-C`/`--cd`、`--remote` 都會略過自動讀取。保留使用者匯出的憑證與引數，拒絕權杖檔案覆寫和管理權杖衝突。
+
+只有比對成功（`matched`）的 autostart wrapper 才直接啟動背後的 Codex。未知狀態（包括檢查例外）必須通過 bypass 驗證；受管 Windows CMD wrapper 必須與目前產生的範本完整一致，才以 `OCX_SHIM_BYPASS=1` 執行。一般 npm 啟動器仍受支援。無法驗證或過時的 wrapper 以結束代碼 1 拒絕，且不啟動 Codex；請用 `ocx codex-shim install` 更新。本次啟動不修復 shim；內容檢查不證明 Windows backing 檔案來源，也不防止並行路徑替換。
+
+啟動器說明為 `ocx help codex`，Codex 說明為 `ocx codex --help`。之後直接執行一般 `codex` 的行為保持不變。
+
 ### `ocx opencode [opencode args...]`
 
 確保代理正在執行，然後在 OpenCode 的內嵌執行階段層（`OPENCODE_CONFIG_CONTENT`）中以生成的 `provider.opencodex` 與 `providers.opencodex` 區塊啟動 opencode。既有的內嵌設定會被保留，本次啟動僅替換這兩個鍵。全域或專案的 `opencode.json` 檔案可能被讀取以警告既有的覆寫，但磁碟上的檔案永不修改。路由模型以
@@ -132,7 +175,7 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 ## 客戶端設定匯出
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo|cline|kilo|commandcode|droid>`
 
 印出連接到執行中代理的客戶端設定。此指令會用所選客戶端的原生格式，序列化含有 base URL、模型清單，以及適用的環境變數參考或 loopback 佔位符的 `opencodex` provider 區塊。
 
@@ -140,7 +183,7 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 | 旗標 | 動作 |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo>` | 必填。選擇客戶端設定格式。 |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo\|cline\|kilo\|commandcode\|droid>` | 必填。選擇客戶端設定格式。 |
 | `--json` | 僅在 stdout 印出設定 JSON，使重導向能擷取逐位元組輸出。所有診斷訊息（含 `--out` 寫入提示）皆送至 stderr。 |
 | `--out <path>` | 將設定寫入 `<path>`。拒絕覆寫既有檔案。 |
 | `--force` | 允許 `--out` 覆寫既有檔案。 |
@@ -170,6 +213,11 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | `aside` | `~/.aside/u/<account>/models.json`，對應 Aside 自己的 `accounts.json` 指定的目前帳戶；資訊清單無法讀取時會被拒絕，而不是退回任一帳戶 | `aside-models.json` | 無——loopback 佔位符 |
 | `raycast` | `~/.config/raycast/ai/providers.yaml`（macOS 與 Windows 相同；Raycast 不遵循 `XDG_CONFIG_HOME`） | `raycast-providers.yaml` | 無——僅限 loopback，不會寫入 `api_keys` 項目 |
 | `omo` | `~/.omo/agent/models.json`（設定後依序由 `OMO_CODING_AGENT_DIR`、`SENPI_CODING_AGENT_DIR`、`PI_CODING_AGENT_DIR` 優先；相對路徑會被拒絕） | `omo-models.json` | 無——loopback 佔位符 |
+| `kilo` | `~/.config/kilo` 下最先存在的 `kilo.jsonc`、`kilo.json`、`opencode.jsonc`、`opencode.json` 或 `config.json`（`XDG_CONFIG_HOME` 可變更該目錄）；皆不存在時使用 `kilo.jsonc` | `kilo.jsonc` | `OPENCODEX_KILO_API_KEY` |
+| `commandcode` | `~/.commandcode/providers.json` (Windows 使用預設家目錄時：僅當 `HOME ?? USERPROFILE` 的值非空、非純空白且為 Windows 絕對路徑時使用，否則使用 `homedir()`；另行傳入的家目錄保持不變；檔案位於其下的 `.commandcode\providers.json`) | `providers.json` | 僅限迴環；`apiKey: false`；不需環境變數 |
+| `droid` | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` on Windows) | `factory-settings.json` | 僅限迴環；不需環境變數 |
+
+以上路徑為預設值。在預設家目錄的 `~/.zcode/v2/setting.json` 設定絕對路徑 `dataBaseDir` 後，儲存路徑改為 `<dataBaseDir>/.zcode/v2/provider_config.json`。`ZCODE_DATA_DIR` 直接指定 `.zcode` 根目錄且優先於設定；`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` 優先指定供應商檔案。設定格式錯誤、無法讀取或使用相對路徑時，新套用與更新會被拒絕。既有所有權及復原記錄會保留。參閱[路徑與復原規則的英文原文](https://opencodex.me/guides/integrations/#zcode-314-and-later)。
 
 Raycast 匯出是一份獨立的 `providers.yaml` 文件，在 `providers` 序列中只有一個 `id: opencodex` 元素：`name: OpenCodex`、proxy 的 `/v1` base URL，以及每個路由模型及其 `abilities`（`tools` 與 `system_message` 一律支援，`vision` 依目錄的輸入模態而定，`reasoning_effort` 在模型有 effort 階梯時設定，`temperature` 對推理模型關閉）。Custom Providers 是 Raycast Pro 功能，且 Raycast 會監看該檔案，因此儲存後的變更不需重新啟動即可生效。格式說明見 [manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers)。不會寫入任何 `api_keys` 項目，所以此匯出僅限 loopback，非 loopback 的 bind 會被拒絕。
 
@@ -182,7 +230,7 @@ opencode 會插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。Pi 與 OMP 的匯出不�
 `ocx export` 永不寫入你的真實客戶端設定。目的地僅印出供你手動合併，而 `--out` 在沒有 `--force` 時拒絕覆寫既有檔案，因為取代設定檔會毀掉其中已有的其他供應商、代理與 MCP 項目。
 :::
 
-金鑰永不被序列化。設定只帶有文件化的環境變數參考，或非秘密的 loopback 佔位符。loopback 代理（`127.0.0.1`，預設值）完全不需要准入金鑰。只有客戶端 schema 支援、且代理綁定超出 loopback 時，才設定被引用的變數；關於准入金鑰的簽發方式，請見[遠端存取](/zh-tw/reference/configuration/#remote-access)。上游 provider 本身的金鑰是完全不同的事，依[供應商](/zh-tw/guides/providers/)個別設定。
+金鑰永不被序列化。設定只帶有文件化的環境變數參考，或非秘密的 loopback 佔位符。僅憑 loopback 位址（`127.0.0.1`）不能認定不需金鑰；應確認目標的驗證政策與端點。使用所選金鑰的模型及音訊 CLI 即使在 loopback 上也需要明確提供金鑰。只有客戶端 schema 支援、且代理綁定超出 loopback 時，才設定被引用的變數；關於准入金鑰的簽發方式，請見[遠端存取](/zh-tw/reference/configuration/server/#遠端存取)。上游 provider 本身的金鑰是完全不同的事，依[供應商](/zh-tw/guides/providers/)個別設定。
 
 產生的 gjc 整合使用非機密的本機回環佔位值，不需要環境變數。此整合僅支援本機回環，不設定遠端存取憑證。
 
@@ -194,7 +242,9 @@ opencode 會插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。Pi 與 OMP 的匯出不�
 
 管理無頭執行階段設定、啟動、同步、診斷與更新。
 
-`ocx system codex-restart --yes` 透過與 `ocx sync --restart-codex` 相同的模組重啟 Codex app-server，並完全結束再重新啟動 Codex 桌面應用程式。若代理本身在 Codex 應用程式內部執行，此命令會給出可執行提示並拒絕，而不是承諾無法完成的移交。
+`ocx system codex-restart --yes` 透過與 `ocx sync --restart-codex` 相同的模組重啟 Codex app-server。模型選擇器在應用程式啟動時建立，因此當桌面應用程式於目前模型目錄寫入之前啟動，或本次請求變更了 `model_catalog_json` 綁定時，會完全結束再重新啟動它。否則應用程式保持開啟，自行重啟其 app-server，並保留未送出的草稿與待處理的核准。若無法讀取應用程式或目錄狀態，則執行完整重啟。若代理本身在 Codex 應用程式內部執行，桌面重啟會給出可執行提示並拒絕，而不是承諾無法完成的移交。
+
+如果本次請求變更了 `model_catalog_json` 綁定，即使桌面程序在目錄檔案寫入後才啟動，也會觸發桌面重新啟動。
 
 ```bash
 ocx system settings --stream-mode eager-relay
@@ -206,7 +256,7 @@ ocx system settings --stream-mode eager-relay
 ocx system codex-cli-update check --json
 ```
 
-`check` 不會向套件 registry 發出請求，只會在限定範圍內檢查設定中的安裝候選項來源證據，包括經過遮罩的可執行檔位置與所有權證據。正式發布的 launcher 所提供的可信內容只會驗證該候選項快照，並不證明 Codex 已成功執行。由於這個單次命令絕不會執行 Codex，來自環境變數與持久化記錄的候選項只供報告（`managed: false`，通常為 `selection_unattested`）；JSON 輸出包含 `candidateAvailable`、`candidateVersion` 與 `candidateSource`，而 `selectionAttested` 維持 `false`。檢查設定中的安裝候選項時，必須有正式發布的 launcher 所提供的可信內容；直接使用 Bun 啟動或從原始碼執行時不具備這項證明，因此會忽略來自環境與持久化記錄的候選項狀態，並可能在 POSIX 系統上報告 `candidate_unavailable`。在 Windows 上，這個首個切片不會對候選路徑或設定路徑執行任何檔案系統 I/O。只有由可信 launcher 擷取的絕對環境候選項可以取得應用程式封裝或版本管理工具的純詞彙標籤；其他所有 Windows 候選項都會以失敗關閉方式處理。由於這個切片完全不會讀取持久化的選擇狀態，在未擷取任何環境候選項的 Windows 執行中會報告 `windows_inspection_deferred` 而非 `candidate_unavailable`：該命令無法觀測 Codex CLI 是否已安裝，因此會報告檢查被延後，而不是斷言候選項不存在。此命令不會執行 Codex 或套件管理工具、不會修復 shim、不會寫入設定或快取、不會停止程序，也不會安裝任何內容。隨應用程式封裝的候選項、位於已識別版本管理工具路徑中的候選項、未經驗證的獨立候選項，以及 shim 狀態不明確的候選項，都會報告為 `unmanaged` 或 `unknown`，絕不會歸類為 `managed`。
+`check` 不查詢註冊表，也不執行 Codex。在 POSIX 上，當已發布啟動器擷取的環境候選項與執行階段解析器選擇的正規路徑相同時，`selectionAttested` 可以為 `true`；若關聯的 npm-global 套件資訊清單證明了所有權，且在回報候選版本時該版本與資訊清單版本一致，`managed` 可以為 `true`。持久化候選項仍不獲認證。Windows x64 也支援經證明繫結的絕對路徑標準 npm `codex.cmd`，以及由持有控制代碼繫結的 Node/npm 工具鏈（存在時為前綴本機，確認不存在時為錨定到啟動器架構的已擷取 PATH 配對）和已驗證的前綴內平台支援元件，並使用拒絕重新剖析的持有控制代碼。其他 Windows 配置仍然延後或不受管理。Windows 的 `managed` 結果僅對觀測到的安裝配置進行分類：繫結的 Node/npm 是更新器的唯讀中繼資料工具鏈，並不保證後續 `codex.cmd` 呼叫將解析到哪個直譯器。直接透過 Bun 或原始碼執行時沒有啟動器證明。`plan` 使用隔離的暫存 npm 設定、快取和日誌查詢官方註冊表，並拒絕活動工作階段或不完整的程序觀測。它不安裝軟體，也不向程序傳送訊號。Windows x64 的 apply 需要具備經過驗證的私人寫入權限的受限 npm 前綴，並保留無關的套件和 shim；不受支援的已觀測配置回傳 `applicable: false` 且 `refusal: windows_apply_disabled`；僅 PATH 選取、OpenCodex 自動啟動包裝器和 global/vendor 後援仍然延後。請參閱[完整命令與拒絕原因（英文）](/reference/cli/agents/#read-only-codex-cli-update-plan)。
 
 在 Windows 上，如果擷取到 `CODEX_CLI_PATH=codex` 這類單純命令名稱、遠端路徑或裝置路徑，則回報 `candidate_path_unavailable`。這些情況已有擷取的候選項，但其路徑不適用於此檢查。
 
@@ -223,6 +273,36 @@ ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <abs
 
 識別值或摘要僅描述觀測當下的檔案，不是持續有效的更新許可，也不證明選用的執行階段、過去的安裝程式、實際 npm 設定或工具真實性。明確指定的 Node 也只是被觀測，不能證明啟動器會選用它。命令不會執行目標、請求套件 registry、安裝、寫入設定或控制程序。現有 Windows `check` 仍不執行候選項或設定的檔案系統 I/O。
 
-### `ocx config <show|get|set|unset|validate|export|import> ...`
+### `ocx config [show|get|set|unset|validate|export|import] ...`
+
+`ocx config [show] [--json] [--source]` 無需執行代理即可顯示本機設定。省略 `show` 時，可使用任一旗標或依任意順序組合使用。`--source` 包含診斷來源、錯誤和警告，僅適用於顯示操作。`--json` 可放在明確指定的操作之前，不會改變執行的操作。重複的 `--json` 或 `--source` 旗標及未知引數會遭到拒絕。
 
 檢查並安全地修改已驗證的 OpenCodex 設定。`show` 與 `get` 會遮罩秘密。匯入在寫入前驗證且需要 `--yes`。
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## Hermes / Command Code: model names
+
+Hermes and Command Code support `--model-names alias|routed` (API: `modelNames`).
+The default is `routed`, independent of `preferModelAliasIds`. A connection
+stores its mode; later Apply without the option preserves it. Alias mode uses
+only provider-qualified aliases that the router proves equivalent; missing,
+unsafe or colliding aliases fall back to routed keys. Combos keep their keys.
+Removed/renamed aliases migrate on the next successful managed refresh, with
+foreign-edit refusal. Named Hermes profiles need explicit Apply.
+
+`ocx export --client hermes --model-names alias --json` previews a current
+already loaded catalog without writing client files or managed state; a cold or
+stale catalog returns unavailable. Explicit `--out` writes an export artifact.
+See the [English integration guide](/guides/integrations/#opt-in-alias-model-names)
+for the canonical workflow.

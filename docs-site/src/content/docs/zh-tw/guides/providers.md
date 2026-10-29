@@ -37,7 +37,7 @@ description: opencodex 進行身分驗證並與 LLM 供應商通訊的所有方�
 window 的用量。
 
 此估算僅供顯示，不會改變帳號選擇、session affinity、自動切換、cooldown 或其他路由決策。個別帳號
-狀態與路由控制請使用 [Codex Auth 帳號池](/zh-tw/guides/web-dashboard/#codex-auth-and-account-pools)。
+狀態與路由控制請使用 [Codex Auth 帳號池](/zh-tw/guides/web-dashboard/#codex-auth-與帳號池)。
 
 shipped v1 設定會自動遷移到 marker 2 的 option-aware row。原始設定只會備份一次到
 `~/.opencodex/config.json.pre-openai-tiers-v2.bak`；可用下列命令恢復：
@@ -56,8 +56,9 @@ preset 通常同時省略 `authMode` 與 `apiKey`。
 
 [`retryOn429`](/zh-tw/reference/configuration/) 的 same-key 429 replay 只適用於 API-key provider
 （`authMode: "key"`）。OAuth、forward 與 local preset 都被排除：它們的 credential 絕不能在同一 token
-上重播，而 local runtime 也沒有 remote key 可保留。此功能為 opt-in；未設定時關閉，物件存在時預設
-啟用，除非明確設為 `enabled: false`。
+上重播，而 local runtime 也沒有 remote key 可保留。除了文件記載的特定目的地預設值之外，此功能為 opt-in。標準 Mistral Chat 會在既有的整個請求傳送額度內使用耐心的重試策略（6 次 replay，10 秒備援間隔）。明確的 `retryOn429` 設定（包括 `enabled: false`）優先。Mistral preset 也會預設轉送提供的 prompt cache key；`promptCacheKey: false` 可停用轉送。快取親和性能提高重用機會，但不保證快取命中，也不會移除 token 吞吐量限制。
+
+Mistral 的 Studio 與 Vibe key 共用同一個 API-key provider。key 類型與方案額度請見 [Mistral 的 API key 文件](https://docs.mistral.ai/admin/identity-access/api-keys)；proxy 不會從 key 推斷訂閱等級。對所有模型，上游明確給出的 `Retry-After` 期限會在同一 credential 與模型的呼叫之間共用。沒有重試時間的 429，在有效的每分鐘計數器顯示容量已耗盡，或被拒查詢的實測成本超過剩餘 token 但仍在公告的完整額度內時，可能啟動保守的 60 秒復原等待。這是本地復原策略，並非對伺服器重設時間的精確預測。正常流量從不預測下一次查詢的快取或成本。等待後會執行一次復原探測；成功即恢復一般流量。缺少、格式錯誤、零授權、月額度已耗盡或超過完整額度的依據，不會憑空推斷重設，也不會壓縮歷史。`requestPacing: { "enabled": false }` 或 `retryOn429: { "respectRetryAfter": false }` 可停用共用節流。對於同一 key 的 replay，若 Mistral 的重試時間超過 `retryOn429.maxIntervalMs`，proxy 會回傳 429 與重試提示，而不會提早 replay。啟用 round-robin key 選擇時，排隊中的請求會重新檢查 key 冷卻並為替代 key 取得節流容量；輸出前的 key 拒絕可在該請求既有的送出上限內改用健康的 key 復原。context window 與各模型的壓縮偏好維持獨立。
 
 ## 1. ChatGPT 登入（forward / passthrough）
 
@@ -98,6 +99,7 @@ ocx login google-antigravity
 ocx login cursor       # 獨立 Cursor PKCE 登入
 ocx login command-code # Command Code browser OAuth（或匯入 ~/.commandcode/auth.json）
 ocx login devin       # Cognition/Devin：優先匯入 Devin CLI 憑證，否則走 Auth0 瀏覽器登入
+ocx login dsh-account # DeepSeek Harness Desktop（匯入 ~/.dsh/.credentials.yaml 授權）
 ocx login github-copilot  # GitHub device flow → Copilot token（Copilot Pro/Business）
 ocx login codex        # Codex 帳號池（別名：chatgpt、openai；需要 proxy 正在執行）
 ocx logout <provider>
@@ -107,12 +109,14 @@ ocx logout <provider>
 | --- | --- | --- | --- |
 | `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth 使用獨立的 Grok CLI 訂閱 gateway。API key 覆寫使用 `https://api.x.ai/v1`，並可能注入 Priority Processing。優先使用即時 Grok catalog；fallback 預設為 `grok-4.5`。 |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude 模型；即時模型列表從 `/v1/models` 取得。 |
-| `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 coding 模型。 |
+| `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi Code 模型。`kimi-for-coding` 目前指向 K2.8 Preview，支援 100 萬 token 上下文、`low`/`high`/`max` 推理及文字、圖片輸入。`k3-256k` 的上下文上限固定為 256K。 |
+| `kimi-responses` | `openai-responses` | `https://api.kimi.com/coding/v1` | 以 Responses 協定共用 `kimi` 的 OAuth 登入與模型清單。推理內容在伺服器端維持加密，工具呼叫及結果仍可見。 |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research 訂閱 gateway（Hermes Agent 使用相同 backend）。透過 `portal.nousresearch.com` 做 device-grant 登入；access token 是每次請求使用的 inference JWT。混合付費與 `:free` 模型 catalog（`tencent/hy3:free`、`stepfun/step-3.7-flash:free` 等）會從已登入帳號即時探索。Refresh token 為單次使用，每次 refresh 都會輪換。 |
 | `kiro` | `kiro` | `https://runtime.us-east-1.kiro.dev` | 初次登入會匯入已安裝且已登入的 `kiro-cli` session。Unix 可用 `curl -fsSL https://cli.kiro.dev/install` &#124; `bash` 安裝；Windows PowerShell 使用 `irm 'https://cli.kiro.dev/install.ps1'` &#124; `iex`，再執行 `kiro-cli login`。**Add account** 會先登出 `kiro-cli`、啟動新的 browser login，切換 `kiro-cli` 所使用的帳號並保存 account-scoped profile metadata。既有 OpenCodex 帳號會保留；取消或失敗時會恢復先前的 `kiro-cli` session。 |
 | `google-antigravity` | `google` | `https://daily-cloudcode-pa.googleapis.com` | 透過 Cloud Code Assist wire 使用 Google OAuth。即時探索使用 CCA 經認證的 `v1internal:fetchAvailableModels` 端點，發布目前登入帳號可用的 agent 模型；維護中的 catalog 作為 fallback。 |
 | `cursor` | `cursor` | `https://api2.cursor.sh` | 實驗性 PKCE 登入、即時 HTTP/2 transport 與按帳號篩選的模型探索。 |
 | `devin` | `devin` | `https://server.codeium.com` | 實驗性的非官方 Cognition/Devin 橋接。登入會先匯入已安裝 Devin CLI 已持有的憑證（`devin auth login` 會把 `devin-session-token` 寫入它自己的 `credentials.toml`）；沒有則開啟 Auth0 瀏覽器頁面，再以 `RegisterUser` 將貼上的權杖換成長期 API 金鑰。`ocx login devin-cli` 仍作為已棄用別名可用。模型清單依帳號透過 `GetCascadeModelConfigs` 即時取得，串流僅走 Connect-RPC 上的 `runTurn` 路徑。預設不在儀表板預設集內，需手動啟用。 |
+| `dsh-account` | `dsh-account` | `https://api.deepseek.com/anthropic` | 實驗性優先匯入帳號提供者，複用已安裝並登入的 DeepSeek Harness (DSH) Desktop 帳號。在使用者明確匯入時嚴格以唯讀方式讀取 `~/.dsh/.credentials.yaml` 憑據。獨立於 DeepSeek API Key 計費。 |
 | `github-copilot` | `openai-chat` | `https://api.githubcopilot.com` | 實驗性。GitHub device flow + `copilot_internal` exchange（VS Code OAuth client）。需要有效 Copilot 訂閱；不是官方第三方 API。 |
 
 Google Antigravity 帳戶與供應商的配額查詢（包括模型清單備援）使用固定的 Google 計量端點。這些目標支援透明 Fake-IP DNS，同時保留 TLS 驗證、重新導向拒絕與私有位址檢查。自訂 base URL 只改變模型請求，不改變配額目標；`NO_PROXY` 仍使用直連政策。
@@ -138,6 +142,12 @@ Vertex 或 Cloud Code Assist 修復會輸出同樣不含內容的 `google-tool-s
 提供且穩定的 `prompt_cache_key` 轉送到 Chat Completions 請求，絕不自行產生。Kimi 文件指出，穩定的
 session／task key 有助提升 Code Plan cache hit rate；沒有 key 的請求仍保持 keyless。若已 opt-in 的上游
 拒絕此欄位，opencodex 不會移除欄位後重試，也不會修改已儲存設定。其他 provider 預設 deny-by-default。
+
+`kimi`、`kimi-code` 和 `kimi-responses` 的 `k3`、`k3[1m]`、`k3-256k` 費用是採用預設五分鐘
+快取寫入費率的 [API 價格](https://platform.kimi.ai/docs/pricing/chat)估算，並非 Code Plan 的實際
+帳單或額度用量。K3 的 1M 版本約耗用 `k3-256k` 兩倍額度。`kimi-for-coding` 已轉為 K2.8 Preview，
+因此不再套用舊 K2.7 價格；除非使用者設定 `modelCosts`，其費用估算會維持未知。排除未知費用的
+路由規則可能因此略過這個別名。
 
 也可以從 [web 儀表板](/zh-tw/guides/web-dashboard/) 啟動 OAuth。
 
@@ -222,6 +232,9 @@ PowerShell 使用 `irm 'https://cli.kiro.dev/install.ps1' | iex`；接著以 `ki
 Windows 匯入會尋找 `%LOCALAPPDATA%\Kiro-Cli\data.sqlite3`。forced／add-account login 也需要本機 CLI
 binary：opencodex 先使用 `PATH`，再 fallback 到 `%LOCALAPPDATA%\Kiro-Cli\kiro-cli.exe` 與
 `C:\Program Files\Kiro-Cli\kiro-cli.exe`。
+若兩個資料夾都沒有 `kiro-cli.exe`，會改用同樣這兩個 `Kiro-Cli` 資料夾內的 `kiro.exe`。
+opencodex 絕不執行在 `PATH` 或 macOS/Linux 共用 bin 目錄中找到的 `kiro` 或 `kiro.exe`，
+請在那裡以 `kiro-cli` 名稱安裝或連結 CLI。
 
 成功匯入後，opencodex 會把 credential 寫入 `~/.opencodex/auth.json`。
 
@@ -237,9 +250,20 @@ database 並移除目前的 WAL、SHM 與 journal sidecar，再發布先前的 s
 `kiro-cli` data path 修復或移除不可讀 database、取消這些 import selector 後重試。沒有既有
 `kiro-cli` session 的新機器登入不受影響。
 
+### DeepSeek Account (DSH)
+
+`dsh-account` 是一個實驗性的、優先匯入既有憑據的帳號提供者，用於複用已安裝且登入的 DeepSeek Harness (DSH) Desktop 應用程式之認證憑據。
+
+- **獨立於 DeepSeek API Key**：`dsh-account` 使用使用者的 DeepSeek 認證工作階段額度（一般/贈送錢包餘額與總支出），而 `deepseek` 提供者則依平台 API Key 餘額扣款。這兩個憑據體系與路由嚴格隔離，互不 fallback。
+- **僅明確匯入**：OpenCodeX 會偵測是否已安裝 DeepSeek Harness 且已登入（`~/.dsh/.credentials.yaml`），但絕不會在未經使用者明確操作（`ocx login dsh-account` 或在 Web 儀表板點選匯入）的情況下自動複製、匯入或使用該權杖。
+- **對 DSH 憑據存放區唯讀**：OpenCodeX 將 `~/.dsh/.credentials.yaml` 視為嚴格唯讀。OpenCodeX 絕不寫入、修改、刪除或變更任何屬於 DeepSeek Harness 的檔案權限。
+- **隔離的憑據複本與登出**：匯入後，OpenCodeX 會透過 DeepSeek 權威身分端點（`/auth-api/v0/users/current`）驗證權杖，並在 OpenCodeX 認證存放區中保存獨立複本。在 OpenCodeX 中登出或移除該帳號僅會刪除 OpenCodeX 本地複本，絕不觸發上游遠端工作階段登出，也不會使 DeepSeek Harness Desktop 登出。
+- **無背景權杖自動輪替與 401 重新匯入**：DSH 工作階段授權不提供自動背景重新整理端點。若上游傳回 HTTP 401（`ACCOUNT_TOKEN_INVALID`），OpenCodeX 會將該帳號標記為 `needsReauth` 並停止路由。若要恢復存取，使用者必須透過 `ocx login dsh-account` 明確重新匯入。
+- **第三方免責聲明**：OpenCodeX 不主張 DeepSeek 官方對第三方客戶端複用工作階段授權提供背書或支援。
+
 ## 3. API 金鑰目錄
 
-opencodex 內建 95 個 preset：79 個 key-based、12 個 OAuth、3 個 local，以及 1 個預設 ChatGPT-forward
+opencodex 內建 106 個 preset：85 個 key-based、17 個 OAuth、3 個 local，以及 1 個預設 ChatGPT-forward
 preset。儀表板的 **Add provider** picker 會開啟 key provider 的 dashboard、驗證金鑰並儲存；驗證方式
 依 provider 而異。主要條目如下。
 
@@ -293,39 +317,48 @@ IDE／CLI，不透過 API；`minimax/minimax-m2.5` 是文件列出的 API 免費
 | Z.AI (GLM Coding) | `https://api.z.ai/api/coding/paas/v4` |
 | Zhipu AI (BigModel) | `https://open.bigmodel.cn/api/paas/v4` |
 | [BigModel Coding Plan — Responses (靜態模型清單)](/guides/providers/#bigmodel-coding-plan-over-responses) | `https://open.bigmodel.cn/api/v1` |
-| Qwen Cloud | Token plan（預設）：`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` · pay as you go：`https://dashscope.aliyuncs.com/compatible-mode/v1` · 或 Custom |
+| Qwen Cloud | Token plan（預設）：`https://token-plan.maas.qwencloudapi.com/compatible-mode/v1` · pay as you go：`https://dashscope.aliyuncs.com/compatible-mode/v1` · 或 Custom |
 | Tencent Cloud Coding Plan | `https://api.lkeap.cloud.tencent.com/coding/v3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` |
 | Volcengine Ark · Coding Plan · Agent Plan | `https://ark.cn-beijing.volces.com/api/v3` · `https://ark.cn-beijing.volces.com/api/coding/v3` · `https://ark.cn-beijing.volces.com/api/plan/v3` |
 | Xiaomi MiMo | `https://api.xiaomimimo.com/anthropic` |
 | Xiaomi MiMo (OpenAI Chat) | `https://api.xiaomimimo.com/v1` |
 | Kilo | `https://api.kilo.ai/api/gateway` |
+| OpenGateway | `https://apis.opengateway.ai/v1` |
 | GitLab Duo | `https://cloud.gitlab.com/ai/v1/proxy/openai/v1` |
 | Cloudflare AI Gateway | `https://gateway.ai.cloudflare.com/v1/{account-id}/{gateway}/anthropic` |
 | …以及更多 | opencode zen、Vercel AI Gateway、Venice、NanoGPT、Synthetic、Qianfan、Alibaba、Parallel、ZenMux、LiteLLM |
 
-**OpenCode Zen**（`opencode-zen`）與無 key 的 **OpenCode Free** preset 共用
-`https://opencode.ai/zen/v1`。該 gateway 的免費模型常遇到短時間 burst limit，約 15–20 requests/minute
-（社群實測；OpenCode 未公布 RPM）。Zen 可能回傳 generic rate-limit 429，而沒有 `Retry-After`／
-`X-RateLimit-*` header。這與 OpenCode 宣告的 keyless desktop quota 是不同限制：`opencode-free` 約每 5
-小時 200 次 Big Pickle／free-model request。Zen 在這類 429 省略 `Retry-After` 時，opencodex 會在 client
-error 加入 provider guidance 與 synthetic `Retry-After`；若上游有 `Retry-After`，仍以上游值為準。
-same-key wait-and-retry 仍需透過 [`retryOn429`](/zh-tw/reference/configuration/) 明確 opt-in。
+**OpenGateway** 是 Sionic AI 營運的 OpenAI 相容閘道，base URL 為
+`https://apis.opengateway.ai/v1`。公開目錄包含約 80 個活躍模型（2026-10-02 確認）。
+preset 透過公開 `GET /v1/models` 自動更新清單，只保留活躍的 Chat Completions 模型（以及僅支援 Responses、並固定走 Responses 的 `openai/o3-pro`）。
+Sionic 提供的 `deepseek/deepseek-v4.1-flash-ultrafast` 與
+`z-ai/glm-5.3-flash-ultrafast` 排在最前。請在
+[OpenGateway 控制台](https://opengateway.ai/api-keys)建立金鑰，再執行
+`ocx provider add opengateway` 或在控制台選擇 **OpenGateway**。Chat 請求使用設定的
+Bearer 金鑰；公開模型清單無法驗證金鑰有效性。
+在 Responses 協定中，OpenGateway 拒絕 replay 原生自訂工具呼叫，因此 preset 會在傳送前將程式碼模式的 `exec` 等 Codex 自訂工具轉換為函式工具。
+工具結果內容陣列以文字傳送，圖片保留在配對的工具結果群組之後。不支援的結果部分（包括拒絕與不透明內容）會在傳送前以明確的用戶端輸入錯誤拒絕。
+圖片細節 `original` 對應為閘道接受的 `high`；圖片位元組維持不變。
+原生 Responses 路由也會在將純文字空完成以成功回傳之前先檢查。
+輸出預算耗盡時回傳帶 `max_output_tokens` 的 `incomplete`；proxy 不會提高請求的預算。仍有預算且可安全 replay 的空完成，可在既有傳送上限內重試一次。明確設定 `emptyCompletionRetry: false` 或 `OCX_EMPTY_COMPLETION_RETRY=0` 可停用此重試。出現文字、拒絕、工具活動或未知串流事件時不會 replay，並保留原始串流。此保護不會改變其他 provider 及其重試預設值。
+Replay 需要明確的 `store: false`、完整輸入且僅含用戶端執行的工具；宣告了 `web_search` 等託管工具時，即使未觀察到工具事件也不會自動 replay。
 
-**無 key 的 `opencode-free` tier 目前對第三方 client 關閉。** Zen 會拒絕任何沒有帶 `x-opencode-session`
-header 的 request，回傳 error type `MissingSessionID` 與訊息 "OpenCode's free tier can only be used in
-OpenCode"。這道 gate 只檢查該 header 是否存在，因此 proxy 大可捏造一個值通過，但 opencodex 不這麼做。
-偽造 session identifier 並附上帶版本號的 `opencode/<version>` User-Agent，等於宣稱自己就是 OpenCode
-client，而 OpenCode 並未公布這個 keyless tier 的第三方整合合約；用這種方式取得的 HTTP 200 是繞過
-admission check，而不是取得授權。因此 opencodex 選擇如實回報限制：送往 `opencode-free` 的 request 會
-收到一則說明上游 gate 的 error。
+**OpenCode Zen**（`opencode-zen`）使用 [opencode.ai/auth](https://opencode.ai/auth) 核發的 API key 存取 `https://opencode.ai/zen/v1`。免費模型可能遇到每分鐘約 15–20 次請求的短時間速率限制（社群測量；OpenCode 未公布 RPM）。速率限制 429 缺少 `Retry-After` 時，opencodex 會加入說明與合成的 `Retry-After`；有效的上游 header 優先。同 key 重試仍須透過 [`retryOn429`](/zh-tw/reference/configuration/) 啟用。
 
-通往同一批模型的受支援路徑，是使用 [opencode.ai/auth](https://opencode.ai/auth) 取得的 OpenCode Zen API
-key，走帶 key 的 **`opencode-zen`** preset。若 OpenCode 日後公布 keyless tier 的第三方路徑，opencodex 可以
-跟進；在此之前，這個 preset 的作用是記錄該限制。上游條款：[opencode.ai/docs/zen](https://opencode.ai/docs/zen/)。
+在標準 `opencode-zen` 提供者中，使用 API 金鑰驗證及官方路由 `https://opencode.ai/zen/v1` 或 `https://opencode.ai/inference/v1` 時，Gemini 會在預設 `googleMode: ai-studio` 下自動使用 Google 原生 API。Zen 模型 ID 維持不變，包括沒有 `-tiered` 後綴的 Flash ID。Claude 使用 Anthropic Messages，不受 `googleMode` 影響。載入已儲存的設定時，僅忽略這些原生模型符合條件的舊 Chat/Responses 覆寫設定，以及符合條件的 Responses 專用 `image_generation` 託管工具偏好。自訂提供者、非金鑰驗證路由及其他偏好維持不變。
 
-大多數 provider 使用帶 bearer key 的 `openai-chat` adapter；少數只提供 Anthropic-compatible endpoint 的
-provider，例如 **Xiaomi MiMo**，使用 `anthropic` adapter（`x-api-key`）。在已驗證的 Ark Coding Plan 工具 continuation 中，把上一輪 Responses 回傳的 `reasoning` item 原樣送回會得到 `400 InvalidParameter`，因此 Coding Plan preset 會在轉送 continuation input 前移除這類 item；該輪的 reasoning 狀態會因此遺失，可用 `dropResponsesReasoningItems: false` 關閉。已經以 `openai-chat` 儲存的 Coding Plan 設定不會被改寫，仍走 Chat；要切換請手動把 `adapter` 改成 `openai-responses`、`responsesPath` 設為 `/responses`，或刪除後重新加入該 preset。Volcengine Coding Plan 與 Agent Plan 透過
+**已移除 `opencode-free` 支援。** OpenCode 上游免費層級的限制使所有模型都回傳 `403 permission_denied`（[#7255](https://github.com/lidge-jun/opencodex/issues/7255)）。載入既有設定時，會在記憶體中停用相關項目與相依的模型參照，每個程序只警告一次，載入時不修改檔案。下次儲存設定時，這些項目及參照將從 config.json 中移除。儲存前，原始檔案會自動保留到同目錄的 `config.json.pre-opencode-free-removal.bak`；如果該名稱已被占用，則使用唯一的同層檔名。位元組完全相同的獨立副本僅在能夠驗證其僅限擁有者存取時才會重用，否則會在旁邊寫入新的受保護副本。既有檔案不會覆寫。首次載入重疊時，可能留下多個相同的受保護副本。警告會顯示復原副本的路徑。如需復原（例如降級後），請將該副本複製回 config.json 並覆寫。如果自動複製失敗，警告會提示立即複製 config.json。如果它原為預設供應商，將以標準 OpenAI OAuth 路徑作為預設。請使用 `opencode-go`、需要 key 的 `opencode-zen` 或其他供應商。[OpenCode Zen 條款](https://opencode.ai/docs/zen/)。 被動讀取只套用記憶體中的停用，不建立副本或顯示警告。
+
+保留正常的 Claude Desktop 指派與預設值。來源模型允許清單變空的規則會停用；注入模型遭移除時，也會停用原生子代理同步。後續儲存設定時不會還原已移除的參照，並會保留正常的同時編輯。
+
+大多數 provider 使用帶 bearer key 的 `openai-chat` adapter；**Xiaomi MiMo**（`xiaomi`）等
+相容 Anthropic 的 preset 則使用 `anthropic` adapter（`x-api-key`）。Xiaomi 另有 OpenAI Chat
+preset `xiaomi-mimo`，以及 token plan preset `mimo`。三者都預設使用 MiMo V2.6
+（`mimo-v2.6-pro`；`xiaomi-mimo` 使用 `mimo-v2.6-flash`）。Xiaomi 將於 2026-10-21 停用
+`mimo-v2.5` 和 `mimo-v2.5-pro`，且不提供重新導向；請在期限前更換已儲存的 V2.5 預設模型，
+opencodex 不會替你改寫。
+在已驗證的 Ark Coding Plan 工具 continuation 中，把上一輪 Responses 回傳的 `reasoning` item 原樣送回會得到 `400 InvalidParameter`，因此 Coding Plan preset 會在轉送 continuation input 前移除這類 item；該輪的 reasoning 狀態會因此遺失，可用 `dropResponsesReasoningItems: false` 關閉。已經以 `openai-chat` 儲存的 Coding Plan 設定不會被改寫，仍走 Chat；要切換請手動把 `adapter` 改成 `openai-responses`、`responsesPath` 設為 `/responses`，或刪除後重新加入該 preset。Volcengine Coding Plan 與 Agent Plan 透過
 `openai-responses` 使用原生 Responses endpoint。內建 DeepSeek preset 也會把 `deepseek-v4-flash` 路由到
 原生 Responses endpoint，並保持上游 SSE streaming。若該模型完成所有 output item 卻省略最後的
 Responses event，opencodex 會套用 5 秒、model-scoped 的 grace repair；malformed 或 partial stream 會以
@@ -373,12 +406,18 @@ Hyperbolic 另外的 image、audio 與 GPU endpoint 不在範圍內。可在
 [Nscale Console](https://console.nscale.com) 建立；Vultr inference key 可從
 [Vultr Console](https://my.vultr.com) 的 subscription overview 複製。
 
-**Command Code 探索。** preset 從固定 Provider API host 讀取 Command Code 的 `/provider/v1/models`
-列表，保留 provider-native id，並把 discovery 限制在 256 KiB／256 個 raw row。
-`ocx login command-code` 支援 browser sign-in OAuth；既有 Command Code CLI 使用者也可選擇從
-`~/.commandcode/auth.json` 匯入本機 CLI credential。模型 catalog 依帳號而定，登入後從經認證的 discovery
-endpoint 取得。Chat request 使用設定的 Bearer key。可在
-[Command Code Studio](https://commandcode.ai/studio/) 建立 key。
+**Command Code 探索。** preset 從固定的 Provider API 主機讀取 Command Code 的
+`/provider/v1/models` 清單，保留 provider 原生 ID，並將探索限制在 256 KiB／256 筆原始資料。
+`ocx login command-code` 支援透過瀏覽器登入 OAuth；既有 Command Code CLI 使用者也可選擇從
+`~/.commandcode/auth.json` 匯入本機 CLI 憑證。模型目錄依帳號而定，登入後由經認證的探索端點取得。
+Provider-API preset（`commandcode`）會傳送目前設定的有效金鑰：多數模型 ID 使用 Chat Completions
+及 Bearer 標頭；`claude-*` ID 則使用 Anthropic Messages 及 `x-api-key`，因為 Command Code 只在
+`/provider/v1/messages` 提供這些模型。若其他 provider 將 `commandcode` 名稱用於不同端點，
+仍沿用自己的傳輸格式。OAuth preset（`command-code`）使用已儲存的帳號 bearer 進行認證探索，
+並從 `/alpha/generate` 以 NDJSON 串流生成內容。若 gateway 將 MiMo 工具呼叫標記以文字回傳，
+且與實際呼叫重複，就會移除該標記。對 MiMo 模型而言，呼叫已宣告工具、內容完整但沒有對應原生呼叫的標記，
+只會在正常結束後還原；中斷或遭過濾的回合則保留標記文字。Provider-API 金鑰可在
+[Command Code Studio](https://commandcode.ai/studio/) 建立。
 
 **Command Code 配額。** 儀表板與 `ocx account refresh` 會在正規主機 `https://api.commandcode.ai` 探測 `/alpha/billing/credits` 視窗（5 小時與每週）。OAuth preset (`command-code`) 使用已儲存的帳號 bearer；Provider-API key preset (`commandcode`) 使用目前設定的有效 key。使用者改寫過的仿冒 base URL 不會被探測。當 Command Code 同時回報週期消耗時，剩餘的 monthly / purchased / free credits 會顯示為 USD 視窗。
 
@@ -482,7 +521,7 @@ key-based provider 也能保存多個 key。透過 Providers 頁面新增 key �
 
 不必開啟儀表板，即可用 `ocx account list`、`ocx account current` 與 `ocx account use` 檢視或切換
 同一組 Codex、OAuth 與 API-key pool。完整 command、JSON output 與新 session 生效規則請參見
-[CLI 參考](/zh-tw/reference/cli/#ocx-account-subcommand)。
+[CLI 參考](/zh-tw/reference/cli/providers-accounts/#ocx-account-subcommand)。
 
 ### GPT-5.6 預覽路徑
 
@@ -494,6 +533,9 @@ GPT-5.6 Sol/Terra/Luna 會預置在 provider fallback list 中，因此即使即
 | Codex 登入（Pool 或 Direct） | `gpt-5.6-*` | 922,000 |
 | OpenAI (API key) | `openai-apikey/gpt-5.6-*` 加 `*-pro` | 922,000（922,000 max input） |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`、`openrouter/openai/gpt-5.6-terra`、`openrouter/openai/gpt-5.6-luna` | 922,000 |
+| Codex | `gpt-6.1-terra` | 500,000 / 872,000 |
+| OpenAI API | `openai-apikey/gpt-6.1-terra` | 1,050,000 (128,000 max output) |
+| OpenRouter | `openrouter/openai/gpt-6.1-terra` | 1,050,000 |
 | Cursor | `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna` | 1,000,000 |
 
 原生 GPT-5.6 條目保留固定的上游 reasoning ladder，例如 Luna 有 `max` 但沒有 `ultra`。路由條目使用各
@@ -511,7 +553,7 @@ Antigravity／Cloud Code Assist 模式）、`azure` / `azure-openai`、`kiro`、
 key／subscription-token gateway。**Cloudflare AI Gateway** 需要在 URL 填入 account 與 gateway id。
 
 Copilot 的 catalog 混合多種 wire：模型（`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.4-mini`、
-`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）會拒絕 agent traffic 的
+`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、 `gpt-6.1-sol`、 `gpt-6.1-terra`、 `gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）會拒絕 agent traffic 的
 `/chat/completions`，因此 opencodex 會依內建預設把這些模型路由到 Responses API；其他 Copilot 模型
 仍使用 chat completions。優先順序為：hard wire pin → 你明確設定的
 [`modelAdapters`](/zh-tw/reference/configuration/providers/) → registry default → provider-wide adapter。
@@ -521,16 +563,17 @@ Copilot 的 catalog 混合多種 wire：模型（`gpt-5.3-codex`、`gpt-5.4`、`
 Cursor 另以實驗性 adapter 追蹤。`adapter: "cursor"` 會在 `ocx init` 與 dashboard Add Provider picker
 出現為實驗性 local config，並帶 Cursor static fallback model catalog metadata。設定 Cursor access token
 後，opencodex 使用 Cursor 即時 HTTP/2 transport。bundled fallback seed 包含 1M context 的
-`gpt-5.6-sol`／`terra`／`luna`、500K 的 Grok 4.5/4.6 一般與 Fast 項目，以及 262K 的 `kimi-k3`；即時探索
-決定哪些模型對帳號保持可見。Grok 4.6 的兩種形式都提供 `low`／`medium`／`high`／`xhigh`，4.5 則最高到
-`high`。Fast 請求會傳送對應的 Grok 基礎模型，並使用獨立的 `effort` 與 `fast=true` `requested_model`
-參數；扁平化的 `cursor-grok-{version}-{effort}-fast` id 僅作為探索與 picker 識別。Cursor 的 Kimi K3
+`gpt-5.6-sol`／`terra`／`luna`、500K 的 Grok 4.5/4.6/4.7 一般與 Fast 項目，以及 262K 的 `kimi-k3`；即時探索
+決定哪些模型對帳號保持可見。Grok 4.6 與 4.7 的兩種形式都提供 `low`／`medium`／`high`／`xhigh`，4.5 則最高到
+`high`。Grok 4.5 與 4.6 的 Fast 請求會傳送對應的基礎模型，並使用獨立的 `effort` 與 `fast=true`
+`requested_model` 參數；這兩個版本扁平化的 `cursor-grok-{version}-{effort}-fast` id 僅作為探索與 picker 識別。
+Grok 4.7 在清單中沒有 `cursor-` 前綴，直接傳送 `grok-4.7-{effort}-fast`。Cursor 的 Kimi K3
 只以帶 effort suffix 的 wire id 提供，因此
 `cursor/kimi-k3` 暴露 `low`／`high`／`max` ladder，預設為 `max`，符合該模型文件化的 API default。
 Cursor server-driven native read/write/delete/ls/grep/shell/fetch execution 預設停用，因為它會繞過 Codex
 approval 與 sandbox 路徑；只有可信本機實驗才應在 `~/.opencodex/config.json` 的 `providers.cursor`
 物件設定 `unsafeAllowNativeLocalExec: true`，也可以透過儀表板 **Providers → Cursor → Edit JSON** 設定。
-完整範例參見[設定參考](/zh-tw/reference/configuration/#cursor-provider-adapter-cursor)。MCP、螢幕錄製與
+完整範例參見[設定參考](/zh-tw/reference/configuration/providers/#cursor-供應商adapter-cursor)。MCP、螢幕錄製與
 computer-use 可透過 executor hook 使用；未設定本機 executor 時，opencodex 會回傳 typed no-executor
 result，而不是用 policy block request。Cursor OAuth 與即時 model discovery 已為此實驗性 adapter 啟用；
 Cursor 仍不會出現在 key-login list。
@@ -576,4 +619,4 @@ refresh 的即時 utilization bar。bar 代表特定 window（5 小時、weekly�
 
 具有 live probe 的 provider：OpenAI/Codex、Anthropic、xAI、Cursor、Kimi、Google Antigravity、
 OpenRouter、DeepSeek、ClinePass、Z.AI、MiniMax、Moonshot、Venice、Synthetic、DeepInfra、Neuralwatt，
-以及任何由 a6api 支援的 custom provider。
+以及任何由 a6api 或 Abliteration 支援的 custom provider。

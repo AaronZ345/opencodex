@@ -1,14 +1,17 @@
 // Shared client export model metadata.
+import { getModelMetadata, resolveMetadataProvider } from "../../generated/model-metadata";
 import { SCHEMA_REQUIRED_OUTPUT_BUDGET } from "./constants";
 import { expandFastExportModels } from "./fast-models";
+import { sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
 import type { OpencodeCatalogModel, ExportModel, ExportClientId, ManagedContribution } from "./contracts";
 import type { OcxConfig } from "../../types";
 import { shouldInjectApiAuthHeader } from "../../codex/inject";
 
 
 /**
- * Authoritative context window, or undefined. Never guesses: a missing, non-finite, or
- * non-positive value means the serializer omits every context-derived field.
+ * Validate the supplied catalog window (which may be a labelled vendor estimate).
+ * A missing, non-finite, or non-positive value omits every context-derived field;
+ * this serializer does not independently infer a window.
  */
 export function authoritativeContextWindow(contextWindow: number | undefined): number | undefined {
   if (typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0) {
@@ -18,9 +21,39 @@ export function authoritativeContextWindow(contextWindow: number | undefined): n
   return undefined;
 }
 
-/** Schema-required output budget for a known context window. */
-export function outputBudgetFor(context: number): number {
-  return Math.min(SCHEMA_REQUIRED_OUTPUT_BUDGET, context);
+/** Known model output limit, with a schema-required fallback, clamped to context. */
+export function outputBudgetFor(context: number, model: OpencodeCatalogModel): number {
+  const provider = model.provider ?? "";
+  const metadata = getModelMetadata(resolveMetadataProvider(provider) ?? provider, model.id ?? model.namespaced);
+  const limit = authoritativeContextWindow(model.maxTokens)
+    ?? authoritativeContextWindow(metadata?.maxTokens)
+    ?? SCHEMA_REQUIRED_OUTPUT_BUDGET;
+  return Math.min(limit, context);
+}
+
+/**
+* Known model output limit without the schema stand-in, clamped to context.
+*
+* `outputBudgetFor` always returns a number because the clients that require the field
+* cannot express "unknown". A client that instead treats an absent `maxTokens` as a real
+* default must not be handed the 32000 stand-in: that would claim a limit no model declared
+* (#5828). Use this variant where "no claim" is representable.
+* @param context - the context window this model already exports.
+* @param model - the catalog row, which may carry an authoritative output limit.
+* @returns the known limit clamped to `context`, or undefined when nothing is known.
+*/
+export function knownOutputBudget(context: number, model: OpencodeCatalogModel): number | undefined {
+  const provider = model.provider ?? "";
+  const metadata = getModelMetadata(resolveMetadataProvider(provider) ?? provider, model.id ?? model.namespaced);
+  const limit = authoritativeContextWindow(model.maxTokens)
+    ?? authoritativeContextWindow(metadata?.maxTokens);
+  return limit === undefined ? undefined : Math.min(limit, context);
+}
+
+/** Input limits are optional: unlike output, a missing limit needs no schema fallback. */
+export function inputBudgetFor(context: number, model: OpencodeCatalogModel): number | undefined {
+  const limit = authoritativeContextWindow(model.maxInputTokens);
+  return limit === undefined ? undefined : Math.min(limit, context);
 }
 
 /**
@@ -73,6 +106,21 @@ export function inputModalitiesForClient(
 }
 
 /**
+ * Effort ladder a ZCode surface can offer as picker values, or undefined when the row
+ * has nothing selectable.
+ *
+ * Both ZCode exports — the legacy `v2/config.json` block's `reasoning.variants` and the
+ * `v2/provider_config.json` store's `optionSpecs.reasoningLevel.values` — carry the same
+ * Codex vocabulary: the client validates the chosen level against the emitted list and
+ * forwards it verbatim, and `/v1/responses` reads that vocabulary natively. `none` is a
+ * Codex omit-sentinel, not a picker option, so it never survives into the values.
+ */
+export function zcodeSelectableEfforts(efforts: readonly string[] | undefined): string[] | undefined {
+  const selectable = sanitizeCodexReasoningEfforts(efforts)?.filter(effort => effort !== "none");
+  return selectable && selectable.length > 0 ? selectable : undefined;
+}
+
+/**
  * Input modalities opencode's model schema accepts (opencode.ai/config.json, both
  * `modalities.input` and `modalities.output`). Wider than our internal `text | image | audio`
  * vocabulary, so unlike Pi and Gajae this filter can only drop a value no current ingress
@@ -83,12 +131,12 @@ export function inputModalitiesForClient(
 const OPENCODE_INPUT_MODALITIES: ReadonlySet<string> = new Set(["text", "audio", "image", "video", "pdf"]);
 
 /**
- * opencode's per-model capability fields for one catalog row, or `undefined` when the row
+ * Legacy per-model modality fields for one catalog row, or `undefined` when the row
  * declares nothing.
  *
- * `undefined` rather than `{ input: ["text"] }`: opencode already computes an entry without
- * capabilities as text-only, and leaving the keys out keeps every model that declares
- * nothing byte-identical to what shipped before. A declared list is carried across as-is, so
+ * `undefined` rather than guessing `{ input: ["text"] }`: unknown capabilities leave the
+ * client's fallback assumptions in place. V2 translates these lists into native capability
+ * fields; legacy clients also receive the attachment flag. A declared list is carried across as-is, so
  * an audio-only row keeps `attachment: true` instead of being rewritten to text it cannot
  * read — the same call Pi's exporter makes, in the opposite direction.
  */

@@ -36,7 +36,7 @@ yönetim API'sine gidiş-dönüş yapar. Durdurulmuş veya erişilemeyen bir pro
 yapılandırma işlemleri olarak açıkça belgelenen komutlar, bunun yerine canlı bir
 proxy olmadan yapılandırma dosyasını doğrulayabilir ve düzenleyebilir.
 
-`ocx system codex-cli-update check` canlı proxy gerektirmez ve paket kayıt defterine istek göndermez. Yapılandırmada belirtilen kurulum adayına ilişkin provenance meta verilerini, maskelenmiş yürütülebilir dosya konumu ve sahiplik kanıtı dâhil, sınırlı biçimde inceler. Yayımlanmış başlatıcıdan gelen güvenilir bağlam aday anlık görüntüsünü doğrular; Codex'in başarıyla çalıştırıldığını doğrulamaz. Bu tek seferlik denetim Codex'i hiçbir zaman çalıştırmadığından, ortamdan ve kalıcı kayıtlardan gelen adaylar yalnızca raporlanır (`managed: false`, genellikle `selection_unattested`). JSON çıktısında `candidateAvailable`, `candidateVersion` ve `candidateSource` alanları bulunur; `selectionAttested` değeri ise `false` kalır. Yapılandırmada belirtilen kurulum adayını incelemek için yayımlanmış başlatıcıdan gelen güvenilir bağlam gerekir; Bun ile veya kaynak koddan doğrudan başlatıldığında bu kanıt bulunmadığından ortamdaki ve kalıcı kayıtlardaki aday durumu yok sayılır ve POSIX'te `candidate_unavailable`, Windows'ta ise `windows_inspection_deferred` bildirilebilir. Windows'ta bu ilk parça, aday veya yapılandırma yollarında hiçbir dosya sistemi G/Ç işlemi yapmaz. Yalnızca güvenilir başlatıcının yakaladığı mutlak bir ortam adayı sözcüksel olarak uygulama paketi ya da sürüm yöneticisi etiketi alabilir; diğer tüm Windows adayları kapalı başarısızlıkla reddedilir. Komut yazılım kurmaz veya onarmaz, Codex ya da npm çalıştırmaz, çalışan bir sürece müdahale etmez ve yapılandırmaya ya da önbellek durumuna yazmaz.
+`check` kayıt defterini sorgulamaz ve Codex’i çalıştırmaz. POSIX üzerinde çözümleyicinin seçtiği kanonik yol, yayımlanmış başlatıcının yakaladığı ortam adayıyla aynıysa `selectionAttested: true` olabilir. Bağlantılı npm-global paket bildirimi sahipliği doğrularsa ve aday sürüm bildirildiyse bu sürüm bildirimdeki sürümle eşleşirse `managed: true` olabilir; kalıcı adaylar doğrulanmaz. Windows x64 ayrıca kanıta bağlı mutlak standart npm `codex.cmd` ile tutulan tanıtıcılara bağlı bir Node/npm araç zincirini (varsa önek-yerel, yokluğu doğrulanırsa başlatıcı mimarisine bağlanmış yakalanan PATH çifti) ve önek içinde doğrulanmış platform desteğini destekler; yeniden ayrıştırmayı reddeden tutulan tanıtıcılar kullanır. Diğer Windows düzenleri ertelenmiş veya yönetimsiz kalır. Windows'taki bir `managed` sonucu yalnızca gözlemlenen kurulum düzenini sınıflandırır: bağlı Node/npm, güncelleyicinin salt okunur meta veri araç zinciridir ve sonraki bir `codex.cmd` çağrısının hangi yorumlayıcıyı çözeceğine dair bir güvence değildir. Doğrudan Bun/kaynak çalıştırması başlatıcı kanıtı sağlamaz. `plan`, yalıtılmış geçici npm yapılandırması, önbelleği ve günlükleriyle resmî kayıt defterini sorgular; etkin oturumları veya eksik süreç gözlemini reddeder. Yazılım kurmaz ve süreçlere sinyal göndermez. Windows x64 apply, doğrulanmış özel yazma yetkisine sahip sınırlı bir npm öneki gerektirir ve ilgisiz paketleri ve shim'leri korur; desteklenmeyen gözlemlenen düzenler `applicable: false` ve `refusal: windows_apply_disabled` döndürür; yalnızca PATH seçimi, OpenCodex otomatik başlatma sarmalayıcıları ve global/vendor geri dönüşü ertelenmiş kalır. [Komutların ve ret nedenlerinin tam açıklamasına (İngilizce)](/reference/cli/agents/#read-only-codex-cli-update-plan) bakın.
 
 Windows x64 kurulum gözlemi için [`attest`](/tr/reference/cli/agents/) komutuna bakın. Açık yollar verilmezse komut, kanıta bağlı başlatıcı anlık görüntüsünün belirlediği seçili adayı gözlemler; güncelleme yetkisi veya çalışma zamanı seçimi doğrulanmaz.
 
@@ -46,12 +46,18 @@ logs --follow --jsonl` kullanın. Tema, dil, gezinme ve diğer tamamen görsel
 tarayıcı durumlarının CLI eşdeğeri yoktur; Cloudflare Tünel kurulumu bu komut
 kümesinin dışındadır.
 
+## Canlılık yoklaması üst sınırının geçersiz kılınması
+
+`ocx health`, `ocx status`, `ocx account *`, `ocx login codex` ve `ocx ready`, çalışan proxy'yi kısa bir canlılık yoklamasıyla bulur: varsayılan olarak deneme başına 750 ms, durdurma ve başlatma kararlarında yeniden denemelerle 1500 ms. Bir güvenlik katmanının (içerik filtresi veya EDR tarzı ağ uzantısı) her loopback bağlantısına sabit bir gecikme eklediği ana makinelerde bu sınırlar, sağlıklı bir proxy yanıt vermeden dolabilir.
+
+Bu durumda sınırları `OCX_PROBE_TIMEOUT_MS` ile yükseltin, örneğin `OCX_PROBE_TIMEOUT_MS=5000 ocx status`. Değer 1 ile 30000 arasında tam sayı milisaniyedir. Geçersiz kılma yalnızca yükseltir: 750 ms varsayılan ve 1500 ms durdurma/başlatma bütçeleri alt sınırlarını korur, bu yüzden `1000` yalnızca varsayılan yoklamayı uzatır. Boş, kesirli, negatif, sıfır veya daha büyük değerler yok sayılır.
+
 ## Çıkış kodları ve onaylama
 
 Başarılı komutlar 0 ile çıkar. Geçersiz kullanım, bilinmeyen komutlar veya
 kaynaklar, başarısız API işlemleri ve kullanılamayan gerekli servisler sıfır
 olmayan bir çıkış yapar. `ocx health` özellikle yalnızca proxy sağlıklı
-olduğunda 0 ve aksi takdirde 1 ile çıkar, bu nedenle bir servis probu olarak
+olduğunda 0, sağlıklı proxy bulunamadığında 1 ve geçersiz argümanlarda 2 ile çıkar, bu nedenle bir servis probu olarak
 kullanılabilir. Betikler insan tarafından okunabilir çıktıyı kazımak yerine
 çıkış kodunu test etmelidir.
 

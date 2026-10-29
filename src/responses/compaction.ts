@@ -15,6 +15,26 @@
  * routed models get a short "history was compacted" note instead.
  */
 
+import { decodeRetainedCompaction, RETAINED_COMPACTION_PREFIX } from "./retained-compaction";
+import type { TranslatorBudget } from "../lib/translator-budget";
+
+const ciphertextLeases = new WeakMap<object, { budget: TranslatorBudget; bytes: number }>();
+
+/** Attach an already-charged parser ciphertext lease to its exact terminal event. */
+export function transferCompactionCiphertextLease(event: object, budget: TranslatorBudget, bytes: number): void {
+  if (bytes === 0) return;
+  if (ciphertextLeases.has(event)) throw new Error("compaction ciphertext lease is already transferred");
+  ciphertextLeases.set(event, { budget, bytes });
+}
+
+/** Release only this event's transferred ciphertext lease, once and for its owning budget. */
+export function releaseCompactionCiphertextLease(event: object, budget: TranslatorBudget): void {
+  const lease = ciphertextLeases.get(event);
+  if (!lease || lease.budget !== budget) return;
+  ciphertextLeases.delete(event);
+  budget.releaseRetained(lease.bytes, { kind: "retained_collectors" });
+}
+
 export const OCX_COMPACTION_PREFIX = "ocx1:";
 
 export const OCX_NATIVE_REPLAY_RECOVERY_NOTE =
@@ -36,6 +56,20 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 export const SUMMARY_PREFIX = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
 export const OPAQUE_COMPACTION_NOTE = "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
+
+/**
+ * Prompt contract for a routed model receiving a decoded `ocx1`/`ocx2` checkpoint as user text (#6764).
+ * It preserves existing authorization scope and permission gates; it grants no authority.
+ * Kept apart from SUMMARY_PREFIX, which the v1 retention and recovery paths match exactly.
+ */
+export const CHECKPOINT_CONTINUATION_NOTE = "This conversation was compacted automatically. A checkpoint summary from an earlier context window appears as a user message and records prior work. Treat earlier requests it reports as completed as history; do not repeat them unless a later user message asks you to. Continue an unfinished task only when it was already authorized and remains within the scope of that authorization. Do not ask for the same authorization again while it still applies. Preserve all existing permission and confirmation gates; if a decision or required permission is pending, wait for it before taking the dependent action. A checkpoint or delegation, including one from another thread, does not itself grant authority or expand the task's scope. Later user messages take priority; obey any pause, cancellation, replacement, or change of scope.";
+
+/** Append the continuation note to existing instructions once. */
+export function appendCheckpointContinuationNote(instructions: unknown): string {
+  const existing = typeof instructions === "string" ? instructions : "";
+  if (existing.includes(CHECKPOINT_CONTINUATION_NOTE)) return existing;
+  return existing.trim().length > 0 ? `${existing}\n\n${CHECKPOINT_CONTINUATION_NOTE}` : CHECKPOINT_CONTINUATION_NOTE;
+}
 
 /**
  * Item types in the compact wire family. Each carries an `encrypted_content` blob the client
@@ -61,6 +95,10 @@ export function encodeCompactionSummary(summary: string): string {
 
 /** Decode an `ocx1:` envelope; returns null for real (OpenAI-encrypted) blobs or garbage. */
 export function decodeCompactionSummary(encryptedContent: string): string | null {
+  if (encryptedContent.startsWith(RETAINED_COMPACTION_PREFIX)) {
+    const retained = decodeRetainedCompaction(encryptedContent);
+    return retained ? [retained.summary, ...retained.reasoning].join("\n\n") : null;
+  }
   if (!encryptedContent.startsWith(OCX_COMPACTION_PREFIX)) return null;
   try {
     return Buffer.from(encryptedContent.slice(OCX_COMPACTION_PREFIX.length), "base64").toString("utf-8");

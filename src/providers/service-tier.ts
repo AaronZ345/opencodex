@@ -1,5 +1,5 @@
 import type { OcxProviderConfig } from "../types";
-import { captureWireAdapterHardPins } from "../types";
+import { captureWireAdapterHardPinPrefixes, captureWireAdapterHardPins } from "../types";
 import { isCanonicalOpenAiForwardProvider } from "./openai-tiers";
 import {
   getProviderRegistryEntry,
@@ -15,6 +15,7 @@ import {
   type FastPolicyAuthority,
   type ResolvedFastPolicy,
 } from "./fastwire";
+import { providerFastSwitchOff } from "./fast-opt-in";
 
 /** OpenAI-compatible adapters that can carry the standard `service_tier` field. */
 export const SERVICE_TIER_ADAPTERS = new Set(["openai-chat", "openai-responses"]);
@@ -32,9 +33,11 @@ type ServiceTierCapabilityProvider = Pick<
   | "modelAdapters"
   | "baseUrl"
   | "authMode"
+  | "googleMode"
   | "apiKeyTransport"
   | "chatServiceTier"
   | "fastWire"
+  | "fastEnabled"
 >;
 
 function cloneRegistryWireDefaults(
@@ -83,9 +86,14 @@ function buildFastPolicyAuthority(
     && registryModelServiceTierCapabilityApplies(registry, capabilityProvider)
     ? registry.modelSupportsServiceTier
     : undefined;
-  const providerCapability = capabilityProvider.supportsServiceTier
-    ?? keyAuthDefaults?.supportsServiceTier
-    ?? registry?.supportsServiceTier;
+  const fastSwitchOff = providerFastSwitchOff(providerName, {
+    fastEnabled: capabilityProvider.fastEnabled ?? provider.fastEnabled,
+  });
+  const providerCapability = fastSwitchOff
+    ? false
+    : capabilityProvider.supportsServiceTier
+      ?? keyAuthDefaults?.supportsServiceTier
+      ?? registry?.supportsServiceTier;
   const authority: FastPolicyAuthority = Object.freeze({
     providerAdapter: provider.adapter,
     providerAuthMode: provider.authMode ?? registry?.authKind ?? "key",
@@ -112,7 +120,8 @@ function buildFastPolicyAuthority(
           : {}),
     }),
     modelAdapters: Object.freeze({ ...(provider.modelAdapters ?? {}) }),
-    hardPins: captureWireAdapterHardPins(providerName),
+    hardPins: captureWireAdapterHardPins(providerName, provider),
+    hardPinPrefixes: captureWireAdapterHardPinPrefixes(providerName, provider),
     registryWireDefaults: cloneRegistryWireDefaults(registry?.modelWireDefaults),
   });
   return authority;
@@ -158,6 +167,7 @@ function authorityForProvider(
       ...authority,
       modelAdapters: Object.freeze({}),
       hardPins: Object.freeze({}),
+      hardPinPrefixes: Object.freeze({}),
       registryWireDefaults: Object.freeze({}),
     });
   }

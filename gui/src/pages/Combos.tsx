@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ComboWorkspace from "../components/ComboWorkspace";
+import { comboVisionSidecarTargets } from "../combo-capabilities";
 import {
   type ComboItem,
   comboModelId,
@@ -8,12 +9,16 @@ import {
   nextProviderQuotaStateExpiration,
   toPutBody,
 } from "../combo-workspace-data";
+import { hostDocumentHidden, onHostVisibilityChange } from "../host-visibility";
 import { hideRedundantChatGptForwardProviders } from "../provider-workspace/catalog";
 import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
 import { Notice } from "../ui";
 import { useT } from "../i18n/shared";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
+import { replaceHash } from "../hash-routing";
+import { jevAutoCreateDecisionProvider } from "../app-routing";
+import type { ComboAddIntent } from "../components/combo-workspace-types";
 
 type ProviderOption = {
   name: string;
@@ -22,13 +27,24 @@ type ProviderOption = {
   authMode?: string;
   adapter?: string;
   baseUrl?: string;
+  defaultModel?: string;
+  models?: string[];
 };
-type ModelOption = { provider: string; id: string; namespaced?: string; reasoningEfforts?: string[]; inputModalities?: string[] };
+type ModelOption = {
+  provider: string;
+  id: string;
+  namespaced?: string;
+  reasoningEfforts?: string[];
+  inputModalities?: string[];
+  inputModalitiesDeclared?: string[];
+  visionSidecarConsumer?: boolean;
+};
 type ProviderDto = {
   adapter: string;
   baseUrl: string;
   disabled?: boolean;
   defaultModel?: string;
+  models?: string[];
   authMode?: string;
 };
 type ConfigDto = { providers?: Record<string, ProviderDto> };
@@ -36,6 +52,7 @@ type CachedCombosPage = {
   combos: ComboItem[];
   providers: ProviderOption[];
   models: ModelOption[];
+  capabilityModels?: ModelOption[];
   cataloguedComboIds: string[];
 };
 type ProviderQuotasDto = { reports?: unknown };
@@ -75,7 +92,7 @@ export default function Combos({
   onCountChange?: (count: number) => void;
 }) {
   const t = useT();
-  const cacheKey = `ocx.combos.workspace.v1:${apiBase}`;
+  const cacheKey = `ocx.combos.workspace.v2:${apiBase}`;
   const cached = useMemo(() => seedCombos(cacheKey), [cacheKey]);
 
   /*
@@ -93,7 +110,21 @@ export default function Combos({
   const [retainedData, setRetainedData] = useState<CachedCombosPage | null>(cached ?? null);
   const [status, setStatus] = useState("");
   const [statusOk, setStatusOk] = useState(false);
-  const [adding, setAdding] = useState(false);
+  const [addIntent, setAddIntent] = useState<ComboAddIntent | null>(() => (
+    jevAutoCreateDecisionProvider(window.location.hash) !== undefined ? "jev-auto" : null
+  ));
+  // A self-hosted decision row's "Create JEV Auto" pre-fills that row as the decision service.
+  const [addDecisionProvider, setAddDecisionProvider] = useState<string | null>(
+    () => jevAutoCreateDecisionProvider(window.location.hash) ?? null,
+  );
+
+  const closeAdd = useCallback(() => {
+    setAddIntent(null);
+    setAddDecisionProvider(null);
+    if (jevAutoCreateDecisionProvider(window.location.hash) !== undefined) {
+      replaceHash("models/combos");
+    }
+  }, []);
 
   const notify = (msg: string, ok: boolean) => {
     setStatus(msg);
@@ -139,14 +170,24 @@ export default function Combos({
     const providers = Object.entries(allProviders).map(([name, p]) => ({
       name,
       disabled: !!p.disabled,
-      hiddenFromPicker: !Object.hasOwn(visibleProviders, name),
+      hiddenFromPicker: p.adapter === "jev-decision" || !Object.hasOwn(visibleProviders, name),
       authMode: p.authMode,
       adapter: p.adapter,
       baseUrl: p.baseUrl,
+      ...(typeof p.defaultModel === "string" ? { defaultModel: p.defaultModel } : {}),
+      ...(Array.isArray(p.models) ? { models: p.models.filter((model): model is string => typeof model === "string") } : {}),
     }));
 
     const models: ModelOption[] = [];
+    const capabilityModels: ModelOption[] = [];
     const catalogued = new Set<string>();
+    const parseModalities = (raw: unknown): string[] | undefined =>
+      Array.isArray(raw)
+        ? raw.flatMap((modality) => {
+          const trimmed = typeof modality === "string" ? modality.trim() : "";
+          return trimmed ? [trimmed] : [];
+        })
+        : undefined;
     for (const row of modelRows) {
       if (!row || typeof row !== "object") continue;
       const model = row as {
@@ -156,6 +197,8 @@ export default function Combos({
         disabled?: unknown;
         reasoningEfforts?: unknown;
         inputModalities?: unknown;
+        inputModalitiesDeclared?: unknown;
+        visionSidecarConsumer?: unknown;
       };
       if (typeof model.provider !== "string" || typeof model.id !== "string") continue;
       const provider = model.provider.trim();
@@ -165,35 +208,34 @@ export default function Combos({
         catalogued.add(id);
         continue; // combos cannot nest other combos as targets
       }
-      if (model.disabled === true) continue;
       const reasoningEfforts = Array.isArray(model.reasoningEfforts)
         ? model.reasoningEfforts.filter((effort): effort is string => typeof effort === "string")
         : undefined;
-      const inputModalities = Array.isArray(model.inputModalities)
-        ? model.inputModalities
-          .filter((modality): modality is string => typeof modality === "string")
-          .map((modality) => modality.trim())
-          .filter(Boolean)
-        : undefined;
-      models.push({
+      const inputModalities = parseModalities(model.inputModalities);
+      const inputModalitiesDeclared = parseModalities(model.inputModalitiesDeclared);
+      const option: ModelOption = {
         provider,
         id,
         namespaced: typeof model.namespaced === "string" ? model.namespaced : undefined,
         ...(reasoningEfforts ? { reasoningEfforts } : {}),
         ...(inputModalities && inputModalities.length > 0 ? { inputModalities } : {}),
-      });
+        ...(inputModalitiesDeclared && inputModalitiesDeclared.length > 0 ? { inputModalitiesDeclared } : {}),
+        visionSidecarConsumer: model.visionSidecarConsumer === true,
+      };
+      capabilityModels.push(option);
+      models.push(option); // Catalog visibility does not restrict internal Combo selection.
     }
 
-    // Ensure each provider's defaultModel appears even if catalog fetch lagged.
+    // Add a default placeholder only when the catalog has no row, including disabled rows.
     for (const [name, provider] of Object.entries(allProviders)) {
       const defaultModel = typeof provider.defaultModel === "string" ? provider.defaultModel.trim() : "";
       if (!defaultModel || provider.disabled) continue;
-      if (!models.some(model => model.provider === name && model.id === defaultModel)) {
+      if (!capabilityModels.some(model => model.provider === name && model.id === defaultModel)) {
         models.push({ provider: name, id: defaultModel, namespaced: `${name}/${defaultModel}` });
       }
     }
 
-    const next = { combos, providers, models, cataloguedComboIds: [...catalogued] } satisfies CachedCombosPage;
+    const next = { combos, providers, models, capabilityModels, cataloguedComboIds: [...catalogued] } satisfies CachedCombosPage;
     writeSessionListCacheEntry(cacheKey, next);
     // Retain the coherent payload here — one place, on the success path, never during
     // render. See the `retainedData` note below.
@@ -220,6 +262,28 @@ export default function Combos({
     },
   );
   const { state } = resource;
+
+  /*
+   * Vision Sidecar enabled state for the enrollment warning. Deliberately
+   * separate from the workspace payload: a failure here must never block or
+   * fail the combo workspace, so errors are swallowed and `undefined`
+   * (unknown) renders no warning.
+   */
+  const [visionEnabled, setVisionEnabled] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    fetch(`${apiBase}/api/sidecar-settings`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: unknown) => {
+        if (cancelled || !data || typeof data !== "object") return;
+        const vision = (data as { vision?: { enabled?: unknown } }).vision;
+        if (!vision || typeof vision !== "object") return;
+        setVisionEnabled(vision.enabled !== false);
+      })
+      .catch(() => { /* unknown stays warning-free */ });
+    return () => { cancelled = true; };
+  }, [active, apiBase]);
 
   const [quotaNow, setQuotaClock] = useState(() => Date.now());
   const loadProviderQuotas = useCallback(async (signal?: AbortSignal): Promise<ProviderQuotasDto> => {
@@ -252,11 +316,11 @@ export default function Combos({
     // A new snapshot may be newer than this clock, so unknown state also gets one immediate check.
     const timer = window.setTimeout(recheck,
       quotaExpiry === undefined ? 0 : Math.max(0, quotaExpiry - Date.now()));
-    const onVisible = () => { if (document.visibilityState === "visible") recheck(); };
-    document.addEventListener("visibilitychange", onVisible);
+    const onVisible = () => { if (!hostDocumentHidden()) recheck(); };
+    const unsubscribeVisibility = onHostVisibilityChange(onVisible);
     return () => {
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisible);
+      unsubscribeVisibility();
     };
   }, [active, apiBase, quotaResource.data, quotaResource.lastAttemptOk, quotaExpiry]);
 
@@ -273,6 +337,7 @@ export default function Combos({
   }, [combos.length, data, onCountChange]);
   const providers = data?.providers ?? [];
   const models = data?.models ?? [];
+  const capabilityModels = data?.capabilityModels ?? models;
   const cataloguedComboIds = new Set(data?.cataloguedComboIds ?? []);
 
   const saveCombo = async (item: ComboItem, isCreate: boolean, renameFrom?: string) => {
@@ -280,7 +345,14 @@ export default function Combos({
       const res = await fetch(`${apiBase}/api/combos`, {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(toPutBody(item, renameFrom ? { renameFrom } : {})),
+        body: JSON.stringify(toPutBody(item, {
+          ...(renameFrom ? { renameFrom } : {}),
+          // Enabling images declares text-only members for the Vision Sidecar so the
+          // operator never has to hand-edit provider config for a multimodal combo.
+          ...(item.imageInput !== "disabled"
+            ? { visionSidecarTargets: comboVisionSidecarTargets(item.targets, capabilityModels) }
+            : {}),
+        })),
       });
       const data = res.ok
         ? await res.json() as unknown
@@ -369,18 +441,23 @@ export default function Combos({
           {state.refreshing ? t("common.loading") : ""}
         </span>
         <ComboWorkspace
+          apiBase={apiBase}
           combos={combos}
           providerQuotaStates={providerQuotaStates}
           providers={providers}
           models={models}
+          capabilityModels={capabilityModels}
           cataloguedComboIds={cataloguedComboIds}
+          visionEnabled={visionEnabled}
           loading={false}
           onRefresh={() => { resource.refresh(); quotaResource.refresh(); }}
           onSave={saveCombo}
           onRemove={removeCombo}
-          onAdd={() => setAdding(true)}
-          adding={adding}
-          onCloseAdd={() => setAdding(false)}
+          onAdd={(intent = "blank") => setAddIntent(intent)}
+          adding={addIntent !== null}
+          addIntent={addIntent ?? undefined}
+          addDecisionProvider={addDecisionProvider}
+          onCloseAdd={closeAdd}
           onCreated={() => resource.refresh()}
         />
       </div>

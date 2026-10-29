@@ -1,6 +1,5 @@
 import { remoteWorkspaceEnabled } from "../remote-control/workspace-activation";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeContextLimits, nativeModelRows, uniqueCatalogModelsForPublicList } from "../codex/catalog";
 import {
@@ -51,14 +50,16 @@ import {
 import type { OcxClaudeCodeConfig, OcxClaudeDesktopProfile, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../types";
 import type { DesktopProfileModel } from "../claude/desktop-profile";
 import { drainAndShutdown } from "./lifecycle";
+import { acquireExplicitShutdownIntent, noteExplicitShutdownRequested } from "./management/system-restart";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "./request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../usage/cost";
 import type { PersistedUsageAttempt } from "../usage/log";
-import { isAllowedManagementOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "./auth-cors";
+import { inheritTrustedHubManagementRequest, isAllowedManagementOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "./auth-cors";
 import { applySystemEnvToggle } from "./system-env";
 
 import type { ManagementApiDeps } from "./management/context";
 import { handleConfigRoutes } from "./management/config-routes";
+import { handleNativeReasoningRetentionRoutes } from "./management/native-reasoning-retention-routes";
 import { handleLogsUsageRoutes } from "./management/logs-usage-routes";
 import { handleStorageLogGuardRoutes } from "./management/storage-log-guard-routes";
 import { handleRequestHistoryRoutes } from "./management/request-history-routes";
@@ -66,17 +67,27 @@ import { handleRoutingAnalyticsRoutes } from "./management/routing-analytics-rou
 import { handleMetricsRoutes } from "./management/metrics-routes";
 import { handleProviderRoutes } from "./management/provider-routes";
 import { handleModelRoutes } from "./management/model-routes";
+import { handleClaudeInterceptRoutes } from "./management/claude-intercept-routes";
 import { handleAgentSettingsRoutes } from "./management/agent-settings-routes";
 import { handleOauthAccountRoutes } from "./management/oauth-account-routes";
 import { handleComboRoutes } from "./management/combo-routes";
+import { handleDecisionRoutes } from "./management/decision-routes";
 import { handleSystemRoutes } from "./management/system-routes";
 import { handleSidebarRoutes } from "./management/sidebar-routes";
+import { handleUsageTimelineRoutes } from "./management/usage-timeline-routes";
+import { handleCompanionRoutes } from "./management/companion-routes";
 import { handleCodexPromptRoutes } from "./management/codex-prompt-routes";
 import { handleIntegrationRoutes } from "./management/integration-routes";
 import { handleNativeIntegrationRoutes } from "./management/native-integration-routes";
+import { handleClaudeDesktopPickerRoutes } from "./management/claude-desktop-picker-routes";
+import { handleDesktopCompatibilityRoutes } from "./management/desktop-compatibility-routes";
+import { handleDesktopCompatibilityRuntimeRoutes } from "./management/desktop-compatibility-runtime-routes";
+import { handleDesktopCompatibilitySettingsRoutes } from "./management/desktop-compatibility-settings-routes";
+import { handleCodexCliUpdateRoutes } from "./management/codex-cli-update-routes";
 import { handleCursorIntegrationRoutes } from "./management/cursor-integration-routes";
 import type { ManagementContext } from "./management/context";
 import type { ManagementPrincipal, ManagementSessionControl } from "./management-auth";
+import type { ManagementRequestIngress } from "./management/context";
 export type { ManagementApiDeps } from "./management/context";
 import { fetchAllModels } from "./management/shared";
 import { CatalogGatherBusyError } from "../codex/catalog/provider-fetch";
@@ -84,15 +95,15 @@ import type { CatalogDisposition, ConvergeCodex } from "../codex/convergence-typ
 import { normalizeCatalogDisposition } from "../codex/catalog-refresh-status";
 import { managementBodyTooLargeResponse } from "./management/body";
 import { handleSessionRoutes } from "./management/session-routes";
+import { siblingRefusesManagementRequest } from "./management/sibling-guard";
+import { siblingOfLivePort, siblingSkipMessage } from "../codex/sibling-start";
+import { packageVersion } from "../lib/package-version";
+import { isLocalAccountSwitchPath } from "../lib/local-account-switch-capability";
+import { readVerifiedAccountSwitchBody } from "./local-account-switch-auth";
 
 // installed npm version instead of a stale hardcode.
-export const VERSION = (() => {
-  try {
-    return JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version as string;
-  } catch {
-    return "0.0.0";
-  }
-})();
+const MANAGEMENT_VERSION_FALLBACK = "0.0.0";
+export const VERSION = packageVersion(MANAGEMENT_VERSION_FALLBACK);
 
 const managementConvergenceBindings = new WeakMap<object, Readonly<{
   factory: (config: Readonly<OcxConfig>) => ConvergeCodex;
@@ -145,6 +156,26 @@ async function handleQuotaResetRoutesOnDemand(ctx: ManagementContext): Promise<R
   return handleQuotaResetRoutes(ctx);
 }
 
+async function handleLowQuotaRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/codex-auth/low-quota-events", false)) return null;
+  const { handleLowQuotaRoutes } = await import("./management/low-quota-routes");
+  return handleLowQuotaRoutes(ctx);
+}
+
+/** Lazy for the same reason: the quota-pool assembler pulls every quota cache reader. */
+async function handleQuotaPoolRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/quota-pool", false)) return null;
+  const { handleQuotaPoolRoutes } = await import("./management/quota-pool-routes");
+  return handleQuotaPoolRoutes(ctx);
+}
+
+/** Lazy: the OCX-11 fallback state view and its write live off the dashboard's common path. */
+async function handleFallbackRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/fallback", false)) return null;
+  const { handleFallbackRoutes } = await import("./management/fallback-routes");
+  return handleFallbackRoutes(ctx);
+}
+
 /**
  * Lazy like the Lab and routing-profile handlers, and for the same recorded reason: this file is
  * mounted for every dashboard request, so a static import would put the workflow-budget ledger
@@ -156,10 +187,32 @@ async function handleWorkflowBudgetRoutesOnDemand(ctx: ManagementContext): Promi
   return handleWorkflowBudgetRoutes(ctx);
 }
 
+async function handleCodexAgentRoleRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/codex-agent-roles")) return null;
+  const { handleCodexAgentRoleRoutes } = await import("./management/codex-agent-role-routes");
+  return handleCodexAgentRoleRoutes(ctx);
+}
+
+/**
+ * Lazy like the Lab and routing-profile handlers: the protocol planner reaches the router and
+ * the ingress eligibility rules, which no other dashboard request needs.
+ */
+async function handleProtocolRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/protocols")) return null;
+  const { handleProtocolRoutes } = await import("./management/protocol-routes");
+  return handleProtocolRoutes(ctx);
+}
+
 async function handleGrokCouponRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
   if (!pathInManagementNamespace(ctx.url.pathname, "/api/grok/reset-coupons", true)) return null;
   const { handleGrokCouponRoutes } = await import("./management/grok-coupon-routes");
   return handleGrokCouponRoutes(ctx);
+}
+
+async function handleAnthropicResetGrantRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/anthropic/reset-grants", true)) return null;
+  const { handleAnthropicResetGrantRoutes } = await import("./management/anthropic-reset-grant-routes");
+  return handleAnthropicResetGrantRoutes(ctx);
 }
 
 async function handleRemoteWorkspaceRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
@@ -169,11 +222,20 @@ async function handleRemoteWorkspaceRoutesOnDemand(ctx: ManagementContext): Prom
       status: ctx.req.method === "GET" ? 200 : 404, headers: { "cache-control": "no-store" },
     });
   }
-  if (ctx.req.method !== "GET" && ctx.principal !== "gui-session") {
-    return Response.json({ error: "A dashboard session is required for Remote Workspace changes." }, { status: 403 });
+  if (ctx.req.method !== "GET" && (
+    ctx.principal !== "gui-session"
+    || ctx.sessionControl?.isPaired(ctx.req, ctx.config) !== true
+  )) {
+    return Response.json({ error: "A paired dashboard session is required for Remote Workspace changes." }, { status: 403 });
   }
   const { handleRemoteWorkspaceRoutes } = await import("./management/remote-workspace-routes");
   return handleRemoteWorkspaceRoutes(ctx);
+}
+
+async function handleLinkRoutesOnDemand(ctx: ManagementContext): Promise<Response | null> {
+  if (!pathInManagementNamespace(ctx.url.pathname, "/api/link")) return null;
+  const { handleLinkRoutes } = await import("./management/link-routes");
+  return handleLinkRoutes(ctx);
 }
 
 export async function handleManagementAPI(
@@ -183,9 +245,25 @@ export async function handleManagementAPI(
   deps: ManagementApiDeps = {},
   principal?: ManagementPrincipal,
   sessionControl?: ManagementSessionControl,
+  requestIngress: ManagementRequestIngress = { trustedLoopback: false },
 ): Promise<Response | null> {
   if (!isAllowedManagementOrigin(req, config)) {
     return jsonResponse({ error: "cross-origin request blocked" }, 403, req, config);
+  }
+  if (principal === "local-account-switch-capability") {
+    if (req.method !== "PUT" || !isLocalAccountSwitchPath(url.pathname) || url.search !== "") {
+      return jsonResponse({ error: "account switch capability scope mismatch" }, 403, req, config);
+    }
+    if (req.headers.has("content-encoding")) {
+      return jsonResponse({ error: "content encoding is not supported" }, 415, req, config);
+    }
+    const verified = await readVerifiedAccountSwitchBody(req);
+    if (verified.status !== 200) {
+      return jsonResponse({ error: "account switch body rejected" }, verified.status, req, config);
+    }
+    const sourceReq = req;
+    req = new Request(req.url, { method: req.method, headers: req.headers, body: Buffer.from(verified.body) });
+    inheritTrustedHubManagementRequest(sourceReq, req);
   }
   // Management bodies are small JSON (provider names, key ids, settings). Reject oversized
   // payloads before any handler buffers them — the data plane has its own decompression cap.
@@ -265,18 +343,36 @@ export async function handleManagementAPI(
       }
     } catch { /* best-effort */ }
   }
-  const ctx: ManagementContext = { req, url, config, deps, version: VERSION, principal, sessionControl, convergeCodexCatalog, syncClaudeAgentDefsBestEffort };
-  let routed: Response | null;
+  const ctx: ManagementContext = {
+    req, url, config, deps, version: VERSION, principal, sessionControl,
+    trustedLoopbackIngress: requestIngress.trustedLoopback,
+    guiSessionIssuance: requestIngress.guiSessionIssuance ?? null,
+    convergeCodexCatalog, syncClaudeAgentDefsBestEffort,
+  };
+  // Before any route module, including the link, native-main and codex-auth dispatch below.
+  if (siblingRefusesManagementRequest(req.method, url.pathname)) {
+    return jsonResponse({ error: siblingSkipMessage(), code: "sibling_instance" }, 409, req, config);
+  }
+  let routed: Response | null | undefined;
   try {
-    routed = handleSessionRoutes(ctx)
+    routed = await handleClaudeInterceptRoutes(ctx)
+    ??     handleSessionRoutes(ctx)
+    ??     (await handleLinkRoutesOnDemand(ctx))
     ??     (await handleRemoteWorkspaceRoutesOnDemand(ctx))
     ??     (await handleConfigRoutes(ctx))
+    ??     (await handleNativeReasoningRetentionRoutes(ctx))
     ??     (await handleStorageLogGuardRoutes(ctx))
     ??     (await handleLogsUsageRoutes(ctx))
     ??     (await handleRequestHistoryRoutes(ctx))
     ??     (await handleQuotaResetRoutesOnDemand(ctx))
+    ??     (await handleLowQuotaRoutesOnDemand(ctx))
+    ??     (await handleQuotaPoolRoutesOnDemand(ctx))
+    ??     (await handleFallbackRoutesOnDemand(ctx))
     ??     (await handleWorkflowBudgetRoutesOnDemand(ctx))
+    ??     (await handleCodexAgentRoleRoutesOnDemand(ctx))
+    ??     (await handleProtocolRoutesOnDemand(ctx))
     ??     (await handleGrokCouponRoutesOnDemand(ctx))
+    ??     (await handleAnthropicResetGrantRoutesOnDemand(ctx))
     ??     handleMetricsRoutes(ctx)
     ??     (await handleRoutingAnalyticsRoutes(ctx))
     ??     (await handleRoutingProfileRoutesOnDemand(ctx))
@@ -285,12 +381,20 @@ export async function handleManagementAPI(
     ??     (await handleIntegrationRoutes(ctx))
     ??     (await handleNativeIntegrationRoutes(ctx))
     ??     (await handleCursorIntegrationRoutes(ctx))
+    ??     (await handleClaudeDesktopPickerRoutes(ctx))
+    ??     (await handleDesktopCompatibilityRoutes(ctx))
+    ??     (await handleDesktopCompatibilityRuntimeRoutes(ctx))
+    ??     (await handleDesktopCompatibilitySettingsRoutes(ctx))
+    ??     (await handleCodexCliUpdateRoutes(ctx))
     ??     (await handleAgentSettingsRoutes(ctx))
     ??     (await handleCodexPromptRoutes(ctx))
     ??     (await handleOauthAccountRoutes(ctx))
+    ??     (await handleDecisionRoutes(ctx))
     ??     (await handleComboRoutes(ctx))
     ??     (await handleSystemRoutes(ctx))
     ??     (await handleLabRoutesOnDemand(ctx))
+      ?? (await handleUsageTimelineRoutes(ctx))
+      ?? (await handleCompanionRoutes(ctx))
       ?? (await handleSidebarRoutes(ctx));
   } catch (error) {
     const tooLarge = managementBodyTooLargeResponse(error, req, config);
@@ -309,6 +413,11 @@ export async function handleManagementAPI(
   }
   if (routed) return routed;
 
+  if (url.pathname === "/api/stop" && req.method === "GET") {
+    const response = jsonResponse((await import("./stop-teardown")).stopCapabilities(), 200, req, config);
+    response.headers.set("Cache-Control", "no-store");
+    return response;
+  }
   if (url.pathname === "/api/stop" && req.method === "POST") {
     const { installedServiceRespawnRisk, stopServiceIfInstalledDetailed, isServiceOwnershipError } = await import("../service");
     // `ocx stop` performs its own shared teardown AFTER verifying the scheduler did not
@@ -327,9 +436,16 @@ export async function handleManagementAPI(
     // outcome. This process cannot verify its own post-exit respawn window; only the
     // receipt-backed parent `ocx stop` can, which is what the deferral exists for.
     const { deferralMatchesReceipt } = await import("../config/pending-teardown");
-    const { deferralHonored, performStopTeardown } = await import("./stop-teardown");
+    const { deferralHonored, desktopSupervisedStopRefusal, performStopTeardown, preflightStopTeardownOwnership } = await import("./stop-teardown");
+    // The desktop app would start this proxy again within seconds; refuse before anything is
+    // touched and point at its tray, whose Stop it honours (#3008 refuses an undone stop the same way).
+    const desktopRefusal = desktopSupervisedStopRefusal(principal);
+    if (desktopRefusal) return jsonResponse(desktopRefusal, 409, req, config);
     const holdsReceipt = deferralHonored(url, deferralMatchesReceipt);
-    const respawnRisk = holdsReceipt ? "none" : installedServiceRespawnRisk();
+    // A sibling never runs under a service manager, and the installed service is the live
+    // owner's: asking the manager to stop from here would refuse, or boot the owner's job out.
+    const sibling = siblingOfLivePort() !== null;
+    const respawnRisk = holdsReceipt || sibling ? "none" : installedServiceRespawnRisk();
     if (respawnRisk === "respawnable") {
       return jsonResponse({
         success: false,
@@ -361,55 +477,65 @@ export async function handleManagementAPI(
         message: "The Windows Task Scheduler state could not be read, so this proxy cannot tell whether a wrapper would respawn it. Nothing was changed. Run `ocx service status` to see the query error, repair Task Scheduler access, then retry.",
       }, 409, req, config);
     }
-    let serviceStop: import("../service").ServiceStopOutcome;
+    // Block automatic handoff while deciding, without committing a refused stop.
+    const releaseStopIntent = acquireExplicitShutdownIntent();
     try {
-      serviceStop = stopServiceIfInstalledDetailed();
-    } catch (err) {
-      if (isServiceOwnershipError(err)) {
-        // The installed service belongs to another CODEX_HOME/OPENCODEX_HOME: it would respawn
-        // this proxy immediately, and its shared config is not ours to tear down. Refuse the
-        // stop instead of half-performing it. 409, not 500 — the request is well-formed.
-        return jsonResponse({ success: false, message: err.message }, 409, req, config);
+      if (!holdsReceipt && !sibling) {
+        const refusal = preflightStopTeardownOwnership();
+        if (refusal) return jsonResponse(refusal, 409, req, config);
       }
-      throw err;
-    }
-    // The boolean helper collapses "failed" into the same false as "no service installed",
-    // so this route used to tear down shared config and exit while a manager that refused
-    // to stop was still there to respawn the proxy (#3008).
-    if (serviceStop === "failed") {
-      return jsonResponse({
-        success: false,
-        message: "The installed service manager did not stop; it may respawn the proxy. Shared client config was left alone. Run `ocx stop` from the home that owns the service.",
-      }, 409, req, config);
-    }
-    if (serviceStop === "state-unknown") {
-      // Same case, same remedy as the pre-check: the query is what needs fixing.
-      return jsonResponse({
-        success: false,
-        code: "service_state_unknown",
-        message: "The Windows Task Scheduler state could not be read, so this proxy cannot tell whether a wrapper would respawn it. Shared client config was left alone. Run `ocx service status` to see the query error, repair Task Scheduler access, then retry.",
-      }, 409, req, config);
-    }
-    // The pre-check above already refused the respawnable case without a receipt, so
-    // reaching here with one means the parent owns the verification.
-    // Both managed configs come down together on an explicit teardown. The daemon's own
-    // syncCleanup skips this when OCX_SERVICE is set (so a crash/respawn keeps the fence),
-    // which is exactly why an intentional stop has to do it here — unless the caller is
-    // `ocx stop`, which does it itself once the proxy is proven down.
-    const teardown = await performStopTeardown(url, { ownsReceipt: deferralMatchesReceipt });
-    setTimeout(async () => {
-      let shutdownSucceeded = false;
+      let serviceStop: import("../service").ServiceStopOutcome;
       try {
-        shutdownSucceeded = await drainAndShutdown(undefined, config.shutdownTimeoutMs ?? 5000);
-      } catch {
-        console.warn("[opencodex] shutdown drain failed");
+        serviceStop = sibling ? "absent" : stopServiceIfInstalledDetailed();
+      } catch (err) {
+        if (isServiceOwnershipError(err)) {
+          // The installed service belongs to another CODEX_HOME/OPENCODEX_HOME: it would respawn
+          // this proxy immediately, and its shared config is not ours to tear down. Refuse the
+          // stop instead of half-performing it. 409, not 500 — the request is well-formed.
+          return jsonResponse({ success: false, message: err.message }, 409, req, config);
+        }
+        throw err;
       }
-      // A drained proxy whose shared teardown failed did not finish the job. Exiting 0
-      // told a supervisor the stop was clean while native Codex or the Grok fence was
-      // still pointed at this process (#3008).
-      process.exit(shutdownSucceeded && teardown.success ? 0 : 1);
-    }, 200);
-    return jsonResponse(teardown);
+      // The boolean helper collapses "failed" into the same false as "no service installed",
+      // so this route used to tear down shared config and exit while a manager that refused
+      // to stop was still there to respawn the proxy (#3008).
+      if (serviceStop === "failed") {
+        return jsonResponse({
+          success: false,
+          message: "The installed service manager did not stop; it may respawn the proxy. Shared client config was left alone. Run `ocx stop` from the home that owns the service.",
+        }, 409, req, config);
+      }
+      if (serviceStop === "state-unknown") {
+        // Same case, same remedy as the pre-check: the query is what needs fixing.
+        return jsonResponse({
+          success: false,
+          code: "service_state_unknown",
+          message: "The Windows Task Scheduler state could not be read, so this proxy cannot tell whether a wrapper would respawn it. Shared client config was left alone. Run `ocx service status` to see the query error, repair Task Scheduler access, then retry.",
+        }, 409, req, config);
+      }
+      // The pre-check above already refused the respawnable case without a receipt, so
+      // reaching here with one means the parent owns the verification.
+      // Both managed configs come down together on an explicit teardown. The daemon's own
+      // syncCleanup skips this when OCX_SERVICE is set (so a crash/respawn keeps the fence),
+      // which is exactly why an intentional stop has to do it here — unless the caller is
+      // `ocx stop`, which does it itself once the proxy is proven down.
+      const teardown = await performStopTeardown(url, { ownsReceipt: deferralMatchesReceipt });
+      if (teardown.sharedTeardown === "refused") return jsonResponse(teardown, 409, req, config);
+      noteExplicitShutdownRequested(); // Accepted stops and signals remain irreversible.
+      setTimeout(async () => {
+        let shutdownSucceeded = false;
+        try {
+          shutdownSucceeded = await drainAndShutdown(undefined, config.shutdownTimeoutMs ?? 5000);
+        } catch {
+          console.warn("[opencodex] shutdown drain failed");
+        }
+        // A drained proxy whose shared teardown failed did not finish the job. Exiting 0
+        // told a supervisor the stop was clean while native Codex or the Grok fence was
+        // still pointed at this process (#3008).
+        process.exit(shutdownSucceeded && teardown.success ? 0 : 1);
+      }, 200);
+      return jsonResponse(teardown);
+    } finally { releaseStopIntent(); }
   }
 
   if (url.pathname.startsWith("/api/native-main-profiles")) {
@@ -425,11 +551,12 @@ export async function handleManagementAPI(
       const { handleMainDeviceReauthAPI } = await import("../codex/main-device-reauth-api");
       return handleMainDeviceReauthAPI(req, url, config);
     }
-    const { handleCodexAuthAPI } = await import("../codex/auth-api");
+    const { handleCodexAuthAPI } = await import("../codex/auth-api/routes");
     const { ConfigMutationLockError } = await import("../config");
     const { CodexCredentialRefreshLockTimeoutError } = await import("../codex/account-store");
     try {
-      return await handleCodexAuthAPI(req, url, config, convergeCodexCatalog, principal);
+      // Remembered sessions retain admin-token consent authority for account refresh.
+      return await handleCodexAuthAPI(req, url, config, convergeCodexCatalog, ctx.guiSessionIssuance === "remembered-admin" ? "admin-token" : principal);
     } catch (error) {
       // Credential writers remap ConfigMutationLockError to CodexCredentialRefreshLockTimeoutError;
       // treat both as the same retryable busy response.

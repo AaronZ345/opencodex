@@ -34,6 +34,23 @@ routed one arrives encrypted and fails. The dashboard asks before either, and li
 [Why v1 is the default](/guides/subagent-v1-default/).
 :::
 
+## Model switches and side-chat compaction
+
+Codex can compact inherited history before the first turn of a side chat or after a model switch.
+One trigger compares the previous and destination models' `comp_hash` compatibility markers:
+when both are present and differ, Codex compacts even if the history fits the destination's context.
+
+OpenCodex represents unknown compatibility for routed models as `comp_hash: null`, instead of
+inventing an `"opencodex"` marker or copying one from a native template. Catalog rebuilds also clear
+those old markers on OpenCodex rows retained during a provider discovery outage. Native models and
+explicit Codex-forward aliases keep their upstream markers, so genuine native incompatibility
+checks still apply. This behavior is independent of the v1/v2 sub-agent surface and the model
+configured to perform compaction.
+
+Normal context and token-limit compaction still applies. This change removes the synthetic
+hash mismatch; it does not select which visible messages a side chat inherits or restore original
+messages from an already compacted context. Provider content support remains a separate constraint.
+
 ## External task input
 
 Codex can deliver a task's initial input or follow-up in a result-shaped envelope
@@ -45,8 +62,7 @@ Generated developer guidance is placed before the current task in both parsed
 messages and saved raw history, preserving the same order when that history is replayed.
 
 Malformed, empty, opaque or incomplete envelopes still fail validation. Actual tool
-results keep their required `call_id`; native passthrough and compaction retain their
-existing raw-input handling. See [the adapter contract](/reference/adapters/#external-task-input-on-translated-responses-routes).
+results keep their required `call_id`; native passthrough and routed (portable) compaction apply the same user-turn mapping to their raw bodies; the direct native `/responses/compact` forward keeps its existing raw-input handling. See [the adapter contract](/reference/adapters/#external-task-input-on-translated-responses-routes).
 
 ## How it works
 
@@ -63,6 +79,65 @@ For a v2 roster, eligibility has three states: an entry stamped `"v2"`, explicit
 with no `multi_agent_version` field is eligible. A genuine `"v1"` pin is excluded because it states
 that the model belongs to the other collaboration surface.
 
+## Which models `spawn_agent` advertises
+
+Codex lists at most five models in the `spawn_agent` tool description, and it chooses them
+itself: it sorts the picker-visible catalog rows by `priority`, lowest first, and takes the first
+five. The roster on the **Subagents** page (`subagentModels`) shapes that list only by giving its
+models the lowest priorities in roster order (`0` through `4` without account selectors). It
+does not limit the list to the roster.
+
+When you feature one to four models, Codex fills the remaining slots with the next rows by
+priority. You did not choose those rows, and the dashboard does not show which ones they are. They
+depend on the catalog:
+
+| Catalog | Rows that fill the remaining slots |
+| --- | --- |
+| No Codex account selectors | Other routed `provider/model` rows. They all share priority `5`, so they appear by provider name and then model id, alphabetically. Unfeatured native GPT rows use `featured.length + 100 + sourcePriority`, preserving native source order behind those routed rows. |
+| Codex account selectors | Account-qualified native rows (`<selector>/<native-model>`), which directly follow the featured rows. Unfeatured routed rows move to priority `1005` and come after them. |
+
+For example, with no account selectors and this roster:
+
+```json
+{ "subagentModels": ["xai/grok-4.5", "anthropic/claude-sonnet-5"] }
+```
+
+| Slot | Model | Priority | Why |
+| ---: | --- | ---: | --- |
+| 1 | `xai/grok-4.5` | `0` | First roster entry |
+| 2 | `anthropic/claude-sonnet-5` | `1` | Second roster entry |
+| 3 | `deepseek/deepseek-v4-flash` | `5` | First remaining routed row alphabetically |
+| 4 | `google/gemini-3-pro` | `5` | Next routed row |
+| 5 | `moonshot/kimi-k3` | `5` | Next routed row |
+| 6+ | `zai/glm-5.2`, then native GPT rows | `5`, then `102 + sourcePriority` | Outside the five |
+
+The native source rank uses current discovery before the pristine backup, exact-model retained
+source rank and upstream snapshot, with fallback `9`. Repeated sync and feature/unfeature preserve
+that unbanded rank. The live list, published catalog and cache agree for equal inputs. See
+[Model ordering](/guides/model-ordering/) for validation and picker-order overrides.
+
+With an empty roster, opencodex pins nothing and the five follow the catalog's normal
+priorities.
+
+The filled slots are ordinary advertisements, so the main agent may pick one of those models.
+The list is also not an allowlist: Codex accepts a catalog model outside the five when the main
+agent names it exactly. To control what Codex advertises:
+
+- Feature five models. With a full roster, no slot is left to fill.
+- Disable a model you never want offered, or leave it out of its provider's `selectedModels`.
+  A disabled or unselected model leaves the picker and cannot fill a slot.
+- `modelPickerOrder` changes the priorities Codex sorts by. A routed-only list moves the listed
+  unfeatured rows to `1000` and up, so the unlisted routed rows fill the slots first. A list that
+  contains a bare native id orders the complete picker, featured rows included: listed rows come
+  first and take the advertised slots before any unlisted row. See
+  [Model ordering](/guides/model-ordering/).
+
+On v2, Codex skips rows pinned `"disabled"` before it takes the five; otherwise the window works
+the same way. The opencodex v2 guidance roster (`{{roster}}`) names only configured roster models
+inside the five, so filler models appear in Codex's tool description and never in opencodex
+guidance. Codex reads the catalog when a session starts, so a roster change applies to new
+sessions.
+
 ## Delegation model and effort
 
 The dashboard's **Sub-agent delegation** controls three related settings:
@@ -70,6 +145,13 @@ The dashboard's **Sub-agent delegation** controls three related settings:
 - `injectionModel` is the preferred worker model named in opencodex guidance.
 - `injectionEffort` is the optional `reasoning_effort` to request for that model.
 - `injectionPrompt` replaces the built-in v2 guidance text.
+
+Not sure which model to delegate to? **Suggest** beside the delegation model asks for a short
+description of the work Codex usually hands off, sizes it with one call to your default Codex model,
+and proposes the cheapest sufficient model and an effort from the list the picker offers, with the
+reasoning and the signals that would move it up or down. Nothing changes until you choose
+**Use this**, which saves exactly like picking the model and effort by hand. Tiers come from
+`codexRoleTiers` or price, as in [role auto-assign](/guides/integrations/#auto-assign).
 
 `multiAgentGuidanceEnabled` defaults to on and is the master switch for opencodex-authored guidance
 on both surfaces. Turning it off suppresses both the v2 designation block and v1 proactive text.
@@ -105,13 +187,21 @@ On v1, opencodex injects the same proactive delegation guidance as the v2 recomm
 at `max` or `ultra` effort. Only the delegation trigger changes: no separate delegation request is
 needed; user instructions, authority, task scope, and collaboration-tool rules still apply.
 It does not add a preferred model, roster, fallback list, or custom prompt on v1.
+In Codex code mode, opencodex sees the v1 tools when the `exec` tool description lists them. When
+Codex defers them for tool search, which it does for every opencodex catalog model, opencodex
+relies on the deferred-tool list Codex Desktop sends with the conversation; if that list names
+`multi_agent_v1`, the proactive guidance is added. A Codex client that does not send the list gives
+opencodex no sign that v1 is available, so the guidance is not added there.
 
 The default-off `syncCodexSubagentDefaults` option is separate from guidance. When opencodex owns
 active Codex routing, sync or restart can write the selected values as marker-owned
 `[agents] default_subagent_model` and `default_subagent_reasoning_effort` entries in Codex TOML.
-opencodex updates or removes only fields bearing its markers. If either target field is user-owned,
-the pair is left unchanged rather than partially written; ambiguous TOML is rejected without a
-write. External provider managers and user-owned root routing also remain authoritative.
+opencodex updates or removes only fields bearing its markers. If you edit a managed value in place,
+the next sync keeps your value, drops the marker, and treats the field as yours from then on.
+Restore also keeps those edits when they recreate previously injected file contents. If
+either target field is user-owned, the pair is left unchanged rather than partially written;
+ambiguous TOML is rejected without a write. External provider managers and user-owned root
+routing also remain authoritative.
 
 ## Fallback chains
 
@@ -226,6 +316,7 @@ Use `ocx agent` for delegation, roster, effort-cap, and fallback settings:
 ```bash
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
+ocx agent injection suggest "read-only searches across the repo" --apply
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
 ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx effort set --subagent max
@@ -276,6 +367,12 @@ a positive partial count before passing a model or effort override.
 
 It may be picker-hidden, outside the five-model display limit, missing from the catalog, or pinned
 to v1. A `"v2"`, `null`, or absent surface value is eligible; a real `"v1"` pin is not.
+
+### Why does `spawn_agent` list models I did not feature?
+
+Codex fills up to five advertised slots from the catalog by priority. With fewer than five
+featured models, the next rows take the remaining slots; see
+[Which models `spawn_agent` advertises](#which-models-spawn_agent-advertises).
 
 ### Do mode changes affect running sessions?
 
@@ -344,3 +441,8 @@ encrypted, but task text can be retained in Codex history, routed-provider reque
 response/debug state. Existing ciphertext is unchanged, and the option depends on undocumented
 ChatGPT and Codex behavior. See
 [Agent configuration: Plaintext v2 agent messages](/reference/configuration/agents/#plaintext-v2-agent-messages).
+If a streamed ChatGPT response carries no content type, or one that is neither `application/json`
+nor a recognizable event stream, opencodex checks a bounded Responses event prefix before restoring
+the message-tool names. An `application/json` response takes the bounded JSON path instead. The
+probe waits at most `stallTimeoutSec` for its prefix, and a body that stays silent, unrecognized, or
+unreadable fails closed rather than reaching Codex as a successful response.

@@ -1,21 +1,34 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apiKeyAccountLogLabel } from "../../src/codex/account-label";
 import { readUsageEntries, resetUsageReadCacheForTests } from "../../src/usage/log";
 import { loadConfig, saveConfig } from "../../src/config";
+import { flushConfigDirHardeningForTests } from "../../src/config/paths";
+import { flushNativeMainStartupReleases } from "../../src/codex/native-profile-startup";
+import { flushWindowsSecretAclReapsBeforeRemoval } from "../../src/lib/windows-secret-acl";
 import { clearKeyCooldowns, getKeyCooldownUntil, rotateKeyOn429 } from "../../src/providers/key-failover";
 import { deriveXaiConvId } from "../../src/providers/xai-transport";
-import { clearReasoningReplayCacheForTests } from "../../src/responses/reasoning-replay-cache";
+import {
+  clearReasoningReplayCacheForTests,
+  reasoningReplayDestinationIdentity,
+  reasoningReplayKeyCredentialIdentity,
+} from "../../src/responses/reasoning-replay-cache";
+import {
+  bridgeSearchReplayScope,
+  clearBridgeSearchReplayCacheForTests,
+  rememberBridgeSearchReplay,
+} from "../../src/responses/bridge-search-replay-cache";
 import { startServer } from "../../src/server";
 import { handleResponses } from "../../src/server/responses";
-import type { OcxConfig } from "../../src/types";
+import type { AdapterEvent, OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { managementFetch } from "../helpers/management-auth";
-import { resetProviderRequestPacingForTest, setProviderRequestPacingRuntimeForTest, waitForProviderRequestSlot } from "../../src/providers/request-pacing";
-import { providerApiKeySelectionIsCurrent, resolveCurrentProviderApiKeyTransport } from "../../src/providers/api-key-selection";
+import { resolveContextPrincipal } from "../../src/server/auth-cors";
+import { providerRequestPacingStatus, resetProviderRequestPacingForTest, setProviderRequestPacingRuntimeForTest, waitForProviderRequestSlot } from "../../src/providers/request-pacing";
+import { providerApiKeySelectionIsCurrent, resolveCurrentProviderApiKeyTransport, commitProviderApiKeySelection } from "../../src/providers/api-key-selection";
 import { routedProviderConfig } from "../../src/router";
 import type { OcxProviderTransport } from "../../src/providers/xai-transport";
 
@@ -24,18 +37,49 @@ let previousHome: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
 let upstream: ReturnType<typeof Bun.serve> | null = null;
 
+// A test that hangs until Bun's per-test timeout never runs its own `finally`, so a server
+// started here would outlive the test still holding the process-wide spend-ledger lease — every
+// later file in the same process then fails to start its own server. Track them for the sweep.
+const trackedServers = new Set<ReturnType<typeof startServer>>();
+// Same reason for fetch: several cases stub it and restore it only in their own `finally`.
+const REAL_FETCH = globalThis.fetch;
+
+function startTrackedServer(port = 0): ReturnType<typeof startServer> {
+  const server = startServer(port);
+  trackedServers.add(server);
+  return server;
+}
+
 beforeEach(() => {
+  // Do not inherit a pacing runtime swapped in by an earlier file or an earlier timed-out test.
+  resetProviderRequestPacingForTest();
   previousHome = process.env.OPENCODEX_HOME;
   isolatedCodexHome = installIsolatedCodexHome("ocx-keyfail-e2e-codex-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-keyfail-e2e-"));
   process.env.OPENCODEX_HOME = testDir;
   clearKeyCooldowns();
   clearReasoningReplayCacheForTests();
+  clearBridgeSearchReplayCacheForTests();
 });
 
-afterEach(() => {
-  upstream?.stop(true);
+afterEach(async () => {
+  // Reap before anything else: a server that survives this file keeps the spend-ledger lease.
+  // Every stop is attempted even when an earlier one rejects, and the failure is raised only
+  // after the rest of this cleanup has run. Re-stopping a server a test already stopped is safe.
+  const stopFailures: unknown[] = [];
+  for (const server of trackedServers) {
+    trackedServers.delete(server);
+    try { await server.stop(true); } catch (error) { stopFailures.push(error); }
+  }
+  resetProviderRequestPacingForTest();
+  globalThis.fetch = REAL_FETCH;
+  await upstream?.stop(true);
   upstream = null;
+  await flushNativeMainStartupReleases();
+  await flushConfigDirHardeningForTests();
+  // Caller-facing ACL deadlines do not prove that their child released this home.
+  if (testDir) await flushWindowsSecretAclReapsBeforeRemoval(testDir);
+  if (isolatedCodexHome) await flushWindowsSecretAclReapsBeforeRemoval(isolatedCodexHome.path);
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   isolatedCodexHome?.restore();
@@ -43,6 +87,8 @@ afterEach(() => {
   if (testDir) removeTreeWithRetry(testDir);
   clearKeyCooldowns();
   clearReasoningReplayCacheForTests();
+  clearBridgeSearchReplayCacheForTests();
+  if (stopFailures.length > 0) throw new AggregateError(stopFailures, "tracked server stop failed in afterEach");
 });
 
 describe("server 429 key failover (end-to-end)", () => {
@@ -84,6 +130,49 @@ describe("server 429 key failover (end-to-end)", () => {
     expect(providerApiKeySelectionIsCurrent(config, "current", current)).toBe(true);
   });
 
+  test("Responses readmits a refreshed key and waits for its existing concurrency lease", async () => {
+    const seen: string[] = [];
+    upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+      seen.push(req.headers.get("authorization")!);
+      return Response.json({ id: "paced", object: "chat.completion", choices: [
+        { index: 0, message: { role: "assistant", content: "readmitted" }, finish_reason: "stop" },
+      ] });
+    } });
+    const config = { port: 0, defaultProvider: "paced", providers: { paced: {
+      adapter: "openai-chat", baseUrl: `http://127.0.0.1:${upstream.port}/v1`, allowPrivateNetwork: true,
+      authMode: "key", apiKey: "synthetic-first",
+      apiKeyPool: [{ id: "first", key: "synthetic-first" }, { id: "second", key: "synthetic-second" }],
+      requestPacing: { enabled: true, keys: { maxConcurrentRequests: 1 } },
+    } } } as OcxConfig;
+    saveConfig(config);
+    const first = await waitForProviderRequestSlot("paced", config.providers.paced);
+    const second = await waitForProviderRequestSlot("paced", { ...config.providers.paced, apiKey: "synthetic-second" });
+    const server = startTrackedServer();
+    const abort = new AbortController();
+    try {
+      const pending = fetch(new URL("/v1/responses", server.url), { method: "POST", signal: abort.signal,
+        headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "paced/test", input: "hello", stream: false }) });
+      for (let i = 0; i < 200 && providerRequestPacingStatus("paced", config.providers.paced).queued === 0; i++) await Bun.sleep(5);
+      expect(providerRequestPacingStatus("paced", config.providers.paced).queued).toBe(1);
+      const selected = await managementFetch(new URL("/api/providers/keys/active", server.url), {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "paced", id: "second" }),
+      });
+      expect(selected.status).toBe(200);
+      await selected.text();
+      first.release();
+      await Bun.sleep(30);
+      expect(seen).toEqual([]);
+      second.release();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("readmitted");
+      expect(seen).toEqual(["Bearer synthetic-second"]);
+    } finally {
+      abort.abort(); first.release(); second.release(); await server.stop(true);
+      resetProviderRequestPacingForTest();
+    }
+  });
+
   test.each(["responses", "chat/completions"])("%s logs only the key selected after pacing", async surface => {
     resetUsageReadCacheForTests();
     let now = 0;
@@ -113,7 +202,7 @@ describe("server 429 key failover (end-to-end)", () => {
       requestPacing: { enabled: true, minIntervalMs: 100 },
     } } } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     const abort = new AbortController();
     try {
       await waitForProviderRequestSlot("paced", config.providers.paced);
@@ -165,7 +254,7 @@ describe("server 429 key failover (end-to-end)", () => {
         { id: "first", key: "${OCX_SELECTION_E2E_KEY}" }, { id: "second", key: "synthetic-second" },
       ],
     } } } as OcxConfig);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL(`/v1/${inbound}`, server.url), {
         method: "POST", headers: { "content-type": "application/json" },
@@ -229,7 +318,7 @@ describe("server 429 key failover (end-to-end)", () => {
         },
       } as OcxConfig;
       saveConfig(config);
-      server = startServer(0);
+      server = startTrackedServer();
       const res = await originalFetch(new URL("/v1/responses", server.url), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -316,7 +405,7 @@ describe("server 429 key failover (end-to-end)", () => {
         },
       } as OcxConfig;
       saveConfig(config);
-      server = startServer(0);
+      server = startTrackedServer();
       const res = await originalFetch(new URL("/v1/responses", server.url), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -392,7 +481,7 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const res = await fetch(new URL(surface === "chat" ? "/v1/chat/completions" : "/v1/responses", server.url), {
         method: "POST",
@@ -446,7 +535,7 @@ describe("server 429 key failover (end-to-end)", () => {
         baseUrl: `http://127.0.0.1:${upstream.port}/v1`, allowPrivateNetwork: true,
         apiKey: "synthetic-first", apiKeyPool: [{ id: "first", key: "synthetic-first" }, { id: "second", key: "synthetic-second" }] } },
     } as OcxConfig);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL("/v1/responses", server.url), { method: "POST",
         headers: { "content-type": "application/json" },
@@ -482,7 +571,7 @@ describe("server 429 key failover (end-to-end)", () => {
       metered: { adapter, authMode: "key", apiKey: "synthetic-key", allowPrivateNetwork: true,
         baseUrl: `http://127.0.0.1:${upstream.port}` },
     } } as OcxConfig);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL("/v1/responses", server.url), { method: "POST",
         headers: { "content-type": "application/json" },
@@ -538,7 +627,7 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const res = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -619,10 +708,11 @@ describe("server 429 key failover (end-to-end)", () => {
     expect(loadConfig().providers.cancelled?.apiKey).toBe("key-canc-000111222333");
   });
 
-  test("reasoning replay misses after a 429 rotates to a different physical key", async () => {
+  test.each(["authenticated", "keyless"] as const)("reasoning replay misses after a 429 rotates to a different physical key (%s)", async (caller) => {
     const model = "reasoning-model";
     const callId = "call_key_rotation";
     const privateReasoning = "reasoning from physical key A";
+    const callerKey = "synthetic-reasoning-replay-caller";
     const seen: Array<{ auth: string; messages: Array<Record<string, unknown>> }> = [];
     upstream = Bun.serve({
       hostname: "127.0.0.1", port: 0,
@@ -671,6 +761,9 @@ describe("server 429 key failover (end-to-end)", () => {
     });
     const config: OcxConfig = {
       port: 0, hostname: "127.0.0.1", defaultProvider: "reasoning-pool",
+      ...(caller === "authenticated" ? { apiKeys: [{
+        id: "reasoning-caller", name: "reasoning-caller", key: callerKey, createdAt: "2026-01-01",
+      }] } : {}),
       providers: {
         "reasoning-pool": {
           adapter: "openai-chat",
@@ -687,10 +780,11 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     const headers = {
       "content-type": "application/json",
       "x-codex-parent-thread-id": "thread-key-rotation",
+      ...(caller === "authenticated" ? { "x-opencodex-api-key": callerKey } : {}),
     };
     try {
       const first = await fetch(new URL("/v1/responses", server.url), {
@@ -729,7 +823,7 @@ describe("server 429 key failover (end-to-end)", () => {
       ]);
       const replayed = seen[1]!.messages.find(message => Array.isArray(message.tool_calls));
       const rotated = seen[2]!.messages.find(message => Array.isArray(message.tool_calls));
-      expect(replayed?.reasoning_content).toBe(privateReasoning);
+      expect(replayed?.reasoning_content).toBe(caller === "authenticated" ? privateReasoning : " ");
       expect(rotated?.reasoning_content).toBe(" ");
       expect(rotated?.reasoning_content).not.toBe(privateReasoning);
     } finally {
@@ -770,7 +864,7 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const res = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -816,7 +910,7 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const res = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -881,7 +975,7 @@ describe("server 429 key failover (end-to-end)", () => {
       },
     } as OcxConfig;
     saveConfig(config);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const res = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -931,7 +1025,7 @@ describe("server 429 key failover (end-to-end)", () => {
 
   test("a cooled committed key is replaced before the first attempt", async () => {
     const seen = await cooledCommittedKeySetup("round-robin");
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL("/v1/chat/completions", server.url), {
         method: "POST", headers: { "content-type": "application/json" },
@@ -949,7 +1043,7 @@ describe("server 429 key failover (end-to-end)", () => {
 
   test("without a configured strategy the cooled key is still used", async () => {
     const seen = await cooledCommittedKeySetup();
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL("/v1/chat/completions", server.url), {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1007,7 +1101,7 @@ describe("server 429 key failover (end-to-end)", () => {
     const restored = loadConfig();
     restored.providers["env-pooled"]!.apiKey = "\${OCX_KEYFAIL_COOLED}";
     saveConfig(restored);
-    const server = startServer(0);
+    const server = startTrackedServer();
     try {
       const response = await fetch(new URL("/v1/responses", server.url), {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1066,7 +1160,7 @@ test.each([false, true])("chat-native attributes same-key 429 usage then the rot
     apiKeyPool: [{ id: "one", key: "key-one" }, { id: "two", key: "key-two" }],
     retryOn429: { attempts: 1, intervalMs: 100, maxIntervalMs: 100, respectRetryAfter: false },
   } } } as OcxConfig);
-  const server = startServer(0);
+  const server = startTrackedServer();
   try {
     const response = await fetch(new URL("/v1/chat/completions", server.url), {
       method: "POST",
@@ -1119,7 +1213,7 @@ test("chat-native preserves same-key retry, key rotation, usage, and request log
     apiKeyPool: [{ id: "one", key: "key-one" }, { id: "two", key: "key-two" }],
     retryOn429: { attempts: 1, intervalMs: 100, maxIntervalMs: 100, respectRetryAfter: false },
   } } } as OcxConfig);
-  const server = startServer(0);
+  const server = startTrackedServer();
   try {
     const response = await fetch(new URL("/v1/chat/completions", server.url), {
       method: "POST",
@@ -1168,7 +1262,7 @@ test.each([false, true])("key refetch retains transient recovery metadata (strea
     apiKey: "synthetic-refetch-a", apiKeyPool: [{ id: "a", key: "synthetic-refetch-a" }, { id: "b", key: "synthetic-refetch-b" }],
     transientRetryOn5xx: { attempts: 3 }, retryOn429: { attempts: 0 },
   } } } as OcxConfig);
-  const server = startServer(0);
+  const server = startTrackedServer();
   try {
     const response = await fetch(new URL("/v1/responses", server.url), { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "refetch/test", input: "hello", stream }) });
@@ -1181,4 +1275,504 @@ test.each([false, true])("key refetch retains transient recovery metadata (strea
     expect(attempts?.[1]).toMatchObject({ sendCount: 2, recoveryKinds: ["key-429", "transient-5xx"],
       usage: { inputTokens: 12, outputTokens: 2 } });
   } finally { await server.stop(true); }
+});
+
+const BRIDGE_CALLER_KEY = "synthetic-bridge-caller-key";
+const BRIDGE_THREAD = "thread-keyrace";
+const BRIDGE_CELL = "ws_keyrace";
+
+function bridgedReplayConfig(baseUrl: string, pacing: boolean): OcxConfig {
+  return {
+    port: 0, hostname: "127.0.0.1", defaultProvider: "pooled",
+    apiKeys: [{ id: "bridge-caller", name: "bridge-caller", key: BRIDGE_CALLER_KEY, createdAt: "2026-01-01" }],
+    providers: { pooled: {
+      adapter: "openai-responses", baseUrl, allowPrivateNetwork: true,
+      authMode: "key", apiKey: "synthetic-first",
+      apiKeyPool: [{ id: "first", key: "synthetic-first" }, { id: "second", key: "synthetic-second" }],
+      webSearchBridge: { enabled: true, backend: "ollama" },
+      ...(pacing ? { requestPacing: { enabled: true, minIntervalMs: 100 } } : {}),
+    } },
+  } as OcxConfig;
+}
+
+/** The principal the server derives for a loopback caller that presents the fixture key. */
+function bridgeCallerPrincipal(config: OcxConfig): string {
+  const principal = resolveContextPrincipal(
+    new Request("http://127.0.0.1/v1/responses", { headers: { "x-opencodex-api-key": BRIDGE_CALLER_KEY } }),
+    config,
+    { kind: "loopback", source: "loopback" },
+  );
+  if (!principal) throw new Error("the fixture caller key must resolve to a principal");
+  return principal;
+}
+
+/** Record one executed bridged search as the FIRST pool key would have served it. */
+function seedBridgedSearch(baseUrl: string, clientPrincipalId: string): void {
+  rememberBridgeSearchReplay(
+    bridgeSearchReplayScope({
+      clientPrincipalId,
+      clientThreadId: BRIDGE_THREAD,
+      current: {
+        providerName: "pooled",
+        providerDestinationIdentity: reasoningReplayDestinationIdentity(baseUrl),
+        adapterName: "openai-responses",
+        modelId: "test",
+        credentialIdentity: reasoningReplayKeyCredentialIdentity({ apiKey: "synthetic-first" }),
+      },
+    }),
+    BRIDGE_CELL,
+    { callId: "call_ws_1", name: "web_search",
+      argumentsText: "{\"query\":\"opencodex release\"}", output: "cached bridged result" },
+  );
+}
+
+type SeenUpstreamTurn = { authorization: string | null; input: Record<string, unknown>[] };
+
+function serveBridgedUpstream(seen: SeenUpstreamTurn[]): string {
+  upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    const body = await req.json() as { input?: unknown };
+    seen.push({
+      authorization: req.headers.get("authorization"),
+      input: Array.isArray(body.input) ? body.input as Record<string, unknown>[] : [],
+    });
+    return Response.json({
+      id: "resp_keyrace", object: "response", status: "completed", model: "test",
+      output: [{ type: "message", id: "msg_keyrace", role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "done", annotations: [] }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    });
+  } });
+  return `http://127.0.0.1:${upstream.port}/v1`;
+}
+
+function bridgedReplayRequest(callerKey: string | undefined, signal?: AbortSignal): RequestInit {
+  return {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "thread-id": BRIDGE_THREAD,
+      ...(callerKey ? { "x-opencodex-api-key": callerKey } : {}),
+    },
+    ...(signal ? { signal } : {}),
+    body: JSON.stringify({
+      model: "pooled/test", stream: false,
+      tools: [{ type: "web_search" }],
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "what is the latest release?" }] },
+        { type: "web_search_call", id: BRIDGE_CELL, status: "completed",
+          action: { type: "search", query: "opencodex release", queries: ["opencodex release"] } },
+      ],
+    }),
+  };
+}
+
+function hostedCellReachedUpstream(turn: SeenUpstreamTurn): boolean {
+  return turn.input.some(item => item.type === "web_search_call" && item.id === BRIDGE_CELL);
+}
+
+function recordedResultRestored(turn: SeenUpstreamTurn): boolean {
+  return turn.input.some(item => item.call_id === "call_ws_1");
+}
+
+test("a keyed caller's bridged search is restored on its next turn", async () => {
+  // Positive control for the two refusals below: the same seed, principal, thread and
+  // credential does restore, so a miss there is the scope doing its job, not a broken fixture.
+  const seen: SeenUpstreamTurn[] = [];
+  const baseUrl = serveBridgedUpstream(seen);
+  const config = bridgedReplayConfig(baseUrl, false);
+  saveConfig(config);
+  seedBridgedSearch(baseUrl, bridgeCallerPrincipal(config));
+  const server = startTrackedServer();
+  try {
+    const response = await fetch(new URL("/v1/responses", server.url), bridgedReplayRequest(BRIDGE_CALLER_KEY));
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(seen).toHaveLength(1);
+    expect(recordedResultRestored(seen[0]!)).toBe(true);
+    expect(hostedCellReachedUpstream(seen[0]!)).toBe(false);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("a keyless loopback caller neither restores nor shares a bridged search", async () => {
+  // A caller that presents no opencodex key has no principal. It must not fall into a shared
+  // bucket: seed both the keyed caller's cell and the literal bucket a fallback would have used.
+  const seen: SeenUpstreamTurn[] = [];
+  const baseUrl = serveBridgedUpstream(seen);
+  const config = bridgedReplayConfig(baseUrl, false);
+  saveConfig(config);
+  seedBridgedSearch(baseUrl, bridgeCallerPrincipal(config));
+  seedBridgedSearch(baseUrl, "loopback");
+  const server = startTrackedServer();
+  try {
+    const response = await fetch(new URL("/v1/responses", server.url), bridgedReplayRequest(undefined));
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(seen).toHaveLength(1);
+    expect(recordedResultRestored(seen[0]!)).toBe(false);
+    expect(hostedCellReachedUpstream(seen[0]!)).toBe(true);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("a dispatch-time key switch rebuilds the bridged-search restore under the new credential", async () => {
+  // Regression for the oauthDispatch rebuild order: the Responses adapter restores a replayed
+  // web_search_call from the memo keyed by _reasoningReplayScope, so the rebuild must rebind
+  // that scope to the refreshed credential BEFORE buildRequest runs. Restoring under the key
+  // whose selection just lapsed, then sending under the newly selected key, would hand the
+  // first credential's recorded result to the second credential's upstream.
+  let now = 0;
+  let resumePacing: (() => void) | undefined;
+  const queued = Promise.withResolvers<void>();
+  setProviderRequestPacingRuntimeForTest({
+    now: () => now,
+    setTimer(callback, delayMs) {
+      resumePacing = () => { now += delayMs; callback(); };
+      queued.resolve();
+      return callback;
+    },
+    clearTimer() {},
+    enqueueMicrotask: queueMicrotask,
+  });
+  const seen: SeenUpstreamTurn[] = [];
+  const baseUrl = serveBridgedUpstream(seen);
+  const config = bridgedReplayConfig(baseUrl, true);
+  saveConfig(config);
+
+  // Seed the memo under the identity the FIRST key binds: the same caller principal and thread
+  // the request below carries, but the credential whose selection is about to lapse.
+  seedBridgedSearch(baseUrl, bridgeCallerPrincipal(config));
+
+  const server = startTrackedServer();
+  const abort = new AbortController();
+  try {
+    await waitForProviderRequestSlot("pooled", config.providers.pooled);
+    const pending = fetch(new URL("/v1/responses", server.url), bridgedReplayRequest(BRIDGE_CALLER_KEY, abort.signal));
+    await queued.promise;
+    const selected = await managementFetch(new URL("/api/providers/keys/active", server.url), {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "pooled", id: "second" }),
+    });
+    expect(selected.status).toBe(200);
+    await selected.text();
+    resumePacing!();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.authorization).toBe("Bearer synthetic-second");
+    // Rebound before rebuild: the memo lookup misses under the new credential, so the hosted
+    // cell reaches the second key's upstream verbatim instead of the first key's result.
+    expect(hostedCellReachedUpstream(seen[0]!)).toBe(true);
+    expect(recordedResultRestored(seen[0]!)).toBe(false);
+  } finally {
+    abort.abort();
+    await server.stop(true);
+    resetProviderRequestPacingForTest();
+  }
+});
+
+
+// Real CLI adapters with an injected child; no provider process or upstream request is made.
+import { EventEmitter } from "node:events";
+import { Readable, Writable } from "node:stream";
+import type { ChildProcess } from "node:child_process";
+import * as runTurnResolver from "../../src/server/adapter-resolve";
+import * as runTurnKeyPool from "../../src/providers/key-failover";
+import { createQoderAdapter } from "../../src/adapters/qoder/adapter";
+import { createCodeBuddyAdapter } from "../../src/adapters/codebuddy/adapter";
+import { clearQoderBinaryCache } from "../../src/adapters/qoder/profiles";
+import { clearCodeBuddyBinaryCache } from "../../src/adapters/codebuddy/profiles";
+import { createRequestExecutionBudget, CODEX_TEXT_GUARDED_BUDGET_POLICY } from "../../src/lib/request-execution-budget";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import type { RequestLogContext } from "../../src/server/request-log";
+import { clearResponseStateForTests, flushResponseState } from "../../src/responses/state";
+import { closeRequestHistoryIndex } from "../../src/routing/history/indexer";
+
+async function cliKeyRecoveryCase(options: {
+  adapter?: "qoder" | "codebuddy"; stream?: boolean; vendorCode?: number; result?: string;
+  exitCode?: number; stderr?: string; prefix?: AdapterEvent;
+  poolSize?: number; allFail?: boolean; manualSwitch?: boolean; cancel?: boolean;
+  budget?: "total" | "hop";
+  stallFirstEvent?: boolean; stallTimeoutSec?: number; healthyFirst?: boolean;
+} = {}) {
+  const adapterName = options.adapter ?? "qoder";
+  clearQoderBinaryCache(); clearCodeBuddyBinaryCache();
+  const config = { port: 0, defaultProvider: "cli-pool",
+    ...(options.stallTimeoutSec ? { stallTimeoutSec: options.stallTimeoutSec } : {}),
+    providers: { "cli-pool": {
+    adapter: adapterName, authMode: "key", baseUrl: adapterName === "qoder" ? "https://qoder.com" : "https://www.codebuddy.ai",
+    apiKey: "synthetic-cli-a", models: ["test"], liveModels: false,
+    apiKeyPool: [
+      { id: "a", key: "synthetic-cli-a" }, { id: "b", key: "synthetic-cli-b" },
+    ].slice(0, options.poolSize ?? 2),
+  } } } as OcxConfig;
+  saveConfig(config);
+  const sent = Promise.withResolvers<void>();
+  const releaseFailure = Promise.withResolvers<void>();
+  const seen: string[] = [];
+  const order: string[] = [];
+  const errors: Array<Extract<AdapterEvent, { type: "error" }>> = [];
+  const abort = new AbortController();
+  const budget = createRequestExecutionBudget(options.budget === "total"
+    ? { ...CODEX_TEXT_GUARDED_BUDGET_POLICY, maxTotalModelSends: 1, baseSendAllowance: 1, finalRecoveryAllowance: 0 }
+    : undefined);
+  const reserve = budget.reserveDispatch.bind(budget);
+  if (options.budget === "hop") budget.reserveDispatch = intent => intent.sendClass === "auth-recovery"
+    ? { allowed: false, reason: "alternate-target-exhausted" } : reserve(intent);
+  const releaseOwner = acquireOwnedSpendHome();
+  const rotate401 = spyOn(runTurnKeyPool, "rotateProviderTransportOn401");
+  const rotate429 = spyOn(runTurnKeyPool, "rotateProviderTransportOn429");
+  const original = runTurnResolver.resolveAdapter;
+  const resolver = spyOn(runTurnResolver, "resolveAdapter").mockImplementation((provider, retention, providerId) => {
+    if (providerId !== "cli-pool" && provider.adapter !== adapterName) return original(provider, retention, providerId);
+    const create = adapterName === "qoder" ? createQoderAdapter : createCodeBuddyAdapter;
+    const adapter = create(provider, { which: () => "/synthetic/cli", killGraceMs: 100,
+      spawn: (_file, _args, childOptions) => {
+        const key = String(childOptions.env?.[adapterName === "qoder" ? "QODER_PERSONAL_ACCESS_TOKEN" : "CODEBUDDY_API_KEY"]);
+        seen.push(key);
+        const failing = options.allFail || (key === "synthetic-cli-a" && !options.healthyFirst);
+        const child = new EventEmitter() as ChildProcess;
+        child.exitCode = null;
+        child.stdin = new Writable({ write(_chunk, _encoding, done) { done(); } });
+        child.stderr = Readable.from(failing && options.stderr ? [options.stderr] : []);
+        child.kill = () => true;
+        child.stdout = Readable.from((async function* () {
+          if (failing || options.healthyFirst) {
+            sent.resolve();
+            if (options.manualSwitch || options.stallFirstEvent) await releaseFailure.promise;
+            order.push("cli-output");
+          }
+          if (failing) {
+            if (options.exitCode === undefined) yield Buffer.from(JSON.stringify({
+              type: "result", is_error: true, error_code: options.vendorCode,
+              result: options.result ?? "invalid personal access token",
+            }) + "\n");
+          } else {
+            yield Buffer.from(JSON.stringify({ type: "assistant", message: { content: [
+              { type: "text", text: options.healthyFirst ? "healthy on A" : "recovered on B" },
+            ] } }) + "\n");
+            yield Buffer.from('{"type":"result","is_error":false}\n');
+          }
+          child.exitCode = failing ? options.exitCode ?? 0 : 0;
+          child.emit("close", child.exitCode);
+        })());
+        return child;
+      },
+    });
+    const run = adapter.runTurn!;
+    adapter.runTurn = (parsed, incoming, emit) => run(parsed, incoming, event => {
+      if (event.type === "error") {
+        errors.push(event);
+        if (options.prefix) emit(options.prefix);
+        if (options.cancel) abort.abort();
+        emit(event);
+      } else emit(event);
+    });
+    return adapter;
+  });
+  const logCtx: RequestLogContext = { model: "", provider: "" };
+  try {
+    const request = new Request("http://localhost/v1/responses", { method: "POST", signal: abort.signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cli-pool/test", input: "synthetic recovery fixture", stream: options.stream ?? false, store: false }) });
+    const pending = handleResponses(request, config, logCtx, { sendBudget: budget, abortSignal: abort.signal });
+    if (options.manualSwitch) {
+      await sent.promise;
+      const current = loadConfig();
+      const outcome = commitProviderApiKeySelection(current, "cli-pool", row => {
+        row.apiKey = "synthetic-cli-b";
+        return { changed: true, value: undefined };
+      });
+      expect(outcome.status).toBe("committed");
+      releaseFailure.resolve();
+    }
+    const response = await pending;
+    order.push("response");
+    if (options.stallFirstEvent) releaseFailure.resolve();
+    const body = await response.text();
+    return { seen, errors, body, budgetUsed: budget.used, logCtx, order,
+      failedSelections: [...rotate401.mock.calls, ...rotate429.mock.calls].map(call => ({
+        key: call[3]?.attemptedKey, entry: call[3]?.attemptedSelection?.entryId,
+        reference: call[3]?.attemptedSelection?.reference,
+      })),
+      active: loadConfig().providers["cli-pool"]!.apiKey,
+      aCooldown: getKeyCooldownUntil("cli-pool", "a"), bCooldown: getKeyCooldownUntil("cli-pool", "b") };
+  } finally {
+    releaseFailure.resolve();
+    abort.abort(); resolver.mockRestore(); rotate401.mockRestore(); rotate429.mockRestore();
+    releaseOwner(); closeRequestHistoryIndex();
+    await flushResponseState(); clearResponseStateForTests();
+  }
+}
+
+describe("runTurn API-key recovery", () => {
+  test.each([
+    { exitCode: 1, stderr: "QoderAuthError: QODER_PERSONAL_ACCESS_TOKEN contains a token that was rejected", stream: false, status: 401 },
+    { result: "You've reached your daily usage limit for Chat. Come back tomorrow...", stream: true, status: 429 },
+  ])("real CLI evidence recovers %j", async fixture => {
+    const result = await cliKeyRecoveryCase(fixture);
+    expect(result.errors[0]).toMatchObject({ status: fixture.status, apiKeyRecovery: true });
+    expect(result.errors[0]!.code).toBe(fixture.status === 401 ? "invalid_api_key"
+      : "insufficient_quota");
+    expect(result.seen).toEqual(["synthetic-cli-a", "synthetic-cli-b"]);
+    expect(result.body).toContain("recovered on B");
+    expect(result.body).not.toContain("apiKeyRecovery");
+    expect(result.active).toBe("synthetic-cli-b");
+    expect(result.aCooldown).not.toBeNull();
+    expect(result.bCooldown).toBeNull();
+    expect(result.budgetUsed).toBe(2);
+  });
+
+  test("CodeBuddy multi-key healthy stream starts SSE without key-pool preflight", async () => {
+    const queueModule = await import("../../src/adapters/run-turn-queue");
+    const preflight = spyOn(queueModule, "preflightAdapterEvents");
+    try {
+      // The CLI cannot release output until the Response exists; no timing race is involved.
+      const result = await cliKeyRecoveryCase({ adapter: "codebuddy", stream: true,
+        healthyFirst: true, stallFirstEvent: true, stallTimeoutSec: 1 });
+      expect(preflight).not.toHaveBeenCalled();
+      expect(result.order).toEqual(["response", "cli-output"]);
+      expect(result.body).toContain("healthy on A");
+      expect(result.seen).toEqual(["synthetic-cli-a"]);
+      expect(result.errors).toEqual([]);
+      expect(result.budgetUsed).toBe(1);
+      expect(result.aCooldown).toBeNull();
+      expect(result.bCooldown).toBeNull();
+    } finally {
+      preflight.mockRestore();
+    }
+  });
+
+  test.each([401, 429])("late %s from sent A preserves manually selected B", async status => {
+    const result = await cliKeyRecoveryCase({ manualSwitch: true, vendorCode: status === 401 ? 105 : 118 });
+    expect(result.seen).toEqual(["synthetic-cli-a", "synthetic-cli-b"]);
+    expect(result.active).toBe("synthetic-cli-b");
+    expect(result.bCooldown).toBeNull();
+    expect(result.failedSelections).toEqual([{
+      key: "synthetic-cli-a", entry: "a", reference: "synthetic-cli-a",
+    }]);
+    // A stale revision cannot file health against the newly selected credential.
+    expect(result.aCooldown).toBeNull();
+    expect(result.body).toContain("recovered on B");
+  });
+
+  test("rechecks the failed key after adapter refresh before applying key recovery", async () => {
+    const transportModule = await import("../../src/server/responses/request-transport");
+    const prepare = transportModule.prepareResponsesTransport;
+    const refreshEntered = Promise.withResolvers<void>();
+    const resumeRefresh = Promise.withResolvers<void>();
+    let refreshConfig: OcxConfig | undefined;
+    let refreshed: { key?: string; runnable: boolean; binding: unknown } | undefined;
+    let refreshes = 0;
+    const transportSpy = spyOn(transportModule, "prepareResponsesTransport").mockImplementation(async (...args) => {
+      const transport = await prepare(...args);
+      if (transport instanceof Response) return transport;
+      const refresh = transport.refreshRunTurnAdapter;
+      transport.refreshRunTurnAdapter = async parsed => {
+        refreshes++;
+        refreshConfig = args[0].config;
+        refreshEntered.resolve();
+        await resumeRefresh.promise;
+        const adapter = await refresh(parsed);
+        // Assert outside recovery: its catch must not swallow a failed test assertion.
+        refreshed = { key: args[2].route.provider.apiKey, runnable: !!adapter.runTurn,
+          binding: transport.adapterBindings.get(adapter) };
+        return adapter;
+      };
+      return transport;
+    });
+    const pending = cliKeyRecoveryCase({ vendorCode: 105 });
+    try {
+      await Promise.race([
+        refreshEntered.promise,
+        pending.then(() => { throw new Error("recovery completed without entering adapter refresh"); }),
+      ]);
+      // Rotation passed the first guard; publish the manual selection to this request and disk.
+      expect(refreshConfig!.providers["cli-pool"]!.apiKey).toBe("synthetic-cli-b");
+      expect(loadConfig().providers["cli-pool"]!.apiKey).toBe("synthetic-cli-b");
+      expect(commitProviderApiKeySelection(refreshConfig!, "cli-pool", row => {
+        row.apiKey = "synthetic-cli-a";
+        return { changed: true, value: undefined };
+      }).status).toBe("committed");
+      resumeRefresh.resolve();
+      const result = await pending;
+      expect(refreshed).toMatchObject({ key: "synthetic-cli-a", runnable: true,
+        binding: { kind: "api-key", provider: { apiKey: "synthetic-cli-a", _apiKeyAttempt: { entryId: "a" } } } });
+      expect(refreshes).toBe(1);
+      expect(result.seen).toEqual(["synthetic-cli-a"]);
+      expect(result.active).toBe("synthetic-cli-a");
+      expect(result.bCooldown).toBeNull();
+      expect(result.body).toContain("invalid_api_key");
+      // The later attempt guard also prevents sending A; only this guard refunds the unused hop.
+      expect(result.budgetUsed).toBe(1);
+    } finally {
+      resumeRefresh.resolve();
+      await pending.catch(() => {});
+      transportSpy.mockRestore();
+    }
+  });
+
+  test.each([
+    ["Team daily usage limit reached", { result: "Team daily usage limit reached" }],
+    ["This model's credit usage limit reached", { result: "This model's credit usage limit reached" }],
+    ["Shared daily usage limit reached", { result: "Shared daily usage limit reached" }],
+    ["999 + supported account daily text", { vendorCode: 999, result: "You've reached your daily usage limit for Chat. Come back tomorrow..." }],
+    ["999 + authentication text", { vendorCode: 999, result: "invalid personal access token" }],
+  ])("nonrecoverable qoder failure (%s) prevents key failover", async (_name, fixture) => {
+    const result = await cliKeyRecoveryCase(fixture);
+    expect(result.seen).toEqual(["synthetic-cli-a"]);
+    expect(result.active).toBe("synthetic-cli-a");
+    expect(result.aCooldown).toBeNull();
+    expect(result.bCooldown).toBeNull();
+    expect(result.budgetUsed).toBe(1);
+  });
+
+  test.each([
+    { type: "text_delta", text: "already visible" },
+    { type: "heartbeat", replayUnsafe: true },
+  ] satisfies AdapterEvent[])("output boundary %j forbids recovery", async prefix => {
+    const result = await cliKeyRecoveryCase({ prefix, stream: true });
+    expect(result.seen).toEqual(["synthetic-cli-a"]);
+    expect(result.aCooldown).toBeNull(); expect(result.bCooldown).toBeNull();
+  });
+
+  test.each(["total", "hop"] as const)("exhausted %s budget keeps original error and key health", async budget => {
+    const result = await cliKeyRecoveryCase({ budget });
+    expect(result.seen).toEqual(["synthetic-cli-a"]);
+    expect(result.aCooldown).toBeNull(); expect(result.bCooldown).toBeNull();
+    expect(result.body).toContain("invalid_api_key");
+    expect(result.budgetUsed).toBe(1);
+  });
+
+  test("cancellation forbids recovery and cooldown", async () => {
+    const result = await cliKeyRecoveryCase({ cancel: true });
+    expect(result.seen).toEqual(["synthetic-cli-a"]);
+    expect(result.aCooldown).toBeNull(); expect(result.bCooldown).toBeNull();
+  });
+
+  test("a single key does not replay", async () => {
+    const result = await cliKeyRecoveryCase({ poolSize: 1 });
+    expect(result.seen).toEqual(["synthetic-cli-a"]);
+    expect(result.aCooldown).toBeNull();
+    expect(result.body).toContain("invalid_api_key");
+  });
+
+  test("both keys failing stops at two physical sends", async () => {
+    const result = await cliKeyRecoveryCase({ allFail: true, vendorCode: 118 });
+    expect(result.seen).toEqual(["synthetic-cli-a", "synthetic-cli-b"]);
+    expect(result.body).toContain("insufficient_quota");
+    expect(result.aCooldown).not.toBeNull(); expect(result.bCooldown).not.toBeNull();
+    expect(result.budgetUsed).toBe(2);
+  });
+
+  test("a silent first event cannot hold the SSE response past the stall bound", async () => {
+    const result = await cliKeyRecoveryCase({ stream: true, vendorCode: 105, stallFirstEvent: true, stallTimeoutSec: 1 });
+    expect(result.order).toEqual(["response", "cli-output"]);
+    expect(result.seen).toEqual(["synthetic-cli-a", "synthetic-cli-b"]);
+    expect(result.body).toContain("recovered on B");
+    expect(result.aCooldown).not.toBeNull();
+  });
 });

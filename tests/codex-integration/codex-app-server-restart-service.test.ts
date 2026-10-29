@@ -14,6 +14,7 @@ import {
   resetCodexRestartInFlightForTests,
 } from "../../src/codex/app-server-restart-service";
 import type { CodexRestartServiceIo } from "../../src/codex/app-server-restart-service";
+import { resetCodexAppServerCatalogStateCache } from "../../src/codex/app-server-processes";
 import type { CodexAppServerProcess } from "../../src/codex/app-server-processes";
 import { isCodexRestartResponse } from "../../src/lib/codex-restart-contract";
 
@@ -275,8 +276,8 @@ describe("performCodexRestart", () => {
 });
 
 describe("readCodexAppServerState", () => {
-  test("reports the classifier verdict and a running count", () => {
-    const state = readCodexAppServerState({
+  test("reports the classifier verdict and a running count", async () => {
+    const state = await readCodexAppServerState({
       collectState: () => ({
         state: "stale",
         processes: [{ pid: 1, startedAtMs: 1 }, { pid: 2, startedAtMs: 2 }],
@@ -287,12 +288,67 @@ describe("readCodexAppServerState", () => {
     expect(state).toEqual({ state: "stale", runningCount: 2 });
   });
 
-  test("passes unknown through instead of guessing not_running", () => {
-    const state = readCodexAppServerState({
+  test("passes unknown through instead of guessing not_running", async () => {
+    const state = await readCodexAppServerState({
       collectState: () => ({ state: "unknown", processes: [], catalogMtimeMs: null }),
     });
 
     expect(state).toEqual({ state: "unknown", runningCount: 0 });
+  });
+
+  test("the default classifier yields to the event loop while Windows enumeration is slow", async () => {
+    // The dashboard route calls this with no collectState. The synchronous classifier
+    // parked the event loop for the whole CIM walk (4-7s on Windows), stalling proxy
+    // traffic every time the Models page opened.
+    resetCodexAppServerCatalogStateCache();
+    let releaseSnapshots: ((snapshots: CodexAppServerProcess[]) => void) | undefined;
+    const snapshots = new Promise<CodexAppServerProcess[]>(resolve => {
+      releaseSnapshots = resolve;
+    });
+    const reading = readCodexAppServerState({
+      stateDeadlineMs: 60_000,
+      processIo: {
+        platform: "win32",
+        listSnapshotsAsync: () => snapshots,
+        readStartMsBatchAsync: async pids => new Map(pids.map(pid => [pid, 500])),
+        catalogMtimeMs: () => 1_000,
+      },
+    });
+
+    const first = await Promise.race([
+      reading.then(() => "reading"),
+      new Promise<"timer">(resolve => setTimeout(() => resolve("timer"), 10)),
+    ]);
+    expect(first).toBe("timer");
+
+    releaseSnapshots?.([proc(42, "/usr/local/bin/codex app-server")]);
+    await expect(reading).resolves.toEqual({ state: "stale", runningCount: 1 });
+    resetCodexAppServerCatalogStateCache();
+  });
+
+  test("a probe slower than the deadline answers unknown, then serves the finished reading", async () => {
+    resetCodexAppServerCatalogStateCache();
+    let releaseSnapshots: ((snapshots: CodexAppServerProcess[]) => void) | undefined;
+    const snapshots = new Promise<CodexAppServerProcess[]>(resolve => {
+      releaseSnapshots = resolve;
+    });
+    const processIo = {
+      platform: "win32" as const,
+      listSnapshotsAsync: () => snapshots,
+      readStartMsBatchAsync: async (pids: readonly number[]) => new Map(pids.map(pid => [pid, 500])),
+      catalogMtimeMs: () => 1_000,
+    };
+
+    await expect(readCodexAppServerState({ stateDeadlineMs: 20, processIo }))
+      .resolves.toEqual({ state: "unknown", runningCount: 0 });
+
+    // The probe kept running behind the deadline; once it lands, the next read is served
+    // from the cache it wrote instead of starting another walk.
+    releaseSnapshots?.([proc(42, "/usr/local/bin/codex app-server")]);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(readCodexAppServerState({ stateDeadlineMs: 20, processIo }))
+      .resolves.toEqual({ state: "stale", runningCount: 1 });
+    resetCodexAppServerCatalogStateCache();
   });
 });
 
@@ -555,5 +611,98 @@ describe("last-moment identity gate (through the real restart helper)", () => {
     expect(serialized).not.toContain("identity changed");
     expect(serialized).not.toContain("CodexAppServerIdentityChanged");
     expect(result.failed).toEqual([4242]);
+  });
+});
+describe("desktop picker freshness decides the desktop restart (#4761)", () => {
+  const staleServers = {
+    collectState: () => ({ state: "stale" as const, processes: [{ pid: 100, startedAtMs: 1 }], catalogMtimeMs: 10 }),
+    listProcesses: () => [proc(100)],
+    readStartMs: () => new Map([[100, 1]]),
+    restart: () => ({ requested: [100], stopped: [100], surviving: [], failed: [] }),
+    catalogBinding: async () => "/codex/opencodex-catalog.json",
+  };
+  const relaunched = { attempted: true, stopped: [7], surviving: [], relaunch: "started" as const };
+
+  test("a current picker keeps the desktop app open and still restarts every app-server", async () => {
+    let desktopRestarts = 0;
+    const result = await performCodexRestart(baseIo({
+      ...staleServers,
+      desktopPickerState: async () => "current",
+      restartDesktopApp: async () => { desktopRestarts += 1; return relaunched; },
+    }));
+    expect(desktopRestarts).toBe(0);
+    expect(result.desktopApp).toEqual({
+      attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "picker_current", pickerState: "current",
+    });
+    expect(result.code).toBe("stopped");
+    expect(result.stopped).toEqual([100]);
+    expect(isCodexRestartResponse(result)).toBe(true);
+  });
+
+  test("a closed desktop app is reported as not running without a restart attempt", async () => {
+    let desktopRestarts = 0;
+    const result = await performCodexRestart(baseIo({
+      catalogBinding: staleServers.catalogBinding,
+      desktopPickerState: async () => "not_running",
+      restartDesktopApp: async () => { desktopRestarts += 1; return relaunched; },
+    }));
+    expect(desktopRestarts).toBe(0);
+    expect(result.desktopApp).toMatchObject({ reason: "no_targets", pickerState: "not_running" });
+  });
+
+  for (const [label, state, reported] of [
+    ["a picker older than the catalog", async () => "stale" as const, "stale"],
+    ["an unreadable picker state", async () => "unknown" as const, "unknown"],
+    ["a picker probe that throws", async (): Promise<"stale"> => { throw new Error("probe failed"); }, "unknown"],
+  ] as const) {
+    test(`${label} falls back to the full desktop restart`, async () => {
+      let desktopRestarts = 0;
+      const result = await performCodexRestart(baseIo({
+        ...staleServers,
+        desktopPickerState: state,
+        restartDesktopApp: async () => { desktopRestarts += 1; return relaunched; },
+      }));
+      expect(desktopRestarts).toBe(1);
+      expect(result.desktopApp).toEqual({ ...relaunched, pickerState: reported });
+      expect(result.stopped).toEqual([100]);
+      expect(isCodexRestartResponse(result)).toBe(true);
+    });
+  }
+
+  for (const [label, bindings] of [
+    ["a sync that installs the catalog binding", [null, "/codex/opencodex-catalog.json"]],
+    ["a sync that moves the catalog binding", ["/codex/old.json", "/codex/opencodex-catalog.json"]],
+    ["an unreadable binding", ["/codex/opencodex-catalog.json", new Error("unreadable")]],
+  ] as const) {
+    test(`${label} restarts the desktop without trusting the mtime probe`, async () => {
+      // The catalog bytes did not change, so its mtime still predates the shell; only the
+      // binding the shell loaded at launch did.
+      let probes = 0;
+      let reads = 0;
+      let desktopRestarts = 0;
+      const result = await performCodexRestart(baseIo({
+        ...staleServers,
+        catalogBinding: async () => {
+          const value = bindings[Math.min(reads++, 1)];
+          if (value instanceof Error) throw value;
+          return value;
+        },
+        desktopPickerState: async () => { probes += 1; return "current"; },
+        restartDesktopApp: async () => { desktopRestarts += 1; return relaunched; },
+      }));
+      expect(probes).toBe(0);
+      expect(desktopRestarts).toBe(1);
+      expect(result.desktopApp?.pickerState).toBe("stale");
+    });
+  }
+
+  test("the binding is read around the sync and the picker is judged after it", async () => {
+    const order: string[] = [];
+    await performCodexRestart(baseIo({
+      catalogBinding: async () => { order.push("binding"); return null; },
+      syncCatalog: async () => { order.push("sync"); return true; },
+      desktopPickerState: async () => { order.push("picker"); return "current"; },
+    }));
+    expect(order).toEqual(["binding", "sync", "binding", "picker"]);
   });
 });

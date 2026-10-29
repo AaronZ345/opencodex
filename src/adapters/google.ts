@@ -1,6 +1,8 @@
-import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "./base";
+import { openCodeZenGeminiEndpoint } from "../types/opencode-zen";
+import type { AdapterFetchContext, AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
 import { debugDroppedFrame, debugProviderDiagnosticLazy } from "../lib/debug";
 import { createToolCallIdAllocator } from "./tool-call-id";
+import { openCodeGoGeminiEndpoint } from "../types/opencode-go";
 import { createImageBudget, materializeInlineImage, MAX_ENCODED_BYTES_PER_IMAGE, artifactHttpUrl } from "../images/artifacts";
 import type {
   AdapterEvent,
@@ -15,12 +17,13 @@ import type {
   OcxUsage,
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolChoiceToolPredicate } from "../types";
+import type { OcxTool } from "../types";
 import { contentPartsToText, parseDataUrl } from "./image";
-import { getVertexAccessToken } from "../lib/gcp-adc";
+import { GCP_CREDENTIAL_MARKER_PREFIX, gcpCredentialMarkerAccount, getVertexAccessToken } from "../lib/gcp-adc";
 import { fetchAntigravityWithRetry, fetchVertexWithRetry } from "./google-http";
 import { safeAntigravityHttpErrorMessage, safeVertexHttpErrorMessage } from "./google-errors";
-import { isVertexTruncatedTurn, vertexTruncationErrorMessage } from "./google-truncation";
-import { ANTIGRAVITY_REQUEST_UA, antigravitySessionAnchor, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { isVertexTruncatedTurn, vertexTruncationErrorEvent } from "./google-truncation";
+import { antigravitySessionAnchor, antigravityUserAgentForWireModel, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
 import { summarizeGoogleWireShape } from "./google-wire-shape";
 import { compileGoogleWireBody } from "./google-wire-compiler";
 import type { GoogleToolSchemaLossReport, GoogleToolSchemaProfile } from "./google-tool-schema";
@@ -33,7 +36,8 @@ import {
   observeAntigravityReplay,
 } from "./google-antigravity-replay";
 import { canonicalAntigravityUsageModel, resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
-import { googleVertexLocationConfigError } from "../providers/google-vertex-location";
+import { selectVertexEndpoint, vertexInferenceUrl, vertexReplayModelKey } from "./google-vertex-endpoint";
+import { resolveVertexApiKeyProject, VERTEX_PROJECT_AUTO } from "./google-vertex-key-project";
 import { forgetThoughtSignatureForReplay, lookupReplayThoughtSignature } from "../responses/thought-signature-replay";
 import {
   isTranslatorBudgetExceededError,
@@ -41,6 +45,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
+import { geminiProgressLead, trimsGeminiProgressHistory } from "./google-progress-history";
 import { configuredReasoningEfforts, mapReasoningEffort } from "../reasoning-effort";
 
 // Google-family models (Gemini/Vertex/Antigravity) tend to emit long running commentary between
@@ -173,7 +178,15 @@ function resolveDirectGeminiWireModelId(modelId: string, applyRenames: boolean):
 
 /** Vertex API key: provider.apiKey if it looks real (not a sentinel), else GOOGLE_CLOUD_API_KEY env. */
 function resolveVertexApiKey(optKey?: string): string | undefined {
-  const realKey = optKey && !optKey.startsWith("<") && optKey !== "N/A" ? optKey : undefined;
+  // A `gcp-sa:` marker is the keychain-backed credential reference (see gcp-adc): it is not
+  // API-key material, so it must not be sent as x-goog-api-key — the ADC branch below handles it.
+  // AND the marker means the operator named one credential explicitly: the GOOGLE_CLOUD_API_KEY
+  // env fallback must NOT fire (it would silently route this provider's inference through the
+  // ambient env key instead of the configured service account).
+  if (optKey && optKey.startsWith(GCP_CREDENTIAL_MARKER_PREFIX)) return undefined;
+  const realKey = optKey && !optKey.startsWith("<") && optKey !== "N/A"
+    ? optKey
+    : undefined;
   return realKey || process.env.GOOGLE_CLOUD_API_KEY;
 }
 
@@ -230,6 +243,72 @@ function toolResultImageParts(content: string | OcxContentPart[]): unknown[] {
  * surfaced on Claude-on-Antigravity; the guard lives here because this is where the parts are
  * built. Mirrors the Anthropic adapter's own empty-block guard (src/adapters/anthropic.ts).
  */
+/**
+ * A video URI Gemini fetches on its own behalf, as a `file_data` reference.
+ *
+ * Deliberately an allowlist of the forms Google documents, not "anything that is
+ * not a data: URL". `file_data` tells Gemini to go and get the bytes; pointing it
+ * at an arbitrary host would either fail upstream or make the proxy the reason a
+ * caller's private URL got dereferenced by Google. Anything not matched here
+ * keeps the existing `[video: …]` text marker.
+ *
+ * Returns the uri alone: the documented REST example for a YouTube part carries
+ * `file_data.file_uri` and nothing else, and the Files API knows the type of what
+ * it stored. An invented `mime_type` would be a guess on both paths.
+ *
+ * https://ai.google.dev/gemini-api/docs/generate-content/video-understanding
+ */
+function geminiFetchableVideoUri(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+
+  const host = parsed.hostname.toLowerCase();
+  const youtubeHosts = new Set([
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtube-nocookie.com",
+    "youtube-nocookie.com",
+  ]);
+  if (youtubeHosts.has(host)) return url;
+
+  // The Files API resource form, https://generativelanguage.googleapis.com/v1beta/files/<id>.
+  // Anchored at the start so the resumable-upload endpoint (/upload/v1beta/files/<id>) does
+  // not match: that URL is not a readable resource, and passing it as `file_data.file_uri`
+  // would have Gemini dereference something it cannot read. The version segment stays loose
+  // because this service is reachable as v1, v1beta and v1alpha.
+  if (host === "generativelanguage.googleapis.com" && /^\/v1[a-z0-9]*\/files\/[^/]+$/.test(parsed.pathname)) {
+    return url;
+  }
+
+  return null;
+}
+
+/**
+ * The caller's requested video mode as GenerateContent spells it.
+ *
+ * `media_processing` sits on the part beside `inline_data`/`file_data` and takes
+ * `STATIC` (the default) or `AGENTIC`. `processing: "agentic"` — the spelling in
+ * the original request and in Google's Interactions API — is a different API and
+ * is ignored here, so forwarding it verbatim would have looked like a
+ * pass-through while agentic mode never actually engaged.
+ *
+ * Upper-cased and forwarded rather than checked against our own copy of the enum:
+ * that list is Google's to extend, and a stale allowlist here would silently
+ * downgrade a caller using a newer mode. An unrecognized value fails upstream
+ * naming the field, which is a better failure than us dropping it.
+ */
+function geminiMediaProcessing(processing: string | undefined): string | undefined {
+  return processing ? processing.toUpperCase() : undefined;
+}
+
 const GEMINI_EMPTY_PLACEHOLDER = "(empty)";
 const GEMINI_EMPTY_TOOL_OUTPUT_PLACEHOLDER = "(empty tool output)";
 const GEMINI_MISSING_TOOL_RESULT = "[missing tool_result for this tool_use in history]";
@@ -255,13 +334,20 @@ function geminiToolResultParts(
   msg: OcxToolResultMessage,
   wireName: string,
   wireCallId: string,
+  nestToolResultImages: boolean,
 ): unknown[] {
   const functionResponse: Record<string, unknown> = {
     name: wireName,
     response: { result: geminiToolResultText(msg.content) },
     id: wireCallId,
   };
-  return [{ functionResponse }, ...toolResultImageParts(msg.content)];
+  const images = toolResultImageParts(msg.content);
+  // Vertex Argon rejects image siblings beside a functionResponse as an unsupported model tail.
+  if (nestToolResultImages && images.length > 0) {
+    functionResponse.parts = images;
+    return [{ functionResponse }];
+  }
+  return [{ functionResponse }, ...images];
 }
 
 function geminiMissingToolResultPart(wireName: string, wireCallId: string): unknown {
@@ -292,6 +378,8 @@ function messagesToGeminiFormat(
   identityModelId: string,
   stripRejectedClaudeSdkParagraph = false,
   isCloudCodeAssist = false,
+  nestToolResultImages = false,
+  toolResponseImagesLast = false,
 ): { systemInstruction?: unknown; contents: unknown[]; replayedCallIds: string[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
@@ -340,10 +428,41 @@ function messagesToGeminiFormat(
               continue;
             }
             if (p.type === "video") {
+              // `media_processing` rides on the PART, so it applies to inline bytes
+              // exactly as it does to a fetched uri — emitting it on only one of the
+              // two would silently drop the mode for data: URLs.
+              const mediaProcessing = geminiMediaProcessing(p.processing);
+              const processingPart = mediaProcessing ? { media_processing: mediaProcessing } : {};
+
+              // Gemini accepts inline video bytes in the same Part union as images.
               const data = parseDataUrl(p.videoUrl);
-              // Gemini accepts inline video bytes in the same Part union as images. Arbitrary
-              // remote URLs are not valid fileData references, so retain only a short marker.
-              parts.push(data ? { inline_data: { mime_type: data.mediaType, data: data.base64 } } : { text: `[video: ${p.videoUrl}]` });
+              if (data) {
+                parts.push({
+                  inline_data: { mime_type: data.mediaType, data: data.base64 },
+                  ...processingPart,
+                });
+                continue;
+              }
+              // Two URI forms Gemini fetches itself: a YouTube watch URL and a Files API
+              // uri. Those ARE valid file_data references (#3271), and flattening them to
+              // a text marker was the whole reason agentic video could not be reached —
+              // the video never arrived as a video. Every other remote URL keeps the
+              // marker: we have no mime type for it and no evidence Gemini can fetch it.
+              const fileUri = geminiFetchableVideoUri(p.videoUrl);
+              if (fileUri) {
+                // Emitted only when the caller asked for a mode, so no existing
+                // request gains a field it did not have.
+                parts.push({ file_data: { file_uri: fileUri }, ...processingPart });
+                continue;
+              }
+              parts.push({ text: `[video: ${p.videoUrl}]` });
+              continue;
+            }
+            if (p.type === "document") {
+              // Gemini takes document bytes through the same inline_data part as images and
+              // video. The marker on the part is the fallback for wires without one, not this
+              // wire's best effort (#5212).
+              parts.push({ inline_data: { mime_type: p.mediaType, data: p.data } });
               continue;
             }
             // Drop empty/malformed text instead of emitting `{ text: "" }` or a bare `{}` part.
@@ -358,11 +477,26 @@ function messagesToGeminiFormat(
         const aMsg = msg as OcxAssistantMessage;
         const parts: unknown[] = [];
         const toolCalls: Array<{ wireCallId: string; wireName: string }> = [];
+        // Progress text before a Gemini tool call replays as its lead sentence, so planning the
+        // model leaked into visible text is not copied forward (google-progress-history.ts).
+        const trimProgress = trimsGeminiProgressHistory(identityModelId)
+          && aMsg.phase !== "final_answer"
+          && aMsg.content.some(part => part.type === "toolCall");
+        let progressLeadKept = false;
+        let afterToolCall = false;
         for (const p of aMsg.content) {
           if (p.type === "text") {
-            const textPart = geminiTextPart((p as OcxTextContent).text);
+            let text: unknown = (p as OcxTextContent).text;
+            if (trimProgress && !afterToolCall) {
+              if (progressLeadKept || typeof text !== "string") continue;
+              text = geminiProgressLead(text);
+              if (text === undefined) continue;
+              progressLeadKept = true;
+            }
+            const textPart = geminiTextPart(text);
             if (textPart) parts.push(textPart);
           } else if (p.type === "toolCall") {
+            afterToolCall = true;
             const tc = p as OcxToolCall;
             // Preserve the thought signature on the function-call part so Antigravity/Gemini-3
             // reasoning continuity survives history-driven (stateless) turns, not just same-process
@@ -425,15 +559,25 @@ function messagesToGeminiFormat(
           }
 
           const responseParts: unknown[] = [];
+          const trailingImages: unknown[] = [];
           for (const call of toolCalls) {
             const result = resultsById.get(call.wireCallId);
-            if (result) responseParts.push(...geminiToolResultParts(result, call.wireName, call.wireCallId));
-            else responseParts.push(geminiMissingToolResultPart(call.wireName, call.wireCallId));
+            if (result) {
+              const [response, ...images] = geminiToolResultParts(result, call.wireName, call.wireCallId, nestToolResultImages);
+              responseParts.push(response);
+              (toolResponseImagesLast ? trailingImages : responseParts).push(...images);
+            } else responseParts.push(geminiMissingToolResultPart(call.wireName, call.wireCallId));
           }
-          for (const orphan of orphanResults) {
-            responseParts.push(...geminiOrphanToolResultParts(orphan));
-          }
+          // CCA Claude misses later responses when image siblings interrupt the response batch.
+          responseParts.push(...trailingImages);
+          const orphanParts = orphanResults.flatMap(geminiOrphanToolResultParts);
           contents.push({ role: "user", parts: responseParts });
+          // Orphan images cannot share Argon's response batch or claim another call's ownership.
+          if (nestToolResultImages && orphanParts.some(part => typeof part === "object" && part !== null && "inline_data" in part)) {
+            contents.push({ role: "user", parts: orphanParts });
+          } else {
+            responseParts.push(...orphanParts);
+          }
           i = j - 1;
         }
         break;
@@ -446,6 +590,18 @@ function messagesToGeminiFormat(
         break;
       }
     }
+  }
+
+  // A functionCall turn may not open the request: the upstream requires it to follow a user or
+  // function-response turn, and rejects with "function call turn comes immediately after a user
+  // turn or after a function response turn" (HTTP 400, #5008). Context compaction can truncate a
+  // long history so it opens on an assistant tool call. Prepend a user nudge, the same repair
+  // Kiro applies to assistant-head turns (src/adapters/kiro/payload.ts). A model head carrying
+  // only text is left alone: no upstream rule against it is demonstrated, and repairing it would
+  // inject a turn into valid requests.
+  const firstTurn = contents[0] as { role?: string; parts?: Array<{ functionCall?: unknown }> } | undefined;
+  if (firstTurn?.role === "model" && firstTurn.parts?.some(p => p.functionCall !== undefined)) {
+    contents.unshift({ role: "user", parts: [{ text: "(continue)" }] });
   }
 
   // Gemini API and Claude-on-Antigravity reject assistant-tail (model-tail in Gemini terms)
@@ -465,9 +621,7 @@ function messagesToGeminiFormat(
 
 function toolsToGeminiFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   if (!parsed.context.tools?.length) return undefined;
-  const tools = isAllowedToolChoice(parsed.options.toolChoice)
-    ? parsed.context.tools.filter(toolChoiceToolPredicate(parsed.options.toolChoice, parsed.context.tools))
-    : parsed.context.tools;
+  const tools = advertisedGeminiTools(parsed);
   if (tools.length === 0) return undefined;
   return [{
     functionDeclarations: tools.map(t => ({
@@ -478,19 +632,37 @@ function toolsToGeminiFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   }];
 }
 
+/** The declarations this request actually advertises, after any allowed-tools filter. */
+function advertisedGeminiTools(parsed: OcxParsedRequest): readonly OcxTool[] {
+  const declared = parsed.context.tools ?? [];
+  return isAllowedToolChoice(parsed.options.toolChoice)
+    ? declared.filter(toolChoiceToolPredicate(parsed.options.toolChoice, declared))
+    : declared;
+}
+
 /**
  * Client tool_choice enforcement on the wire. The catalog nudge states the same contract in
  * prose, but without functionCallingConfig the model is free to ignore it. "auto" stays absent
  * so the common case is byte-identical. The allowedTools variant already filters the
  * declarations in toolsToGeminiFormat; only its "required" half needs a wire mode.
+ *
+ * A caller that declares strict tools is asking for its argument schemas to be enforced, and
+ * Gemini expresses that as VALIDATED. The mode existed and was plumbed end to end, but was only
+ * ever reachable by matching a model name, so a strict declaration arrived as an ordinary
+ * unvalidated AUTO turn and the response looked the same either way (#5210). VALIDATED replaces
+ * AUTO only: ANY and NONE are stronger constraints the caller asked for explicitly, and
+ * overwriting either of them would lose the choice this function exists to enforce.
  */
 function toolChoiceToGeminiToolConfig(parsed: OcxParsedRequest): Record<string, unknown> | undefined {
   const choice = parsed.options.toolChoice;
-  if (!choice || choice === "auto") return undefined;
+  const validated = advertisedGeminiTools(parsed).some(t => t.strict === true)
+    ? { functionCallingConfig: { mode: "VALIDATED" } }
+    : undefined;
+  if (!choice || choice === "auto") return validated;
   if (choice === "none") return { functionCallingConfig: { mode: "NONE" } };
   if (choice === "required") return { functionCallingConfig: { mode: "ANY" } };
   if (isAllowedToolChoice(choice)) {
-    return choice.mode === "required" ? { functionCallingConfig: { mode: "ANY" } } : undefined;
+    return choice.mode === "required" ? { functionCallingConfig: { mode: "ANY" } } : validated;
   }
   return {
     functionCallingConfig: {
@@ -738,6 +910,7 @@ function invalidGoogleShapeEvent(
   };
 }
 
+/** Build Gemini transport and response parsing for AI Studio, Vertex, Cloud Code Assist or Go. */
 export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapter {
   const toolSchemaPolicy = provider.googleToolSchemaPolicy ?? "compatible";
   const toolSchemaProfile = {
@@ -819,7 +992,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         }
       : {}),
 
-    async buildRequest(parsed: OcxParsedRequest) {
+    /** Compile an admitted request into the selected Gemini endpoint, body and authentication. */
+    async buildRequest(parsed: OcxParsedRequest, incoming?: IncomingMeta) {
       // Structured-output admission runs FIRST, before messagesToGeminiFormat writes
       // lastInjectedCallIds/lastReasoningReplayScope: a refused request must not leave
       // adapter-scoped replay state pointing at call ids that never went out. These
@@ -857,10 +1031,17 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
             mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning),
             provider.baseUrl,
           ).wireModelId
-        : provider.googleMode === "vertex"
+        : provider.googleMode === "vertex" || openCodeZenGeminiEndpoint(provider, parsed.modelId) !== undefined
           ? parsed.modelId
           : resolveDirectGeminiWireModelId(parsed.modelId, provider.directGeminiWireRenames !== false);
-      returnsThoughtSummaries = provider.googleMode === "cloud-code-assist"
+      const configuredEfforts = configuredReasoningEfforts(provider, parsed.modelId);
+      const thinkingEligible = provider.googleMode !== "cloud-code-assist"
+        && !isImageCapableModel(parsed.modelId)
+        && (configuredEfforts !== undefined
+          ? configuredEfforts.length > 0
+          : (provider.googleMode !== "vertex"
+            && (parsed.modelId === "gemini-3.5-flash" || parsed.modelId === "gemini-3.6-flash")));
+      returnsThoughtSummaries = (provider.googleMode === "cloud-code-assist" || (thinkingEligible && provider.showThinkingSummary === true))
         && /^gemini-/.test(routedModelId) && !isImageCapableModel(parsed.modelId);
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
@@ -872,6 +1053,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         identityModelId,
         stripRejectedClaudeSdkParagraph,
         isCloudCodeAssist,
+        provider.googleMode === "vertex" && parsed.modelId === "gemini-4-argon",
+        isCloudCodeAssist && /^claude-/i.test(routedModelId),
       );
       lastInjectedCallIds = [...replayedCallIds];
       lastReasoningReplayScope = parsed._reasoningReplayScope;
@@ -898,15 +1081,19 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       // current behavior; Vertex participates only through an explicitly configured ladder (the
       // seed google-vertex entry ships none). Image models are excluded — thinkingConfig would
       // suppress the responseModalities fallback below. CCA maps effort on its envelope path.
-      const thinkingEligible = provider.googleMode !== "cloud-code-assist"
-        && !isImageCapableModel(parsed.modelId)
-        && (configuredReasoningEfforts(provider, parsed.modelId) !== undefined
-          || (provider.googleMode !== "vertex"
-            && (parsed.modelId === "gemini-3.5-flash" || parsed.modelId === "gemini-3.6-flash")));
       const thinkingLevel = thinkingEligible
         ? mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning)
         : undefined;
-      if (thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel };
+      const includeThoughts = thinkingEligible
+        && provider.showThinkingSummary === true
+        && parsed.options.hideThinkingSummary !== true
+        && /^gemini-/.test(routedModelId);
+      if (thinkingLevel || includeThoughts) {
+        generationConfig.thinkingConfig = {
+          ...(thinkingLevel ? { thinkingLevel } : {}),
+          ...(includeThoughts ? { includeThoughts: true } : {}),
+        };
+      }
       if (!generationConfig.thinkingConfig && isImageCapableModel(parsed.modelId)) {
         generationConfig.responseModalities = ["TEXT", "IMAGE"];
       }
@@ -1029,7 +1216,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           requestId: `agent-${crypto.randomUUID()}`,
           request,
         };
-        headers["User-Agent"] = ANTIGRAVITY_REQUEST_UA;
+        headers["User-Agent"] = antigravityUserAgentForWireModel(wireModelId);
         headers["Authorization"] = `Bearer ${token}`;
         return { url, method: "POST", headers, body: JSON.stringify(envelope) };
       }
@@ -1038,9 +1225,19 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
         reportToolSchemaLoss(compiled.toolSchemaLossReport);
         restoreGoogleToolName = compiled.restoreToolName;
-        const vertexProject = provider.project || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "api-key";
-        const vertexLocation = provider.location || process.env.GOOGLE_CLOUD_LOCATION || "global";
-        vertexReplayModel = `vertex:${vertexProject}:${vertexLocation}:${parsed.modelId}`;
+        const apiKey = resolveVertexApiKey(provider.apiKey);
+        let vertexEndpoint = selectVertexEndpoint(provider, Boolean(apiKey));
+        if (apiKey && vertexEndpoint.kind === "project" && vertexEndpoint.project === VERTEX_PROJECT_AUTO) {
+          // Unresolved keys use express for this request so Google's status drives key failover.
+          const project = await resolveVertexApiKeyProject(apiKey, {
+            signal: incoming?.abortSignal,
+            provider,
+            providerName: incoming?.providerName,
+          });
+          vertexEndpoint = project ? { ...vertexEndpoint, project } : { kind: "express" };
+        }
+        const url = vertexInferenceUrl(vertexEndpoint, parsed.modelId, method, streamParam);
+        vertexReplayModel = vertexReplayModelKey(vertexEndpoint, parsed.modelId);
         vertexReplaySession = vertexReplaySessionId(parsed);
         // Compile names before replay so the cache matches the exact provider-visible
         // functionCall identity. This is the same bounded TTL/LRU store used by CCA, with the
@@ -1056,35 +1253,42 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
             (compiled.body as { contents: unknown[] }).contents,
           );
         }
-        // Vertex AI: project/location endpoint with GCP ADC, or x-goog-api-key fast path.
-        const apiKey = resolveVertexApiKey(provider.apiKey);
-        if (apiKey) {
-          const url = `https://aiplatform.googleapis.com/v1/publishers/google/models/${parsed.modelId}:${method}${streamParam}`;
-          headers["x-goog-api-key"] = apiKey;
-          return { url, method: "POST", headers, body: JSON.stringify(compiled.body) };
+        // Endpoint, location and model path were validated above, before any credential is attached.
+        if (apiKey) headers["x-goog-api-key"] = apiKey;
+        else {
+          // Resolve each marker per request; never share a process-global active account.
+          const markerAccount = gcpCredentialMarkerAccount(provider.apiKey);
+          headers["Authorization"] = `Bearer ${await getVertexAccessToken({ markerAccount })}`;
         }
-        const project = provider.project || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-        if (!project) throw new Error("Vertex AI requires a project id (provider.project or GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT).");
-        const location = provider.location || process.env.GOOGLE_CLOUD_LOCATION;
-        if (!location) throw new Error("Vertex AI requires a location (provider.location or GOOGLE_CLOUD_LOCATION).");
-        const locationError = googleVertexLocationConfigError(location);
-        if (locationError) throw new Error(locationError);
-        const host = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
-        const url = `https://${host}/v1/projects/${project}/locations/${location}/publishers/google/models/${parsed.modelId}:${method}${streamParam}`;
-        const token = await getVertexAccessToken();
-        headers["Authorization"] = `Bearer ${token}`;
         return { url, method: "POST", headers, body: JSON.stringify(compiled.body) };
       }
 
-      // ai-studio (default): Generative Language API + x-goog-api-key.
-      const url = `${provider.baseUrl}/v1beta/models/${routedModelId}:${method}${streamParam}`;
+      // Go and Zen use separate guarded Gemini endpoints; AI Studio retains /v1beta.
+      const goEndpoint = openCodeGoGeminiEndpoint(provider, routedModelId);
+      const zenEndpoint = openCodeZenGeminiEndpoint(provider, routedModelId);
+      const endpoint = goEndpoint ?? zenEndpoint ?? `${provider.baseUrl}/v1beta/models/${routedModelId}`;
+      const url = `${endpoint}:${method}${streamParam}`;
       const apiKey = provider.apiKey?.trim();
-      if (!apiKey) throw new Error("google (AI Studio) requires a non-empty API key");
-      headers["x-goog-api-key"] = apiKey;
+      if (!apiKey) throw new Error(`${goEndpoint ? "OpenCode Go" : zenEndpoint ? "OpenCode Zen" : "google (AI Studio)"} requires a non-empty API key`);
+      if (goEndpoint) {
+        // Console inference documents Bearer auth. Send only the selected Go key.
+        for (const name of Object.keys(headers)) {
+          if (["authorization", "x-goog-api-key", "x-api-key"].includes(name.toLowerCase())) delete headers[name];
+        }
+        headers["Authorization"] = `Bearer ${apiKey}`;
+      } else {
+        headers["x-goog-api-key"] = apiKey;
+      }
 
       const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
       reportToolSchemaLoss(compiled.toolSchemaLossReport);
       restoreGoogleToolName = compiled.restoreToolName;
+      // A functionCall issued by another model (a combo hop, #7298) has no Gemini signature, and
+      // Gemini 3 refuses the turn without one. The same Gemini-only sentinel CCA and Vertex
+      // apply; a real signature carried by history always wins.
+      if (Array.isArray((compiled.body as { contents?: unknown[] }).contents)) {
+        applyAntigravityThoughtSignatureFallback(routedModelId, (compiled.body as { contents: unknown[] }).contents);
+      }
       return { url, method: "POST", headers, body: JSON.stringify(compiled.body) };
     },
 
@@ -1100,9 +1304,23 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      const budgetEncoder = new TextEncoder();
       let buffer = "";
       let bufferBytes = 0;
+      const appendDecoded = (fragment: string): void => {
+        if (!fragment) return;
+        // TextDecoder emits complete code points, so only new text needs UTF-8 measurement.
+        const nextBytes = bufferBytes + Buffer.byteLength(fragment);
+        const reservation = budget.reserveTransient(nextBytes, { kind: "live_transient" });
+        try {
+          buffer += fragment;
+          reservation.commitRetained();
+        } catch (error) {
+          reservation.release();
+          throw error;
+        }
+        budget.releaseRetained(bufferBytes, { kind: "live_transient" });
+        bufferBytes = nextBytes;
+      };
       let pendingUsage: OcxUsage | undefined;
       let toolCallsStarted = 0;
       let lastFinishReason: string | undefined;
@@ -1294,13 +1512,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const nextBuffer = buffer + decoder.decode(value, { stream: true });
-          const nextBufferBytes = budgetEncoder.encode(nextBuffer).byteLength;
-          const appendReservation = budget.reserveTransient(nextBufferBytes, { kind: "live_transient" });
-          buffer = nextBuffer;
-          appendReservation.commitRetained();
-          budget.releaseRetained(bufferBytes, { kind: "live_transient" });
-          bufferBytes = nextBufferBytes;
+          const decoded = decoder.decode(value, { stream: true });
+          appendDecoded(decoded);
           // Cap incomplete frames before waiting for a newline — otherwise a single
           // unterminated data: payload can grow without bound.
           if (buffer.length > MAX_SSE_FRAME_BYTES) {
@@ -1309,9 +1522,11 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
             return;
           }
 
+          // The retained suffix contains no newline; an unfinished line needs no rescan.
+          if (!decoded.includes("\n")) continue;
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
-          const residualBytes = budgetEncoder.encode(buffer).byteLength;
+          const residualBytes = Buffer.byteLength(buffer);
           const residualReservation = budget.reserveTransient(residualBytes, { kind: "live_transient" });
           residualReservation.commitRetained();
           budget.releaseRetained(bufferBytes, { kind: "live_transient" });
@@ -1332,7 +1547,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           }
           if (sawLiveness && !sawContentEvent) yield { type: "heartbeat" };
         }
-        buffer += decoder.decode();
+        appendDecoded(decoder.decode());
         if (buffer.trim().length > 0) {
           const residual = buffer.trim();
           if (residual.startsWith(":")) {
@@ -1346,7 +1561,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         // an error instead of a silently-incomplete done. Mirrors kiro-truncation.
         if ((provider.googleMode === "vertex" || provider.googleMode === "cloud-code-assist")
           && isVertexTruncatedTurn(lastFinishReason, toolCallsStarted)) {
-          yield { type: "error", message: vertexTruncationErrorMessage(lastFinishReason) };
+          yield vertexTruncationErrorEvent(lastFinishReason, toolCallsStarted, pendingUsage);
           return;
         }
         if (!sawAnyFrame || !sawTerminalSignal) {
@@ -1561,7 +1776,11 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       // (MAX_TOKENS / MALFORMED_FUNCTION_CALL) surfaces an error instead of a silent done.
       if ((provider.googleMode === "vertex" || provider.googleMode === "cloud-code-assist")
         && isVertexTruncatedTurn(candidate.finishReason, toolCallsStarted)) {
-        return finish([{ type: "error", message: vertexTruncationErrorMessage(candidate.finishReason) }]);
+        return finish([vertexTruncationErrorEvent(
+          candidate.finishReason,
+          toolCallsStarted,
+          usageFromGemini(json.usageMetadata as Record<string, number> | undefined),
+        )]);
       }
 
       const usage = json.usageMetadata as Record<string, number> | undefined;

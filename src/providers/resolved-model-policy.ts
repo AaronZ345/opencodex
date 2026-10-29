@@ -1,7 +1,9 @@
-import type { ModelCapabilities, OcxProviderConfig } from "../types";
-import { MODEL_ADAPTER_OVERRIDE_ALLOWED, pinnedWireAdapter } from "../types";
+import type { ModelCapabilities, OcxProviderConfig, ReasoningCapabilities } from "../types";
+import { declaredModelCapabilities, mergeReasoningModelCapabilities, reasoningCapabilitiesFromConfig, REASONING_CAPABILITY_FIELDS } from "./reasoning-capabilities";
+import { MODEL_ADAPTER_OVERRIDE_ALLOWED, modelInList, pinnedWireAdapter } from "../types";
 import { isCanonicalOpenAiForwardProvider } from "./openai-tiers";
 import { resolveProviderAuthTransport } from "./fastwire";
+import { fastSwitchOff } from "./fast-opt-in";
 import { registryEntrySupportsLiveModelDiscovery } from "./static-model-discovery";
 import type { InboundWire, ProviderRegistryEntry, ResponsesTerminalRepairPolicy } from "./registry/types";
 import {
@@ -30,14 +32,14 @@ export type StaticProviderPolicyField =
   | "modelMaxOutputTokens" | "reasoningEfforts" | "modelReasoningEfforts" | "modelReasoningEffortsAuthoritative"
   | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap"
   | "reasoningWireFormat" | "noVisionModels" | "noReasoningModels" | "noTemperatureModels"
-  | "noTopPModels" | "noPenaltyModels" | "noJsonSchemaModels" | "parallelToolCalls"
-  | "promptCacheKey" | "chatServiceTier" | "openaiChatEofTolerance" | "statelessResponses"
+  | "noTopPModels" | "noStopModels" | "noPenaltyModels" | "noJsonSchemaModels" | "noStructuredOutputModels" | "parallelToolCalls"
+  | "promptCacheKey" | "chatServiceTier" | "openaiChatEofTolerance" | "foldDeveloperRoleToSystem" | "statelessResponses"
   | "requiresAdjacentResponsesToolResults" | "requiresPairedResponsesToolResults" | "annotateEmptyToolOutputs"
   | "fastWire" | "supportsServiceTier" | "modelSupportsServiceTier" | "supportsOpenAiWebSearchToolFields"
   | "supportsResponsesCustomTools" | "preserveResponsesReasoningContent" | "dropResponsesReasoningItems"
   | "modelSupportsReasoningSummaries"
   | "supportsVerbosity" | "modelSupportsVerbosity" | "responsesItemIdRepair" | "autoToolChoiceOnlyModels"
-  | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels"
+  | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "inlineThinkTagModels"
   | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "showThinkingSummary"
   | "escapeBuiltinToolNames" | "googleMode" | "project" | "location" | "modelCapabilities"
   | "modelAutoCompactTokenLimits" | "modelSuppressSyntheticMax" | "modelReasoningSummaryDelivery"
@@ -47,7 +49,7 @@ export type ResolvedProviderStaticPolicy = Readonly<Partial<StaticProviderPolicy
   adapter: string;
   baseUrl: string;
 }>;
-export interface ResolvedPerModelStaticPolicy {
+export interface ResolvedPerModelStaticPolicy extends Readonly<ReasoningCapabilities> {
   readonly adapter: string;
   readonly contextWindow?: number;
   readonly inputModalities?: readonly string[];
@@ -172,7 +174,7 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
     "responsesPath", "chatCompletionsPath", "keyOptional", "freeTier", "modelSuffixBracketStrip",
     "defaultModel", "models", "liveModels", "contextWindow", "defaultMaxOutputTokens",
     "reasoningWireFormat", "parallelToolCalls", "promptCacheKey",
-    "openaiChatEofTolerance", "statelessResponses",
+    "openaiChatEofTolerance", "foldDeveloperRoleToSystem", "statelessResponses",
     "requiresAdjacentResponsesToolResults", "requiresPairedResponsesToolResults",
     "annotateEmptyToolOutputs", "fastWire", "supportsServiceTier",
     "supportsOpenAiWebSearchToolFields", "supportsResponsesCustomTools",
@@ -187,7 +189,10 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
     legacyClinePassLadder || provider.reasoningEfforts === undefined ? entry?.reasoningEfforts ? "registry" : "unknown" : "operator");
   put("chatServiceTier", provider.chatServiceTier ?? keyAuthDefaults?.chatServiceTier ?? entry?.chatServiceTier,
     provider.chatServiceTier !== undefined ? "operator" : keyAuthDefaults?.chatServiceTier !== undefined ? "registry" : entry?.chatServiceTier !== undefined ? "registry" : "unknown");
-  put("supportsServiceTier", provider.supportsServiceTier ?? keyAuthDefaults?.supportsServiceTier ?? entry?.supportsServiceTier,
+  // The Fast switch overrides every capability source; see providerFastSwitchOff.
+  const fastOff = fastSwitchOff(provider, input.registryEntry);
+  if (fastOff) put("supportsServiceTier", false, provider.fastEnabled === false ? "operator" : "registry");
+  else put("supportsServiceTier", provider.supportsServiceTier ?? keyAuthDefaults?.supportsServiceTier ?? entry?.supportsServiceTier,
     provider.supportsServiceTier !== undefined ? "operator" : keyAuthDefaults?.supportsServiceTier !== undefined ? "registry" : entry?.supportsServiceTier !== undefined ? "registry" : "unknown");
   if (entry && !registryEntrySupportsLiveModelDiscovery(entry)) put("liveModels", false, "registry");
   putMergedMap("modelDisplayNames", entry?.modelDisplayNames, provider.modelDisplayNames);
@@ -211,9 +216,11 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
   putMergedMap("modelSupportsReasoningSummaries", entry?.modelSupportsReasoningSummaries, provider.modelSupportsReasoningSummaries);
   putMergedMap("modelSupportsVerbosity", entry?.modelSupportsVerbosity, provider.modelSupportsVerbosity);
   for (const key of [
-    "modelCapabilities", "modelAutoCompactTokenLimits", "modelSuppressSyntheticMax",
+    "modelAutoCompactTokenLimits", "modelSuppressSyntheticMax",
     "modelReasoningSummaryDelivery", "codexToolMode", "modelAdapters",
   ] as const) putScalar(key, undefined);
+  put("modelCapabilities", mergeReasoningModelCapabilities(entry?.modelCapabilities, provider.modelCapabilities),
+    provider.modelCapabilities !== undefined ? "operator-capability" : entry?.modelCapabilities !== undefined ? "registry" : "unknown");
   for (const key of ["modelContextWindows", "modelMaxInputTokens"] as const) {
     const [value, source] = input.providerName === "openai-apikey"
       ? positiveCapMap(entry?.[key], provider[key])
@@ -226,10 +233,13 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
   put("modelReasoningEffortMap", modelEffortMap, modelEffortMapSource);
   for (const key of [
     "noVisionModels", "noReasoningModels", "noTemperatureModels", "noTopPModels",
-    "noPenaltyModels", "noJsonSchemaModels", "autoToolChoiceOnlyModels",
+    "noStopModels",
+    "noPenaltyModels", "noJsonSchemaModels", "noStructuredOutputModels", "autoToolChoiceOnlyModels",
     "preserveReasoningContentModels", "requiresReasoningPlaceholderModels",
     "reasoningSplitModels", "reasoningDetailsModels", "thinkingToggleModels", "thinkingBudgetModels",
   ] as const) putUnion(key, entry?.[key]);
+  // This parser is opt-in: an explicit list, including [], overrides registry defaults.
+  putScalar("inlineThinkTagModels", entry?.inlineThinkTagModels);
   for (const directModel of entry?.directReasoningEffortModels ?? []) {
     const staleBudget = [directModel, ...(entry?.thinkingBudgetModels ?? [])];
     const routedStaleBudget = [...(entry?.thinkingBudgetModels ?? []), directModel];
@@ -281,7 +291,7 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
     return exact !== "unknown" ? exact : operatorDefault !== undefined ? "operator" : registryDefault !== undefined ? "registry" : "unknown";
   };
   const configuredAdapter = provider.modelAdapters?.[input.modelId];
-  const pin = pinnedWireAdapter(input.providerName, input.modelId);
+  const pin = pinnedWireAdapter(input.providerName, input.modelId, provider);
   const normalizedModelId = input.modelId.trim().toLowerCase();
   const registryWire = wireDefault(entry?.modelWireDefaults?.[normalizedModelId], provider, entry,
     input.inboundWire ?? "responses", resolvedAuthMode);
@@ -318,13 +328,25 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
     : exactMaxInputTokens;
   const exactMaxOutputTokens = modelValue(providerPolicy.modelMaxOutputTokens);
   const modelMaxOutputTokens = exactMaxOutputTokens ?? providerPolicy.defaultMaxOutputTokens;
-  const modelReasoningEfforts = modelValue(providerPolicy.modelReasoningEfforts) ?? providerPolicy.reasoningEfforts;
+  const reasoningCapabilities = reasoningCapabilitiesFromConfig({
+    ...providerPolicy,
+    adapter: providerPolicy.adapter ?? provider.adapter,
+    baseUrl: providerPolicy.baseUrl ?? provider.baseUrl,
+    ...(input.modelCapabilities ? { modelCapabilities: mergeReasoningModelCapabilities(
+      providerPolicy.modelCapabilities, { [input.modelId]: input.modelCapabilities },
+    ) } : {}),
+  }, input.modelId);
+  const modelReasoningEfforts = reasoningCapabilities.supportsReasoningEffort === false ? []
+    : modelValue(providerPolicy.modelReasoningEfforts) ?? providerPolicy.reasoningEfforts;
   const modelSupportsReasoningSummaries = modelValue(providerPolicy.modelSupportsReasoningSummaries)
     ?? (modelValue(providerPolicy.modelReasoningSummaryDelivery) !== undefined ? true : undefined);
   const modelSupportsVerbosity = modelValue(providerPolicy.modelSupportsVerbosity) ?? providerPolicy.supportsVerbosity;
-  const modelSupportsServiceTier = modelValue(providerPolicy.modelSupportsServiceTier) ?? providerPolicy.supportsServiceTier;
+  const modelSupportsServiceTier = fastOff
+    ? false
+    : modelValue(providerPolicy.modelSupportsServiceTier) ?? providerPolicy.supportsServiceTier;
   const model: ResolvedPerModelStaticPolicy = {
     adapter,
+    ...reasoningCapabilities,
     ...(modelContextWindow !== undefined ? { contextWindow: modelContextWindow } : {}),
     ...(capabilityModalities ?? modelValue(providerPolicy.modelInputModalities) !== undefined
       ? { inputModalities: capabilityModalities ?? modelValue(providerPolicy.modelInputModalities) }
@@ -332,7 +354,7 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
     ...(modelMaxInputTokens !== undefined ? { maxInputTokens: modelMaxInputTokens } : {}),
     ...(modelMaxOutputTokens !== undefined ? { maxOutputTokens: modelMaxOutputTokens } : {}),
     ...(modelReasoningEfforts !== undefined ? { reasoningEfforts: modelReasoningEfforts } : {}),
-    ...(modelValue(providerPolicy.modelDefaultReasoningEfforts) !== undefined ? { defaultReasoningEffort: modelValue(providerPolicy.modelDefaultReasoningEfforts) } : {}),
+    ...(reasoningCapabilities.supportsReasoningEffort !== false && modelValue(providerPolicy.modelDefaultReasoningEfforts) !== undefined ? { defaultReasoningEffort: modelValue(providerPolicy.modelDefaultReasoningEfforts) } : {}),
     ...(modelSupportsReasoningSummaries !== undefined ? { supportsReasoningSummaries: modelSupportsReasoningSummaries } : {}),
     ...(modelSupportsVerbosity !== undefined ? { supportsVerbosity: modelSupportsVerbosity } : {}),
     ...(modelSupportsServiceTier !== undefined ? { supportsServiceTier: modelSupportsServiceTier } : {}),
@@ -350,6 +372,13 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
   const modelProvenance: Partial<Record<keyof ResolvedPerModelStaticPolicy, StaticPolicySource>> = {
     adapter: adapterSource,
   };
+  for (const field of REASONING_CAPABILITY_FIELDS) {
+    modelProvenance[field] = reasoningCapabilities[field] === undefined ? "unknown"
+      : modelInList(provider.noReasoningModels, input.modelId) ? "operator"
+      : modelInList(entry?.noReasoningModels, input.modelId) ? "registry"
+      : input.modelCapabilities?.[field] !== undefined || declaredModelCapabilities(provider.modelCapabilities, input.modelId)?.[field] !== undefined
+        ? "operator-capability" : declaredModelCapabilities(entry?.modelCapabilities, input.modelId)?.[field] !== undefined ? "registry" : "operator";
+  }
   modelProvenance.contextWindow = modelOrProviderSource(provider.modelContextWindows, entry?.modelContextWindows, provider.contextWindow, entry?.contextWindow);
   if (modelProvenance.contextWindow === "unknown" && familyContextWindow !== undefined) {
     modelProvenance.contextWindow = anthropicFamilyContextWindow(provider.modelContextWindows, input.modelId) !== undefined
@@ -377,7 +406,7 @@ export function resolveModelPolicy(input: ResolveModelPolicyInput): ResolvedMode
   }
   modelProvenance.supportsVerbosity = modelOrProviderSource(provider.modelSupportsVerbosity, entry?.modelSupportsVerbosity, provider.supportsVerbosity, entry?.supportsVerbosity);
   const exactServiceTierSource = modelSource(provider.modelSupportsServiceTier, registryServiceTierDefaults);
-  modelProvenance.supportsServiceTier = exactServiceTierSource !== "unknown" ? exactServiceTierSource
+  modelProvenance.supportsServiceTier = !fastOff && exactServiceTierSource !== "unknown" ? exactServiceTierSource
     : providerProvenance.supportsServiceTier ?? "unknown";
   modelProvenance.responsesUpstreamStreaming = model.responsesUpstreamStreaming === undefined ? "unknown" : "registry";
   modelProvenance.responsesTerminalRepair = model.responsesTerminalRepair === undefined ? "unknown" : "registry";

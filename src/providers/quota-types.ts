@@ -19,6 +19,28 @@ export interface ProviderQuotaWindow {
   label: string;
   percent: number;
   resetAt?: number;
+  /**
+   * Model this window is attributed to: the exact CCA wire model of a fallback measurement, or
+   * the canonical model of a quota-summary bucket dedicated to one model (Antigravity's Gemini 4
+   * Argon pool). Display evidence only, never eligibility: routing, exhaustion, reset ordering
+   * and reset notifications ignore every window that carries it.
+   */
+  modelId?: string;
+  /**
+   * Set only when the PRODUCER proved this window covers one model family, structurally rather
+   * than by reading its label: an Anthropic `seven_day_<family>` body key, or a limit with
+   * `kind: "weekly_scoped"` and a recognized `scope.model.display_name`.
+   *
+   * Absent means provider-wide, which gates every model. That is the fail-closed direction and
+   * the behaviour every other producer keeps. Routing must key on THIS, never on the label text:
+   * `quota/antigravity.ts` passes an upstream `group.displayName` straight through, so a
+   * provider-wide group named "Opus" there would otherwise be mistaken for a per-model window.
+   */
+  scope?: "model";
+  /** Passive family readings have their own freshness clock, independent of active probes. */
+  passiveObservedAt?: number;
+  /** Upstream refusal evidence, distinct from a measured utilization counter. */
+  rejected?: true;
 }
 
 export interface ProviderQuotaCreditsUsd {
@@ -31,12 +53,17 @@ export interface ProviderQuotaCreditsUsd {
 }
 
 export interface ProviderQuota {
+  /** Display-only subscription credits; not a routing or exhaustion window. */
+  workbuddyCredits?: import("./workbuddy-credit-balance").WorkBuddyCreditBalance;
   fiveHourPercent?: number;
   fiveHourResetAt?: number;
   weeklyPercent?: number;
   weeklyResetAt?: number;
   monthlyPercent?: number;
   monthlyResetAt?: number;
+  /** Observed Kiro plan credits, independent of token and currency estimates. */
+  kiroCreditsUsed?: number;
+  kiroCreditsLimit?: number;
   customWindows?: ProviderQuotaWindow[];
   creditsUsd?: ProviderQuotaCreditsUsd;
   updatedAt: number;

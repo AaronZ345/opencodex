@@ -9,12 +9,14 @@ import IntegrationStateBadge from "./IntegrationStateBadge";
 import ConsequenceDialog, { type ConsequenceCopy } from "./ConsequenceDialog";
 import RestoreDialog from "./RestoreDialog";
 import RaycastPlanNotice from "./RaycastPlanNotice";
+import DroidReasoningDefaultsPanel from "./DroidReasoningDefaultsPanel";
 import { RollbackHistory } from "./RollbackHistory";
 import { describeRefusal } from "./refusal-copy";
 import {
   loadIntegrationJournal,
   loadIntegrationState,
   previewIntegrationMutation,
+  canDisableKiloWithCandidateIssue,
   toggleIntegration,
   bindingFor,
   IntegrationApiError,
@@ -70,6 +72,7 @@ const DISABLE_COPY: ConsequenceCopy = {
 const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   opencode: "integrations.semantics.opencode",
   pi: "integrations.semantics.pi",
+  "gentle-shell": "integrations.semantics.gentleShell",
   omp: "integrations.semantics.omp",
   hermes: "integrations.semantics.hermes",
   openclaw: "integrations.semantics.openclaw",
@@ -78,16 +81,25 @@ const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   dsh: "integrations.semantics.dsh",
   mcode: "integrations.semantics.mcode",
   zcode: "integrations.semantics.zcode",
+  commandcode: "integrations.semantics.commandcode",
   prime: "integrations.semantics.prime",
   aside: "integrations.semantics.aside",
   raycast: "integrations.semantics.raycast",
   omo: "integrations.semantics.omo",
   cline: "integrations.semantics.cline",
+  kilo: "integrations.semantics.kilo",
+  droid: "integrations.semantics.droid",
+  qoder: "integrations.semantics.qoder",
+  "qoder-cn": "integrations.semantics.qoderCn",
+  "workbuddy": "integrations.semantics.workbuddy",
+  "workbuddy-ai": "integrations.semantics.workbuddyAi",
+  t3code: "integrations.semantics.t3code",
 };
 
 const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   opencode: "integrations.tab.opencode",
   pi: "integrations.tab.pi",
+  "gentle-shell": "integrations.tab.gentleShell",
   omp: "integrations.tab.omp",
   hermes: "integrations.tab.hermes",
   openclaw: "integrations.tab.openclaw",
@@ -96,29 +108,54 @@ const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   dsh: "integrations.tab.dsh",
   mcode: "integrations.tab.mcode",
   zcode: "integrations.tab.zcode",
+  commandcode: "integrations.tab.commandcode",
   prime: "integrations.tab.prime",
   aside: "integrations.tab.aside",
   raycast: "integrations.tab.raycast",
   omo: "integrations.tab.omo",
   cline: "integrations.tab.cline",
+  kilo: "integrations.tab.kilo",
+  droid: "integrations.tab.droid",
+  qoder: "integrations.tab.qoder",
+  "qoder-cn": "integrations.tab.qoderCn",
+  "workbuddy": "integrations.tab.workbuddy",
+  "workbuddy-ai": "integrations.tab.workbuddyAi",
+  t3code: "integrations.tab.t3code",
 };
 
-export default function FileIntegrationPage({
-  apiBase,
-  client,
-  active = true,
-  profileId,
-  profileLabel,
-}: {
+type FileIntegrationPageProps = {
   apiBase: string;
   client: FileIntegrationClientId;
   active?: boolean;
   profileId?: number;
   profileLabel?: string;
-}) {
+  /** A named Hermes profile (#7674); omitted for the default profile. */
+  hermesProfile?: string;
+  /** Called whenever this page re-reads its state, so a surrounding list can follow. */
+  onRefresh?: () => void;
+};
+
+export default function FileIntegrationPage(props: FileIntegrationPageProps) {
+  return <FileIntegrationControls key={JSON.stringify([props.apiBase, props.client, props.profileId, props.hermesProfile])} {...props} />;
+}
+
+function FileIntegrationControls({
+  apiBase,
+  client,
+  active = true,
+  profileId,
+  profileLabel,
+  hermesProfile,
+  onRefresh,
+}: FileIntegrationPageProps) {
   const t = useT();
-  const scopeKey = profileId === undefined ? client : `${client}:${profileId}`;
+  const scopeKey = profileId !== undefined ? `${client}:${profileId}`
+    : hermesProfile !== undefined ? `${client}/${hermesProfile}` : client;
   const [pending, setPending] = useState(false);
+  const [droidReasoningDraft, setDroidReasoningDraft] = useState<{
+    scopeKey: string;
+    values: Record<string, string>;
+  } | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<IntegrationJournalRow | null>(null);
   /* The row awaiting delete confirmation. */
@@ -128,6 +165,7 @@ export default function FileIntegrationPage({
     plan: IntegrationMutationPlan | null;
     loading: boolean;
     failure: string | null;
+    droidReasoningDefaults?: Record<string, string>;
   } | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
   const previewGenerationRef = useRef(0);
@@ -138,17 +176,17 @@ export default function FileIntegrationPage({
   }, []);
 
   const fetchState = useCallback(
-    (signal: AbortSignal) => loadIntegrationState(apiBase, client, signal, profileId),
-    [apiBase, client, profileId],
+    (signal: AbortSignal) => loadIntegrationState(apiBase, client, signal, profileId, hermesProfile),
+    [apiBase, client, profileId, hermesProfile],
   );
   const fetchHistory = useCallback(
-    async (signal: AbortSignal) => (await loadIntegrationJournal(apiBase, client, signal, profileId)).operations,
-    [apiBase, client, profileId],
+    async (signal: AbortSignal) => (await loadIntegrationJournal(apiBase, client, signal, profileId, hermesProfile)).operations,
+    [apiBase, client, profileId, hermesProfile],
   );
 
   const stateResource = useDataSurface<IntegrationStatus>(
     `integration-state:${apiBase}:${scopeKey}`,
-    [apiBase, client, profileId],
+    [apiBase, client, profileId, hermesProfile],
     fetchState,
     {
       isEmpty: () => false,
@@ -158,7 +196,7 @@ export default function FileIntegrationPage({
   );
   const historyResource = useDataSurface<IntegrationJournalRow[]>(
     `integration-journal:${apiBase}:${scopeKey}`,
-    [apiBase, client, profileId],
+    [apiBase, client, profileId, hermesProfile],
     fetchHistory,
     {
       isEmpty: rows => rows.length === 0,
@@ -169,16 +207,31 @@ export default function FileIntegrationPage({
 
   const candidate = stateResource.state.data ?? null;
   const status = candidate && (profileId === undefined
-    || (candidate.profileId === profileId && typeof candidate.enabled === "boolean")) ? candidate : null;
+    || (candidate.profileId === profileId && typeof candidate.enabled === "boolean"))
+    && candidate.hermesProfile === hermesProfile ? candidate : null;
   const history = historyResource.state.data ?? [];
 
   const refresh = () => {
     void stateResource.refresh();
     void historyResource.refresh();
+    onRefresh?.();
   };
 
-  const requestMutation = async (operation: Exclude<IntegrationPlanOperation, "restore">) => {
+  const resetDroidDraft = () => {
+    setDroidReasoningDraft(null);
+    refresh();
+  };
+
+  const requestMutation = async (
+    operation: Exclude<IntegrationPlanOperation, "restore">,
+    reasoningDefaults = client === "droid" && operation !== "disable"
+      ? (droidReasoningDraft?.scopeKey === scopeKey
+        ? droidReasoningDraft.values
+        : undefined)
+      : undefined,
+  ) => {
     if (!status || pending || plannedMutation) return;
+    const defaultsSnapshot = reasoningDefaults === undefined ? undefined : { ...reasoningDefaults };
     const controller = new AbortController();
     const generation = previewGenerationRef.current + 1;
     previewGenerationRef.current = generation;
@@ -186,10 +239,10 @@ export default function FileIntegrationPage({
     previewAbortRef.current = controller;
     setPlannedMutation({ operation, plan: null, loading: true, failure: null });
     try {
-      const plan = await previewIntegrationMutation(apiBase, client, operation, controller.signal, profileId);
+      const plan = await previewIntegrationMutation(apiBase, client, operation, controller.signal, profileId, defaultsSnapshot, hermesProfile);
       if (controller.signal.aborted || generation !== previewGenerationRef.current) return;
       previewAbortRef.current = null;
-      setPlannedMutation({ operation, plan, loading: false, failure: null });
+      setPlannedMutation({ operation, plan, loading: false, failure: null, droidReasoningDefaults: defaultsSnapshot });
     } catch (error) {
       if (controller.signal.aborted || generation !== previewGenerationRef.current) return;
       previewAbortRef.current = null;
@@ -218,9 +271,14 @@ export default function FileIntegrationPage({
         enabled: plan.operation !== "disable",
         overwriteConflict: plan.operation === "overwrite",
         profileId,
+        hermesProfile,
         binding: bindingFor(plan),
+        ...(plan.operation !== "disable" && plannedMutation?.droidReasoningDefaults !== undefined
+          ? { droidReasoningDefaults: plannedMutation.droidReasoningDefaults }
+          : {}),
       });
       setPlannedMutation(null);
+      if (client === "droid") setDroidReasoningDraft(null);
     } catch (error) {
       refresh();
       if (error instanceof IntegrationApiError && error.stalePlan) throw error;
@@ -255,18 +313,23 @@ export default function FileIntegrationPage({
     return (
       <section className="integration-client-page">
         {stateResource.state.showError
-          ? <Notice tone="err">{t("integrations.error.load")}</Notice>
+          ? (
+            <Notice tone="err">{t("integrations.error.load")}
+              <button type="button" className="btn btn-ghost btn-sm" onClick={refresh} disabled={stateResource.state.refreshing}>{t("common.retry")}</button>
+            </Notice>
+          )
           : <p className="page-sub">{t("common.loading")}</p>}
       </section>
     );
   }
 
-  const applied = status.state === "current" || status.state === "stale";
+  const removableKiloIssue = canDisableKiloWithCandidateIssue(status);
+  const applied = status.state === "current" || status.state === "stale" || removableKiloIssue;
   const enabled = profileId !== undefined ? status.enabled === true : applied;
   const profileUnavailable = profileId !== undefined && (stateResource.state.showError || stateResource.state.refreshing);
   // A profile may stop future sync even when its file cannot be changed; the
   // writer still refuses unsafe deletion and reports the actual state separately.
-  const locked = (!status.installed || status.state === "conflict" || status.state === "unsafe")
+  const locked = (!status.installed || ((status.state === "conflict" || status.state === "unsafe") && !removableKiloIssue))
     && !(profileId !== undefined && enabled);
 
   return (
@@ -277,7 +340,7 @@ export default function FileIntegrationPage({
         <IntegrationStateBadge
           state={status.state}
           installed={status.installed}
-          id={`integration-state-${client}${profileId === undefined ? "" : `-${profileId}`}`}
+          id={`integration-state-${client}${profileId === undefined ? "" : `-${profileId}`}${hermesProfile === undefined ? "" : `-${hermesProfile}`}`}
         />
         <Switch
           on={enabled}
@@ -308,14 +371,26 @@ export default function FileIntegrationPage({
         </button>
       )}
 
+      {client === "droid" && status.droidReasoning && (
+        <DroidReasoningDefaultsPanel
+          reasoning={status.droidReasoning}
+          defaults={droidReasoningDraft?.scopeKey === scopeKey
+            ? droidReasoningDraft.values
+            : status.droidReasoning.defaults}
+          disabled={pending || plannedMutation !== null}
+          onChange={values => setDroidReasoningDraft({ scopeKey, values })}
+          onReview={() => void requestMutation("apply")}
+        />
+      )}
+
       {/*
         Conflict used to be a dead end: the switch locks, the page explains why,
         and the only way forward was to open the file and edit it by hand -- which
         is the thing a user came to a dashboard to avoid. The switch stays locked
-        and this is the one way past it, behind a dialog that names the file and
-        says what is lost.
+        and this is the way past an overwriteable conflict, behind a dialog
+        that names the file and says what is lost.
       */}
-      {status.installed && status.state === "conflict" && (
+      {status.installed && status.state === "conflict" && status.reason !== "candidate-conflict" && (
         <button
           type="button"
           className="btn btn-danger"
@@ -328,8 +403,23 @@ export default function FileIntegrationPage({
 
       <p className="page-sub">{t(SEMANTICS_KEY[client])}</p>
       <p className="integration-path">{status.configPath}</p>
+      {status.reason === "candidate-conflict" && status.conflictPaths?.map(path => (
+        <Notice key={path} tone="err">{t("integrations.status.candidateConflict", { path })}</Notice>
+      ))}
       {/* Only the raycast envelope carries this; the guard is the field, not the id. */}
       {status.raycast && <RaycastPlanNotice install={status.raycast} />}
+      {/*
+        A file the client no longer opens. The badge above stays truthful about
+        the file -- our block really is where we put it -- so this is the only
+        place that can say the client has stopped reading it.
+      */}
+      {status.supersededBy && (
+        <Notice tone="err">
+          {status.supersededReason === "missing-store" && status.missingStoreDocument !== undefined
+            ? t("integrations.status.missingStore", { path: status.supersededBy, document: status.missingStoreDocument })
+            : t("integrations.status.supersededStore", { path: status.supersededBy })}
+        </Notice>
+      )}
 
       {status.appliedAt && (
         <p className="integration-meta">
@@ -367,8 +457,9 @@ export default function FileIntegrationPage({
           apiBase={apiBase}
           row={restoring}
           profileId={profileId}
+          hermesProfile={hermesProfile}
           onClose={() => setRestoring(null)}
-          onRestored={refresh}
+          onRestored={() => { if (client === "droid") resetDroidDraft(); else refresh(); }}
           onReconcile={refresh}
         />
       )}
@@ -385,7 +476,7 @@ export default function FileIntegrationPage({
           onClose={() => setDeleting(null)}
           onConfirm={async () => {
             try {
-              await deleteJournalEntry(apiBase, deleting.opId, undefined, profileId);
+              await deleteJournalEntry(apiBase, deleting.opId, undefined, profileId, hermesProfile);
             } catch (error) {
               // The requested end state is already true when another tab
               // removed this row. Reconcile the view instead of keeping a
@@ -412,6 +503,7 @@ export default function FileIntegrationPage({
           plan={plannedMutation.plan}
           planLoading={plannedMutation.loading}
           planFailure={plannedMutation.failure}
+          missingStorePath={status.supersededReason === "missing-store" ? status.supersededBy : undefined}
           onClose={closePlannedMutation}
           onConfirm={async plan => { if (plan) await mutate(plan); }}
         />

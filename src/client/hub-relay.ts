@@ -1,4 +1,5 @@
 import { stripMachineAuthHeaders } from "./machine-auth";
+import { homeUnreachableBody } from "./home-unreachable";
 
 export interface HubRelayTarget {
   managementUrl: string;
@@ -73,6 +74,11 @@ function relayError(status: number, error: string): Response {
   return Response.json({ error }, { status });
 }
 
+/** The Hub did not answer (OCX-11 `home_unreachable`); the 502 status is kept. */
+function hubUnreachable(): Response {
+  return Response.json(homeUnreachableBody("hub relay unavailable"), { status: 502 });
+}
+
 function canonicalOrigin(value: string): string | null {
   try {
     const url = new URL(value);
@@ -108,7 +114,7 @@ function relayDestination(suffix: string, target: HubRelayTarget, method: string
   return destination;
 }
 
-async function boundedBody(
+export async function readBoundedRelayRequestBody(
   stream: ReadableStream<Uint8Array> | null,
   declared: string | null,
   limit: number,
@@ -142,16 +148,20 @@ async function boundedBody(
   return body;
 }
 
-function filteredHeaders(source: Headers, allowlist: Set<string>, omitted: ReadonlySet<string> = new Set()): Headers {
+export function filterRelayHeaders(
+  source: Headers,
+  allowlist?: ReadonlySet<string>,
+  omitted: ReadonlySet<string> = new Set(),
+): Headers {
   const headers = new Headers();
   for (const [name, value] of source) {
     const normalized = name.toLowerCase();
-    if (allowlist.has(normalized) && !HOP_BY_HOP_HEADERS.has(normalized) && !omitted.has(normalized)) headers.append(name, value);
+    if ((!allowlist || allowlist.has(normalized)) && !HOP_BY_HOP_HEADERS.has(normalized) && !omitted.has(normalized)) headers.append(name, value);
   }
   return headers;
 }
 
-function headersWithinLimit(headers: Headers): boolean {
+export function headersWithinLimit(headers: Headers): boolean {
   let bytes = 0;
   for (const [name, value] of headers) {
     bytes += name.length + value.length + 4;
@@ -160,7 +170,7 @@ function headersWithinLimit(headers: Headers): boolean {
   return true;
 }
 
-function boundedRelayResponseStream(
+export function boundedRelayResponseStream(
   body: ReadableStream<Uint8Array>,
   limit: number,
   signal: AbortSignal,
@@ -228,13 +238,13 @@ export async function relayHubManagementRequest(
   try {
     body = method === "GET" || method === "HEAD"
       ? null
-      : await boundedBody(req.body, req.headers.get("content-length"), HUB_RELAY_REQUEST_BODY_MAX_BYTES);
+      : await readBoundedRelayRequestBody(req.body, req.headers.get("content-length"), HUB_RELAY_REQUEST_BODY_MAX_BYTES);
   } catch {
     return relayError(413, "hub relay request body too large");
   }
 
   const stripped = stripMachineAuthHeaders(req.headers);
-  const headers = filteredHeaders(stripped, REQUEST_HEADERS, requestHeaderValidation.connectionNamed);
+  const headers = filterRelayHeaders(stripped, REQUEST_HEADERS, requestHeaderValidation.connectionNamed);
   if (!headersWithinLimit(headers)) return relayError(431, "hub relay request headers too large");
   const browserOrigin = canonicalOrigin(target.browserOrigin);
   const mutation = method !== "GET" && method !== "HEAD";
@@ -271,12 +281,12 @@ export async function relayHubManagementRequest(
     });
   } catch {
     cleanup();
-    return relayError(502, "hub relay unavailable");
+    return hubUnreachable();
   }
   if (signal.aborted) {
     cleanup();
     try { await upstream.body?.cancel(); } catch { /* best effort */ }
-    return relayError(502, "hub relay unavailable");
+    return hubUnreachable();
   }
   if (upstream.status >= 300 && upstream.status < 400) {
     cleanup();
@@ -285,7 +295,7 @@ export async function relayHubManagementRequest(
   }
 
   const responseConnectionNamed = new Set((upstream.headers.get("connection") ?? "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean));
-  const responseHeaders = filteredHeaders(upstream.headers, RESPONSE_HEADERS, responseConnectionNamed);
+  const responseHeaders = filterRelayHeaders(upstream.headers, RESPONSE_HEADERS, responseConnectionNamed);
   if (!headersWithinLimit(responseHeaders)) {
     cleanup();
     try { await upstream.body?.cancel(); } catch { /* best effort */ }

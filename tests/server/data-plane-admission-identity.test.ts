@@ -6,6 +6,7 @@ import {
   requireResponsesApiAuth,
   resolveApiAuth,
   resolveContextPrincipal,
+  resolveDurableReplayPrincipal,
   resolveDataPlaneAdmissionSecret,
   resolveResponsesApiAuth,
 } from "../../src/server/auth-cors";
@@ -284,17 +285,27 @@ describe("the Responses WebSocket handshake", () => {
           headers: { "X-OpenCodex-API-Key": "ocx_data_secondsecret" },
         } as unknown as string[]);
         let settled = false;
+        let opened = false;
+        let failed = false;
         const finish = (value: boolean) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          try { socket.close(); } catch { /* already closed */ }
           resolve(value);
         };
-        socket.addEventListener("open", () => finish(true));
-        socket.addEventListener("error", () => finish(false));
-        socket.addEventListener("close", () => finish(false));
-        const timer = setTimeout(() => finish(false), 5_000);
+        socket.addEventListener("open", () => {
+          opened = true;
+          try { socket.close(); } catch { finish(false); }
+        });
+        socket.addEventListener("error", () => {
+          failed = true;
+          try { socket.close(); } catch { finish(false); }
+        });
+        socket.addEventListener("close", () => finish(opened && !failed));
+        const timer = setTimeout(() => {
+          try { socket.close(); } catch { /* already closed */ }
+          finish(false);
+        }, 5_000);
       });
       // The handshake now branches on the resolver rather than the boolean
       // wrapper, so this pins that the rewrite did not change who gets in.
@@ -330,4 +341,30 @@ describe("the Responses WebSocket handshake", () => {
   // its purpose and is gone: phase 3 is what adds them, and a guard that must be
   // deleted by the next commit is a scheduling note, not a test. What survives is
   // the payload assertion above, which stays true regardless of who consumes it.
+});
+
+
+describe("durable structural replay principal", () => {
+  const signing = new Uint8Array(32).fill(17);
+  test("same verified local credential has stable scope, independent of process principal", () => {
+    const config=loopbackConfig(), req=request({"x-opencodex-api-key":"ocx_data_firstsecret"});
+    const first=resolveDurableReplayPrincipal(req, config, {kind:"loopback",source:"loopback"}, signing);
+    expect(first).toBeDefined();
+    expect(resolveDurableReplayPrincipal(req, config, {kind:"configured",source:"dedicated",keyId:"first-key",contextPrincipalId:"different-process-principal"}, signing)).toBe(first);
+    expect(first).not.toContain("ocx_data_firstsecret");
+  });
+  test("missing admission, wrong key, keyless loopback and mismatched named admission refuse scope", () => {
+    const config=loopbackConfig(), req=request({"x-opencodex-api-key":"ocx_data_firstsecret"});
+    expect(resolveDurableReplayPrincipal(req, config, undefined, signing)).toBeUndefined();
+    expect(resolveDurableReplayPrincipal(request(), config, {kind:"loopback",source:"loopback"}, signing)).toBeUndefined();
+    expect(resolveDurableReplayPrincipal(request({"authorization":"Bearer upstream-only"}),config,{kind:"loopback",source:"loopback"},signing)).toBeUndefined();
+    expect(resolveDurableReplayPrincipal(req,config,{kind:"configured",source:"dedicated",keyId:"second-key"},signing)).toBeUndefined();
+    expect(resolveDurableReplayPrincipal(req,config,{kind:"loopback",source:"loopback"},new Uint8Array(31))).toBeUndefined();
+  });
+  test("explicit credential or signing-key rotation changes structural ownership", () => {
+    const config=loopbackConfig(), admission={kind:"loopback",source:"loopback"} as const;
+    const first=resolveDurableReplayPrincipal(request({"x-opencodex-api-key":"ocx_data_firstsecret"}),config,admission,signing);
+    expect(resolveDurableReplayPrincipal(request({"x-opencodex-api-key":"ocx_data_secondsecret"}),config,admission,signing)).not.toBe(first);
+    expect(resolveDurableReplayPrincipal(request({"x-opencodex-api-key":"ocx_data_firstsecret"}),config,admission,new Uint8Array(32).fill(18))).not.toBe(first);
+  });
 });

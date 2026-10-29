@@ -1,42 +1,53 @@
 import { formatErrorResponse } from "../bridge";
 import {
   CodexAccountCooldownError,
+  CodexAuthContextError,
   CodexMainProfileDrainingError,
   codexMainProfileDrainingResponse,
   cooldownErrorResponse,
   isCodexAuthContextUsable,
-  materializeCodexUpstreamAuth,
+  materializeCodexUpstreamAuthAsync,
   releaseCodexAuthContextProbeLease,
   resolveCodexAuthContext,
   type CodexAuthContext,
 } from "../codex/auth-context";
+import { MAIN_CODEX_ACCOUNT_ID, MainAccountTokenRefreshError, MainAuthJsonChangedDuringRefreshError } from "../codex/main-account";
+import { NativeProfileError } from "../codex/native-profile-types";
 import { formatCodexProviderForLog } from "../codex/routing";
 import type { AdmissionLease } from "../lib/admission";
 import { captureExplicitOpenAiCallerAuth, resolveFirstUsableOpenAiSidecar, selectOpenAiImagesProvider } from "../providers/openai-sidecar";
 import type { OcxConfig } from "../types";
+import { admissionScopeDenial } from "./admission-model-scope";
 import {
   isProxyAdmissionSecret,
   resolveDataPlaneAdmissionSecret,
   validateForwardAdmissionCredential,
   type DataPlaneAdmission,
+  type DataPlaneAdmissionOptions,
 } from "./auth-cors";
 import { codexAccountSelectionForTurn } from "./lifecycle";
 import type { RequestLogContext } from "./request-log";
+import { authorizationCredential } from "../lib/authorization-scheme";
+import { nativeMainRefreshFailureResponse } from "./responses/codex-auth-error";
 
 export const TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 export const LIVE_AUDIO_MODEL = "gpt-live-1-codex";
 
 /** Audio keys remain identifiable even on the otherwise unauthenticated local listener. */
-export function resolveAudioAdmission(headers: Headers, config: OcxConfig): DataPlaneAdmission | null {
+export function resolveAudioAdmission(
+  headers: Headers,
+  config: OcxConfig,
+  options: DataPlaneAdmissionOptions = {},
+): DataPlaneAdmission | null {
   const dedicated = headers.get("x-opencodex-api-key")?.trim();
-  if (dedicated) return resolveDataPlaneAdmissionSecret(dedicated, config, "dedicated");
+  if (dedicated) return resolveDataPlaneAdmissionSecret(dedicated, config, "dedicated", options);
   const authorization = headers.get("authorization")?.trim();
   if (authorization) {
     const token = /^Bearer\s+([^\s,]+)$/i.exec(authorization)?.[1];
-    return token ? resolveDataPlaneAdmissionSecret(token, config, "bearer") : null;
+    return token ? resolveDataPlaneAdmissionSecret(token, config, "bearer", options) : null;
   }
   const key = headers.get("x-api-key")?.trim();
-  return key ? resolveDataPlaneAdmissionSecret(key, config, "x-api-key") : null;
+  return key ? resolveDataPlaneAdmissionSecret(key, config, "x-api-key", options) : null;
 }
 
 export interface AudioUpstream {
@@ -71,7 +82,7 @@ export async function resolveAudioUpstream(
     if (candidates.keyed?.providerName !== options.providerName) delete candidates.keyed;
   }
   const headers = new Headers(incoming);
-  const bearer = headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+  const bearer = authorizationCredential(headers);
   if (bearer && isProxyAdmissionSecret(bearer, config)) {
     headers.delete("authorization");
     headers.delete("chatgpt-account-id");
@@ -96,10 +107,11 @@ export async function resolveAudioUpstream(
           signal: options.signal,
         });
         options.signal?.throwIfAborted();
-        selected = materializeCodexUpstreamAuth(headers, context, {
+        selected = await materializeCodexUpstreamAuthAsync(headers, context, {
           config,
           admission: options.admission,
           substituteMainCredential: true,
+          signal: options.signal,
         });
       } else {
         const resolved = await resolveFirstUsableOpenAiSidecar(candidates.forwardCandidates, headers, config, {
@@ -119,6 +131,18 @@ export async function resolveAudioUpstream(
         return formatErrorResponse(401, "authentication_error", "Selected audio account is unavailable");
       }
       validateForwardAdmissionCredential(selected, config);
+      // Every audio surface — file transcription, the dictation socket, voice
+      // call-create and the sideband join — resolves its upstream here, and
+      // `options.model` is the model that upstream will run, not a selector the
+      // caller can rewrite afterwards. One check therefore covers all of them.
+      const forwardDenial = admissionScopeDenial(config, options.admission, options.model, {
+        providerName: candidate.providerName,
+        modelId: options.model,
+      });
+      if (forwardDenial) {
+        releaseCodexAuthContextProbeLease(context);
+        return forwardDenial;
+      }
       log.provider = formatCodexProviderForLog(candidate.providerName, context.accountId, config);
       log.model = options.model;
       return {
@@ -136,6 +160,11 @@ export async function resolveAudioUpstream(
       const selected = new Headers(provider.headers);
       selected.set("authorization", `Bearer ${apiKey}`);
       validateForwardAdmissionCredential(selected, config);
+      const keyedDenial = admissionScopeDenial(config, options.admission, options.model, {
+        providerName,
+        modelId: options.model,
+      });
+      if (keyedDenial) return keyedDenial;
       log.provider = providerName;
       log.model = options.model;
       return {
@@ -148,6 +177,9 @@ export async function resolveAudioUpstream(
     releaseCodexAuthContextProbeLease(context);
     if (error instanceof CodexAccountCooldownError) return cooldownErrorResponse(error);
     if (error instanceof CodexMainProfileDrainingError) return codexMainProfileDrainingResponse();
+    const mainCause = error instanceof CodexAuthContextError && error.accountId === MAIN_CODEX_ACCOUNT_ID ? error.cause : error;
+    if (mainCause instanceof MainAccountTokenRefreshError || mainCause instanceof MainAuthJsonChangedDuringRefreshError
+      || (mainCause instanceof NativeProfileError && mainCause.retryable)) return nativeMainRefreshFailureResponse(mainCause);
     return formatErrorResponse(401, "authentication_error", "Audio account authentication unavailable; reconnect the selected OpenAI account");
   }
 }

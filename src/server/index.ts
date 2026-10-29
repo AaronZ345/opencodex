@@ -1,6 +1,8 @@
 import { remoteWorkspaceEnabled } from "../remote-control/workspace-activation";
+import { scheduleDesktopCompatibilityStartup } from "./index/desktop-compatibility-startup";
 import { AuxiliaryListenerBindError } from "./ports";
-import { runAdmittedBodyWork } from "./inbound-body-admission";
+import { normalizeBindHostname } from "./bind-host";
+import { configureInboundBodyBudget, runAdmittedBodyWork } from "./inbound-body-admission";
 import {
   buildWarmupCompletionFrames,
   buildWsErrorFrame,
@@ -23,7 +25,8 @@ import {
   loopbackCompanionBindError,
   websocketsEnabled,
 } from "../config";
-import { flushConfigDirHardening } from "../config/paths";
+import { flushConfigDirHardeningAndReaps } from "../config/paths";
+import { trackBackgroundWork } from "../lib/background-work";
 import { migrateStartupSubagentModels } from "./subagent-models-startup";
 import { migrateStartupXaiResponses } from "./xai-responses-startup";
 import { migrateStartupZaiResponses } from "./zai-responses-startup";
@@ -61,6 +64,8 @@ import {
   registerDefaultAppOwnedObservedBuffers,
 } from "../lib/app-owned-memory-stores";
 import { acquireServerBackgroundLifecycle } from "./background-lifecycle";
+import { startPackageRefresh, stopPackageRefresh } from "../update/refresh-scheduler";
+import { activateAdvisor } from "../lib/advisor-activation";
 import { activateLab, labActivationRequired } from "../lib/lab-activation";
 import { runOpenAiTierStartupMigration } from "../providers/openai-tier-startup";
 import { runAlibabaRegionStartupMigration } from "../providers/alibaba-region-startup";
@@ -69,11 +74,6 @@ import { runDevinProviderMergeStartupMigration } from "../providers/devin-provid
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { StorageCleanupPolicy } from "../types";
-import {
-  MAX_CONFIGURABLE_INBOUND_BODY_BYTES,
-  MIN_CONFIGURABLE_INBOUND_BODY_BYTES,
-  resolveInboundBodyLimitBytes,
-} from "./request-decompress";
 import { MAIN_CODEX_ACCOUNT_ID } from "../codex/main-account";
 export {
   clearThreadAccountMap,
@@ -83,6 +83,7 @@ export {
 import { resolveGuiFilePath, rootFallbackPayload, serveGuiFile, serveSessionBootstrap } from "./gui-static";
 export { resolveGuiFilePath, rootFallbackPayload } from "./gui-static";
 export { resolveAdapter } from "./adapter-resolve";
+export { noteExplicitShutdownRequested } from "./management/system-restart";
 import { formatErrorResponse, type ResponsesTerminalStatus } from "../bridge";
 import {
   drainAndShutdown,
@@ -116,10 +117,11 @@ import {
   type RequestLogEntry,
 } from "./request-log";
 import { sessionLaneIdFromRequest } from "./request-log-conversation";
+import { setUsageLedgerRetention } from "./usage-ledger-retention";
 import { admitHttpWorkflowTurn, workflowDecisionRefusalResponse, type WorkflowRefusalLog } from "./workflow-refusal";
 export {
   addFinalRequestLog,
-  filterRequestLogs,
+  filterRequestLogs, queryRequestLogs,
   hydrateRequestLogsFromDisk,
   httpStatusForTerminalStatus,
   httpStatusFromTerminalError,
@@ -197,19 +199,18 @@ import {
   createLocalAttestationSecret,
 } from "../lib/local-management-attestation";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
-import {
-  createRuntimePackageTreeIntegrityGuard,
-  type PackageTreeIntegrityGuard,
-} from "../lib/package-tree-integrity";
-import { detectInstall } from "../update/index";
 import { createServeOptions, type ServerIngress } from "./index/serve-options";
-import { inspectStartupOwnership, setStartupCacheInvalidationWrite, warnAgentTaskRecoveryStartup, warnPlaintextV2AgentMessagesStartup, type StartServerDeps } from "./index/startup-warnings";
-import { acquireSpendLedgerServerLifecycle, type SpendLedgerServerLifecycle } from "./index/spend-ledger-lifecycle";
+import { createOptionalListenerSet, LINK_INGRESS_HOSTNAME } from "./index/optional-listeners";
+import { createPackageTreeIntegrityGuardForServer } from "./index/package-tree-guard";
+import { inspectStartupOwnership, logProxyEndpoints, resolveInboundBodyLimitWithWarning, setStartupCacheInvalidationWrite, warnAgentTaskRecoveryStartup, warnPlaintextV2AgentMessagesStartup, type StartServerDeps } from "./index/startup-warnings";
+import { acquireSpendLedgerServerLifecycle, recordFailedStartRollback, type SpendLedgerServerLifecycle } from "./index/spend-ledger-lifecycle";
+import { withLocalCredentialObservation } from "../local-credentials/runtime-observation";
+export { waitForFailedStartRollback } from "./index/spend-ledger-lifecycle";
 
 export function startServer(port?: number, deps: StartServerDeps = {}): Server<WsData> {
   const spendLedgerLifecycle = acquireSpendLedgerServerLifecycle(getConfigDir());
-  try { return startServerWithSpendLedgerOwner(port, deps, spendLedgerLifecycle); }
-  catch (error) { spendLedgerLifecycle.releaseAfterFailedStart(); throw error; }
+  try { return withLocalCredentialObservation(() => startServerWithSpendLedgerOwner(port, deps, spendLedgerLifecycle)); }
+  catch (error) { recordFailedStartRollback(error, spendLedgerLifecycle.releaseAfterFailedStart()); throw error; }
 }
 
 function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartServerDeps, spendLedgerLifecycle: SpendLedgerServerLifecycle): Server<WsData> {
@@ -257,10 +258,10 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   const resolveServiceHomes = deps.resolveServiceHomes ?? currentServiceHomes;
   let startupOwnershipHomes: ReturnType<typeof currentServiceHomes> | null = null;
   let startupOwnershipStatePaths: readonly string[] | null = null;
-  // #2923: both synchronous startup ownership decisions keep their fresh,
-  // race-sensitive targeted task query. Only the expensive fallback listing is
-  // shared, and only while that targeted result stays byte-for-byte unchanged.
-  // Runtime ownership retries below intentionally omit this startup-local memo.
+  // #2923: retain a successful fallback listing only within the first startup
+  // ownership decision. A targeted query's bytes are not a Task Scheduler state
+  // generation, so the later race-sensitive decision must take a fresh listing.
+  // Runtime ownership retries below intentionally omit this startup-local memo too.
   const startupWindowsTaskListingCache = createWindowsTaskListingCache();
   try {
     const homes = resolveServiceHomes();
@@ -268,24 +269,24 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     startupOwnershipHomes = homes;
     startupOwnershipStatePaths = statePaths;
   } catch { /* inspection below stays unknown */ }
-  const startupCacheOwnership = inspectStartupOwnership(
+  const startupCacheOwnership = shouldSyncCodexOnStart(config) ? inspectStartupOwnership(
     deps,
     startupOwnershipHomes,
     startupOwnershipStatePaths,
     startupWindowsTaskListingCache,
-  );
+  ) : null;
   // Startup cache invalidation is best-effort and applies only when startup sync is enabled.
   // Check OFF before taking K: on Windows K resolves SID + LocalAppData through PowerShell,
   // and run 35093667426 exceeded healthy controls by 33.8 s against that 30 s child budget.
   // The permit callback still re-reads intent under K to close a concurrent disable race.
-  if (shouldSyncCodexOnStart(config) && startupCacheOwnership.ownership === "owned" && startupOwnershipHomes !== null) {
+  if (startupCacheOwnership?.ownership === "owned" && startupOwnershipHomes !== null) {
     try {
       const startupCodexHome = startupOwnershipHomes.codexHome;
       // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
       // with the later startup sync and warns ONCE about stale app-servers; warning
       // here instead would read a catalog mtime the sync is about to move.
       const outcome = withCatalogWriteSerialization(startupCodexHome, permit =>
-        invalidateCodexModelsCacheWithPermit(permit, startupCodexHome));
+        invalidateCodexModelsCacheWithPermit(permit, startupCodexHome), { intent: "cache", writer: "startup-cache" });
       // A refused permit is not a write; only a completed run that returned true is.
       setStartupCacheInvalidationWrite(outcome.kind === "completed" && outcome.value === true);
     } catch { /* no readable Codex home: nothing to invalidate */ }
@@ -306,7 +307,10 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(config.appOwnedMemoryBudgetMb));
   enforceAppOwnedMemoryBudget();
   // Observe-only mode still journals physical sends, so every server owns before configuring.
-  spendLedgerLifecycle.configure(config.spend);
+  spendLedgerLifecycle.configure(config.spend, config.spendPoolAliases, Object.keys(config.providers));
+  // After ownership: a second server on the same home is refused above, so the process running
+  // this line is the only one appending to usage.jsonl and the only one that may compact it.
+  setUsageLedgerRetention(config.usageLedgerMaxBytes);
   registerCodexCooldownRecoveryProbeWorker(config);
   // Issue #42 Phase 3: opt-in archived auto-cleanup (default OFF). Unref'd hourly
   // tick for daily/weekly; startup evaluation is fire-and-forget after listen.
@@ -319,12 +323,12 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   const listenPort = port ?? config.port ?? 10100;
   setCorsOrigin(listenPort);
 
-  // Canonicalize an explicit "localhost" bind to IPv4 so it matches the injected base_url (which
+  // Canonicalize an explicit "localhost" bind (including its fully-qualified spelling) to IPv4
+  // so it matches the injected base_url (which
   // resolves localhost→127.0.0.1): on Windows `localhost` resolves ::1-first, but the injected URL
   // is 127.0.0.1, so binding literal "localhost" would reintroduce the F4 refusal. Wildcards
   // (0.0.0.0/::) and specific hosts are left untouched so intentional exposure is preserved.
-  const configuredHost = config.hostname?.trim();
-  const bindHost = !configuredHost || /^localhost$/i.test(configuredHost) ? "127.0.0.1" : configuredHost;
+  const bindHost = normalizeBindHostname(config.hostname);
 
   // Unauthenticated loopback listener (#1102). Off unless explicitly enabled.
   // A port-less enabled entry is the companion form: same port as the public listener, on
@@ -463,21 +467,19 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     return serveGuiFile(rawPath) !== null;
   }
 
-  // Codex treats empty / non-JSON 503 bodies as "Unknown error" (#452). Keep Retry-After and
-  // the server_is_overloaded code so clients can back off, but always return a JSON envelope.
-  // These two run BEFORE the auth/origin checks, so they need the receiving listener's policy
-  // explicitly (#1102). Reaching for the shared `config` here would attach public-policy CORS
-  // headers to a 503 on the loopback listener — no model runs and no credential is spent, but
-  // it is the one error path that would answer a rebinding origin with its own origin echoed
-  // back.
+  // Codex maps 503 + server_is_overloaded to ServerOverloaded ("model at capacity"), retried
+  // only with retry advice that older clients ignore (#6642); server_restarting is a
+  // retryable UnexpectedStatus in every version and never reads as model capacity.
+  // Keep JSON (empty / non-JSON 503 means "Unknown error", #452) and Retry-After.
+  // Drain and busy run BEFORE auth/origin checks: use the receiving listener's policy
+  // (#1102), because shared public `config` could echo a rebinding origin on loopback.
   function drainingResponse(req: Request, policy: RequestPolicyView): Response {
-    const response = formatErrorResponse(503, "server_error", "Service shutting down");
-    const headers = new Headers(response.headers);
-    for (const [name, value] of Object.entries(corsHeaders(req, policy))) {
-      headers.set(name, value);
-    }
-    headers.set("Retry-After", "5");
-    return new Response(response.body, { status: 503, headers });
+    return withCors(new Response(JSON.stringify({
+      error: { type: "server_error", code: "server_restarting", message: "OpenCodex is restarting; retry this request." },
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json", "Retry-After": "5" },
+    }), req, policy);
   }
 
   function serverBusyResponse(req: Request, resource: string, policy: RequestPolicyView): Response {
@@ -504,26 +506,26 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     work: (lease: ActiveTurnLease) => Promise<Response>,
     refusalLog?: WorkflowRefusalLog,
   ): Promise<Response> {
-    const lease = tryAdmitTurn(sessionLaneIdFromRequest(req.headers));
+    const lease = tryAdmitTurn(sessionLaneIdFromRequest(req.headers), req.signal);
     if (!lease) return serverBusyResponse(req, "active turns", policy);
     // Root, lane, and the refusal that follows from them, all live in ./workflow-refusal.
-    const workflow = admitHttpWorkflowTurn(req.headers);
+    let workflow: ReturnType<typeof admitHttpWorkflowTurn>;
+    try { workflow = admitHttpWorkflowTurn(req.headers); }
+    catch (error) { lease.release(); throw error; }
     if (workflow && !workflow.admitted) {
       lease.release();
       // withCors, because without Access-Control-Allow-Origin the exposed refusal header is
       // still unreadable to a browser dashboard -- which made exposing it pointless.
       return withCors(workflowDecisionRefusalResponse(workflow, undefined, refusalLog), req, policy);
     }
-    const releaseWorkflow = (): void => { if (workflow?.admitted) workflow.lease.release(); };
+    if (workflow?.admitted) lease.attach(workflow.lease);
     let response: Response;
     try {
       response = await runAdmittedBodyWork(req, policy, config.maxInboundBodyBytes, () => work(lease), refusalLog);
     } catch (error) {
-      releaseWorkflow();
       lease.release();
       throw error;
     }
-    releaseWorkflow();
     if (!lease.isTransferred()) {
       lease.release();
     }
@@ -536,8 +538,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   // passes it in, and transitions it after the post-startup sync settles. When
   // no gate is supplied (tests, ad-hoc starts) a fresh pending gate is created.
   const readinessGate = deps.readinessGate ?? createReadinessGate();
-  const packageTreeIntegrity = deps.packageTreeIntegrity
-    ?? createRuntimePackageTreeIntegrityGuard(detectInstall());
+  const packageTreeIntegrity = createPackageTreeIntegrityGuardForServer(deps);
   // Actual bound port, filled in after Bun.serve binds so /readyz reports the
   // real ephemeral port for startServer(0). /healthz keeps its existing port
   // field (the requested listenPort) byte-for-byte.
@@ -549,13 +550,12 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   // clients; no Codex request can use this lifecycle in that state.
   // Re-probe here instead of trusting the earlier cache decision: startup work
   // between the two sites must not widen the service-install race.
-  const nativeOwnership = inspectStartupOwnership(
+  const nativeOwnership = shouldSyncCodexOnStart(config) ? inspectStartupOwnership(
     deps,
     startupOwnershipHomes,
     startupOwnershipStatePaths,
-    startupWindowsTaskListingCache,
-  );
-  const preparedNativeMainLifecycle = nativeOwnership.ownership !== "foreign"
+  ) : null;
+  const preparedNativeMainLifecycle = nativeOwnership !== null && nativeOwnership.ownership !== "foreign"
     && startupOwnershipHomes !== null
     ? prepareNativeMainStartupLifecycle(
       deps.nativeMainStartup,
@@ -601,7 +601,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       return retryPreparedNativeMainLifecycle.start();
     },
   };
-  const nativeMainLifecycle: NativeMainStartupLifecycle = shouldSyncCodexOnStart(config)
+  const nativeMainLifecycle: NativeMainStartupLifecycle = nativeOwnership !== null
     ? nativeOwnership.ownership === "owned"
       ? preparedNativeMainLifecycle
         ? preparedNativeMainLifecycle.start()
@@ -627,36 +627,29 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   let server: Server<WsData>;
   let loopbackServer: Server<WsData> | null = null;
   let managementIngressServer: Server<WsData> | null = null;
-
-  // Resolved once, before any listener binds. The clamp is silent inside the resolver so it
-  // stays pure and per-request cheap; the operator is told here instead, once, because a
-  // config value that was quietly reduced is exactly the thing they would otherwise debug
-  // against the wrong limit.
-  const inboundBodyLimitBytes = resolveInboundBodyLimitBytes(config.maxInboundBodyBytes);
-  const requestedInboundBodyLimit = config.maxInboundBodyBytes;
-  if (requestedInboundBodyLimit !== undefined
-    && requestedInboundBodyLimit > 0
-    && requestedInboundBodyLimit !== inboundBodyLimitBytes) {
-    console.warn(
-      `[server] maxInboundBodyBytes=${requestedInboundBodyLimit} is outside the supported range `
-      + `[${MIN_CONFIGURABLE_INBOUND_BODY_BYTES}, ${MAX_CONFIGURABLE_INBOUND_BODY_BYTES}]; `
-      + `using ${inboundBodyLimitBytes} bytes.`,
-    );
-  }
+  const optionalListeners = createOptionalListenerSet<WsData>();
+  const inboundBodyLimitBytes = resolveInboundBodyLimitWithWarning(config);
 
   function ingressForServer(requestServer: Server<WsData>): ServerIngress {
+    const optionalIngress = optionalListeners.ingressOf(requestServer);
+    if (optionalIngress !== undefined) return optionalIngress;
     if (requestServer === loopbackServer) return "unauthenticated-loopback";
     if (requestServer === managementIngressServer) return "hub-management";
     return "public";
   }
+  const linkPolicy = (): RequestPolicyView => requestPolicyView(config, LINK_INGRESS_HOSTNAME, { allowedKeyIds: optionalListeners.linkAdmissionKeyIds() });
   let backgroundLifecycle: ReturnType<typeof acquireServerBackgroundLifecycle> | null = null;
   let unregisterQuotaAutoRefresh: (() => void) | null = null;
   let remoteWorkspaceStopping = false;
   let remoteWorkspaceShutdown: (() => Promise<void>) | undefined;
+  let desktopCompatibilityStartup: ReturnType<typeof scheduleDesktopCompatibilityStartup> | undefined;
+  let desktopCompatibilityShutdown: (() => Promise<void>) | undefined;
   const managementApiDeps: ManagementApiDeps = {
     ...deps.managementApi,
+    listLowQuotaEvents: limit => backgroundLifecycle?.listLowQuotaEvents(limit) ?? [],
     remoteWorkspaceStopping: () => remoteWorkspaceStopping,
-    onRemoteWorkspaceShutdown: shutdown => { remoteWorkspaceShutdown = shutdown; },
+    onRemoteWorkspaceShutdown: shutdown => { remoteWorkspaceShutdown = shutdown; }, linkSupervisor: () => optionalListeners.linkSupervisor(), linkListener: () => optionalListeners,
+    onDesktopCompatibilityShutdown: shutdown => { desktopCompatibilityShutdown = shutdown; },
   };
   let workspaceRuntimeFlight: Promise<typeof import("../remote-control/workspace-runtime")> | undefined;
   const loadRemoteWorkspaceRuntime = () => {
@@ -670,19 +663,17 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     return workspaceRuntimeFlight;
   };
   try {
-    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
+    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy, config);
     unregisterQuotaAutoRefresh = (deps.registerCodexQuotaAutoRefreshWorker
       ?? registerCodexQuotaAutoRefreshWorker)(config);
-    // External `ocx config set` / direct config.json edits run in other
-    // processes; poll the file so Logs/Usage display prices follow them live.
-    // Started inside the guarded startup transaction so the catch below can
-    // release the owner-scoped lease on any listener failure.
+    // Poll external pricing edits; the startup catch releases this owner-scoped lease.
     userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = createServeOptions({
       drainingResponse,
       ingressForServer,
       loopbackRouteAllowed,
       managementIngressRouteAllowed,
+      linkRouteAllowed: optionalListeners.linkRouteAllowed, linkPolicy, onAuthenticatedCatalog: optionalListeners.notifyAuthenticatedCatalog,
       packageTreeChangedResponse,
       serverBusyResponse,
       runAdmittedHttpTurn,
@@ -706,7 +697,6 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     });
 
     server = spendLedgerLifecycle.track(Bun.serve<WsData>({ ...serveOptions, port: listenPort, hostname: bindHost }));
-
     // Both binds are one startup transaction (#1102). If the loopback bind fails after the
     // public one succeeded, leaving the public listener up would strand it: the CLI's port
     // retry would read the failure as a public-port conflict and pick a different port,
@@ -748,6 +738,9 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
         throw new AuxiliaryListenerBindError("hub.managementIngress", managementIngressPort, "127.0.0.1", error);
       }
     }
+    configureInboundBodyBudget(config.maxConcurrentInboundBodyBytes);
+    optionalListeners.start({ config, publicPort: server.port ?? listenPort, requestedPort: listenPort, startProxy: deps.startClaudeInterceptProxy,
+      maxRequestBodySize: inboundBodyLimitBytes, dispatch: (req, requestServer) => serveOptions.fetch(req, requestServer) });
   } catch (error) {
     unregisterQuotaAutoRefresh?.();
     userCostOverlayReconciler?.stop();
@@ -760,11 +753,19 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   const nativeStop = server.stop.bind(server);
   const loopbackListenerRef = loopbackServer;
   const managementIngressRef = managementIngressServer;
+  let packageRefreshStopped = false;
   Object.defineProperty(server, "stop", {
     configurable: true,
     value: async (closeActiveConnections?: boolean): Promise<void> => {
+      backgroundLifecycle?.revokeClientFanout();
       remoteWorkspaceStopping = true;
       liveCallBindings.clear();
+      // Disarm the package-tree restart timer before teardown can schedule another restart.
+      if (!packageRefreshStopped) {
+        packageRefreshStopped = true;
+        stopPackageRefresh();
+      }
+      packageTreeIntegrity.dispose();
       // The orchestration lives in `runListenerShutdown` so its two competing properties —
       // cleanup completes, failure propagates — are testable without a live socket.
       await runListenerShutdown(
@@ -776,7 +777,9 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
           ...(managementIngressRef
             ? [() => managementIngressRef.stop(closeActiveConnections)]
             : []),
+          () => optionalListeners.stop(),
           async () => { await remoteWorkspaceShutdown?.(); },
+          async () => { await desktopCompatibilityStartup?.shutdown(); await desktopCompatibilityShutdown?.(); },
           async () => {
             try {
               userCostOverlayReconciler?.stop();
@@ -785,17 +788,17 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
             }
           },
         ],
-        async () => {
+        async listenersStopped => {
           try {
             await backgroundLifecycle.release();
             await releaseNativeMainStartupLifecycle(server);
           } finally {
-            // icacls.exe from hardenConfigDir() holds the config dir open; a caller that
-            // removes the dir right after stop() settles would hit EPERM/EBUSY on Windows
-            // otherwise. Runs even when an earlier release rejected — that rejection still
-            // propagates, but not before the child is drained.
-            try { spendLedgerLifecycle.release(); }
-            finally { await flushConfigDirHardening(startupConfigDir); }
+            // icacls.exe from hardenConfigDir() holds the config dir open. The caller-facing
+            // hardening deadline can settle before its child exits, so also wait for that
+            // child's reap before stop() promises the directory is removable. The spend owner
+            // is retained when a listener stop failed because the socket may live.
+            try { if (listenersStopped) spendLedgerLifecycle.release(); }
+            finally { await flushConfigDirHardeningAndReaps(startupConfigDir); }
           }
         },
       );
@@ -806,13 +809,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   boundPort = actualPort;
   setCorsOrigin(actualPort);
 
-  console.log(`🚀 opencodex proxy running on http://localhost:${actualPort}`);
-  console.log(`   POST /v1/responses → provider translation`);
-  console.log(`   POST /v1/chat/completions → OpenAI-compatible clients`);
-  console.log(`   GET  /healthz      → health check`);
-  console.log(`   GET  /api/*        → management API`);
-  console.log(`   GET  /             → GUI dashboard`);
-
+  logProxyEndpoints(actualPort);
   if (loopbackServer) {
     // Loud on every start, not once at enable time. An operator who inherits a config, or
     // who forgot, has to be able to see that an unauthenticated surface is live without
@@ -848,7 +845,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     && isCanonicalOpenAiForwardProvider(openAiProvider)
     && providerCodexAccountMode("openai", openAiProvider) === "pool"
   ) {
-    import("../codex/plan-from-token")
+    void trackBackgroundWork("codex-pool-quota-prime-startup", import("../codex/plan-from-token")
       .then(({ reconcileCodexPlansFromTokens }) => {
         try {
           reconcileCodexPlansFromTokens(config);
@@ -858,7 +855,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
         return import("../codex/auth-api");
       })
       .then(({ primeCodexPoolQuotas }) => primeCodexPoolQuotas(config, "startup"))
-      .catch(() => {});
+      .catch(() => {}));
   }
 
   // Opt-in storage policy (default OFF). Never blocks listen; cancellable on shutdown.
@@ -869,6 +866,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   // startServer returns, in the same turn as Bun.serve, so a policy route can never be
   // evaluated before its evidence provider is registered. That ordering is load-bearing:
   // the subagent-fallback chain routes synchronously and has nowhere to await.
+  activateAdvisor(config);
   const labConfigDir = getConfigDir();
   if (labActivationRequired(config, labConfigDir)) {
     activateLab(config, labConfigDir);
@@ -883,6 +881,8 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     });
   }
 
+  startPackageRefresh();
+  desktopCompatibilityStartup = scheduleDesktopCompatibilityStartup(config, { boundHostname: bindHost, boundPort: actualPort, loopbackPort: loopbackServer?.port ?? undefined, readiness: deps.readinessGate });
   return server;
 }
 

@@ -37,6 +37,47 @@ export function normalizeLogConversationId(raw: string | undefined | null): stri
   return createHash("sha256").update(trimmed).digest("hex").slice(0, LOG_CONVERSATION_ID_LEN);
 }
 
+const CODEX_THREAD_LINK_PREFIX = "codex://threads/";
+/** Real thread links stay well under this bound; larger pastes skip unwrapping so per-row matching stays cheap. */
+const LOG_CONVERSATION_LINK_MAX = 512;
+
+/**
+ * Unwrap a pasted `codex://threads/<id>` deep link to the bare thread id. Codex's
+ * "copy session link" clipboard carries that URI form while clients send the bare id
+ * on the wire, so Logs search accepts either paste without changing what is persisted.
+ * Query/fragment metadata (e.g. `?hostId=…`) belongs to the link, not the id, and is
+ * dropped. The scan is a bounded linear walk — no ambiguous regex — because this runs
+ * per log row on every filter evaluation.
+ */
+export function unwrapLogConversationQuery(query: string): string {
+  const trimmed = query.trim();
+  if (
+    trimmed.length > LOG_CONVERSATION_LINK_MAX ||
+    trimmed.length <= CODEX_THREAD_LINK_PREFIX.length ||
+    !trimmed.toLowerCase().startsWith(CODEX_THREAD_LINK_PREFIX)
+  ) {
+    return trimmed;
+  }
+  const rest = trimmed.slice(CODEX_THREAD_LINK_PREFIX.length);
+  const metaIndex = rest.search(/[?#]/);
+  const segment = (metaIndex === -1 ? rest : rest.slice(0, metaIndex)).replace(/\/+$/, "");
+  // A thread id is a single path segment; deeper paths or embedded whitespace keep the
+  // whole paste as the query, so foreign `codex://` URIs still fail to match.
+  return segment !== "" && !/[/\s]/.test(segment) ? segment : trimmed;
+}
+
+/**
+ * The candidate ids a conversation query may legitimately match. Unwrapping a pasted
+ * `codex://threads/<id>` link must add a match path, not replace one: a client can
+ * literally send a `codex://threads/…` session id, which is hashed whole for storage,
+ * so the untouched paste stays a candidate too.
+ */
+export function logConversationQueryCandidates(query: string): string[] {
+  const trimmed = query.trim();
+  const unwrapped = unwrapLogConversationQuery(trimmed);
+  return unwrapped === trimmed ? [unwrapped] : [unwrapped, trimmed];
+}
+
 /**
  * Filter match: accept either the persisted digest or the original preimage
  * (so pasting from Logs detail or the client-facing session id both work).
@@ -46,11 +87,13 @@ export function matchesLogConversationId(
   query: string | undefined | null,
 ): boolean {
   if (!stored) return false;
-  const trimmed = typeof query === "string" ? query.trim() : "";
-  if (!trimmed) return false;
-  if (stored === trimmed) return true;
-  const hashed = normalizeLogConversationId(trimmed);
-  return hashed !== undefined && stored === hashed;
+  for (const candidate of logConversationQueryCandidates(typeof query === "string" ? query : "")) {
+    if (!candidate) continue;
+    if (stored === candidate) return true;
+    const hashed = normalizeLogConversationId(candidate);
+    if (hashed !== undefined && stored === hashed) return true;
+  }
+  return false;
 }
 
 /**
@@ -127,6 +170,55 @@ export function conversationIdFromResponsesRequest(input: {
       ?? input.threadIdHeader
       ?? input.cursorConversationId,
   );
+}
+
+/**
+ * Hermes Agent session affinity header for log correlation (#330).
+ * Kept separate from runtime/session identities so it cannot affect lanes or routing.
+ */
+export function conversationIdFromHermesHeader(headers: Headers): string | undefined {
+  return normalizeLogConversationId(headers.get("x-hermes-conversation-id"));
+}
+
+/**
+ * Validates and normalizes native header candidates in priority order for logging:
+ * parent-thread -> session_id -> session-id -> thread-id.
+ * Each candidate spelling is evaluated and normalized independently so an empty or
+ * whitespace-only candidate (e.g. empty session_id) cannot suppress a subsequent valid candidate.
+ */
+export function nativeLogConversationIdFromHeaders(headers: Headers): string | undefined {
+  return (
+    normalizeLogConversationId(headers.get("x-codex-parent-thread-id")) ??
+    normalizeLogConversationId(headers.get("session_id")) ??
+    normalizeLogConversationId(headers.get("session-id")) ??
+    normalizeLogConversationId(headers.get("thread-id"))
+  );
+}
+
+/** The request-log context's conversation slot; structural so callers need not import request-log. */
+export interface LogConversationSlot {
+  conversationId?: string;
+  conversationIdIsHermesFallback?: boolean;
+}
+
+/**
+ * Record a native log identity. Fills an empty slot or replaces the log-only Hermes fallback,
+ * so a native id found late (Responses preparation, a Cursor conversation created mid-turn)
+ * still wins. A caller-owned id already in the slot (routed Claude metadata) is kept.
+ */
+export function assignNativeLogConversationId(slot: LogConversationSlot, nativeId: string | undefined): void {
+  if (!nativeId || (slot.conversationId && !slot.conversationIdIsHermesFallback)) return;
+  slot.conversationId = nativeId;
+  delete slot.conversationIdIsHermesFallback;
+}
+
+/** Fill an empty slot with the log-only Hermes digest, marked so any native id replaces it. */
+export function fillHermesLogConversationFallback(slot: LogConversationSlot, headers: Headers): void {
+  if (slot.conversationId) return;
+  const hermes = conversationIdFromHermesHeader(headers);
+  if (!hermes) return;
+  slot.conversationId = hermes;
+  slot.conversationIdIsHermesFallback = true;
 }
 
 /**

@@ -1,3 +1,4 @@
+import { anthropicProgressEnvelope, isAnthropicProgressMirror } from "../responses/anthropic-progress";
 /**
  * Claude Code outbound: internal /v1/responses output -> Anthropic Messages API shapes.
  *
@@ -11,7 +12,7 @@
  *  - errors: {type:"error", error:{type,message}}; may arrive mid-stream after HTTP 200.
  */
 import { createHash } from "node:crypto";
-import { httpStatusFromTerminalError } from "../lib/errors";
+import { httpStatusFromTerminalError, UNDECLARED_TOOL_CALL_ERROR_CODE } from "../lib/errors";
 import { isTransientUpstreamStatus } from "../lib/upstream-retry";
 import {
   isTranslatorBudgetExceededError,
@@ -20,7 +21,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { sseFieldOffset, sseFieldValue } from "../lib/sse-decoder";
-import { decodeReasoningEnvelope, encodeReasoningEnvelope } from "../responses/reasoning-envelope";
+import { decodeReasoningEnvelope, encodeReasoningEnvelope, OCX_REASONING_PREFIX } from "../responses/reasoning-envelope";
 
 type Rec = Record<string, unknown>;
 
@@ -33,7 +34,7 @@ function reasoningIdentityDigest(value: string): string {
 }
 
 /** Fixed-size identity that preserves protocol boundaries without retaining upstream strings. */
-function boundedReasoningIdentity(value: unknown): string {
+export function boundedReasoningIdentity(value: unknown): string {
   if (typeof value === "number") {
     if (Number.isSafeInteger(value) && value >= 0) return `n${value}`;
     if (Number.isFinite(value)) return `d${value}`;
@@ -70,8 +71,71 @@ export function anthropicErrorType(status: number): string {
   }
 }
 
+/**
+ * Claude Code compacts reactively only when an oversized-prompt refusal is worded the way the
+ * Anthropic API words it: it looks for `prompt is too long` (or `input is too long for requested
+ * model`) in the message and reads `prompt is too long: <actual> tokens > <limit> maximum` for the
+ * gap (2.1.288 binary). Routed providers word the same refusal differently, so a
+ * context_length_exceeded envelope is rewritten into that form. Counts are carried over only when
+ * the upstream states both of them; otherwise the original text is prefixed and no number is
+ * guessed. Without this the client ends the turn on a fatal error instead of compacting
+ * (devlog/_plan/261009_claude_1m_default/010).
+ */
+const CLAUDE_PROMPT_TOO_LONG_RE = /prompt is too long|input is too long for requested model/i;
+const MAX_OVERFLOW_MESSAGE_CHARS = 64 * 1024;
+const STATED_CONTEXT_LIMIT_RE = /maximum context length is (\d+) tokens/i;
+const STATED_REQUEST_COUNT_RE = /(?:resulted in|you requested) (\d+) tokens/i;
+
+export function claudePromptTooLongMessage(message: string): string {
+  message = message.slice(0, MAX_OVERFLOW_MESSAGE_CHARS);
+  if (CLAUDE_PROMPT_TOO_LONG_RE.test(message)) return message;
+  const limit = STATED_CONTEXT_LIMIT_RE.exec(message);
+  const requested = limit && STATED_REQUEST_COUNT_RE.exec(message.slice(limit.index + limit[0].length));
+  if (limit && requested) return `prompt is too long: ${requested[1]} tokens > ${limit[1]} maximum`;
+  return `prompt is too long: ${message}`;
+}
+
+/** Provider wordings of an oversized-input refusal, for lanes that relay a provider's own error text. */
+const CONTEXT_OVERFLOW_TEXT_RE = /prompt is too long|input is too long|context window|context length|maximum context|too many tokens|model token limit/i;
+
+export function isContextOverflowText(message: string): boolean {
+  return CONTEXT_OVERFLOW_TEXT_RE.test(message);
+}
+
+/**
+ * SSE payload rewrite for the native Messages lane: an `error` event that refuses an oversized
+ * input gets the Anthropic wording; every other payload passes through byte-identical. The type
+ * gate keeps a rate limit that happens to mention the context window untouched.
+ */
+export function claudeOverflowSsePayload(payload: string): string {
+  if (!payload.includes("\"error\"")) return payload;
+  let parsed: unknown;
+  try { parsed = JSON.parse(payload); } catch { return payload; }
+  if (!isRec(parsed) || parsed.type !== "error" || !isRec(parsed.error)) return payload;
+  const error = parsed.error;
+  const message = typeof error.message === "string" ? error.message : "";
+  const sized = error.type === "invalid_request_error" || error.type === "request_too_large";
+  if (!sized || isThroughputLimitText(message)) return payload;
+  if (!(error.code === "context_length_exceeded" || isContextOverflowText(message))) return payload;
+  const next = claudePromptTooLongMessage(message);
+  return next === message ? payload : JSON.stringify({ ...parsed, error: { ...error, message: next } });
+}
+
+/**
+ * A throughput limit that the shared classifier files under context_length_exceeded (its "too many
+ * tokens" match also catches "too many tokens per minute"). Worded as an overflow it would make
+ * Claude Code compact a conversation that only needs to wait, so it keeps its own text.
+ */
+const THROUGHPUT_LIMIT_TEXT_RE = /\bper (?:second|minute|hour|day)\b|\brate limit|\bquota\b|\btpm\b/i;
+
+export function isThroughputLimitText(message: string): boolean {
+  return THROUGHPUT_LIMIT_TEXT_RE.test(message);
+}
+
 export function anthropicErrorBody(status: number, message: string, type?: string, code?: string): Rec {
-  return { type: "error", error: { type: type ?? anthropicErrorType(status), message, ...(code ? { code } : {}) } };
+  const overflow = code === "context_length_exceeded" && !isThroughputLimitText(message);
+  const text = overflow ? claudePromptTooLongMessage(message) : message;
+  return { type: "error", error: { type: type ?? anthropicErrorType(status), message: text, ...(code ? { code } : {}) } };
 }
 
 export function anthropicErrorResponse(status: number, message: string, type?: string, code?: string): Response {
@@ -92,6 +156,8 @@ export function anthropicUsage(usage: unknown, webSearchRequests = 0): Rec {
   const details = isRec(u.input_tokens_details) ? u.input_tokens_details : {};
   const cached = typeof details.cached_tokens === "number" ? details.cached_tokens : 0;
   const cacheWrite = typeof details.cache_write_tokens === "number" ? details.cache_write_tokens : 0;
+  const cacheWrite1h = typeof details.cache_write_1h_tokens === "number"
+    ? Math.max(0, Math.min(details.cache_write_1h_tokens, cacheWrite)) : undefined;
   const input = typeof u.input_tokens === "number" ? u.input_tokens : 0;
   const output = typeof u.output_tokens === "number" ? u.output_tokens : 0;
   return {
@@ -99,12 +165,15 @@ export function anthropicUsage(usage: unknown, webSearchRequests = 0): Rec {
     output_tokens: output,
     cache_read_input_tokens: cached,
     cache_creation_input_tokens: cacheWrite,
+    ...(cacheWrite1h !== undefined
+      ? { cache_creation: { ephemeral_5m_input_tokens: cacheWrite - cacheWrite1h, ephemeral_1h_input_tokens: cacheWrite1h } }
+      : {}),
     // Only successful searches are billed/counted (Anthropic contract; Claude Code cost accounting).
     ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
   };
 }
 
-function sseFrame(name: string, data: Rec): string {
+export function sseFrame(name: string, data: Rec): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
@@ -159,10 +228,28 @@ export function sanitizeWebSearchInput(input: unknown): Rec {
 /**
  * Map a Responses `web_search_call` item to its Anthropic pair: the server_tool_use
  * input (query/queries) and the web_search_tool_result content (hits, or the error
- * object when the search failed). Shared by the SSE and JSON translation paths.
+ * object when the search failed). An item carrying `anthropic_blocks` came from Anthropic's
+ * own server-side call and maps back to those blocks verbatim (`srvtoolu_` id,
+ * `encrypted_content`, web_fetch), so the client can replay them on its next turn.
+ * Shared by the SSE, JSON and direct translation paths.
  */
-function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultContent: unknown; completed: boolean } {
+export function webSearchPairFromItem(item: Rec): {
+  id: string; name: string; resultType: string; input: Rec; resultContent: unknown; completed: boolean;
+} {
   const action = isRec(item.action) ? item.action : {};
+  const completed = item.status !== "failed";
+  const { use, result } = isRec(item.anthropic_blocks) ? item.anthropic_blocks : {};
+  if (isRec(use) && isRec(result) && typeof use.id === "string" && isRec(use.input)
+    && (use.name === "web_search" || use.name === "web_fetch")
+    && result.tool_use_id === use.id && result.type === `${use.name}_tool_result`) {
+    return { id: use.id, name: use.name, resultType: result.type, input: use.input, resultContent: result.content, completed };
+  }
+  const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `srvtoolu_${uuid()}`;
+  // An item emitted before `anthropic_blocks` carried a server web_fetch as `fetch_result`.
+  if (item.fetch_result !== undefined) {
+    const input = { url: typeof action.url === "string" ? action.url : "" };
+    return { id, name: "web_fetch", resultType: "web_fetch_tool_result", input, resultContent: item.fetch_result, completed };
+  }
   const queries = Array.isArray(action.queries)
     ? action.queries.filter((q): q is string => typeof q === "string" && q.length > 0)
     : [];
@@ -170,7 +257,6 @@ function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultConte
   const input = sanitizeWebSearchInput(
     queries.length > 1 ? { queries } : { query: queries[0] ?? query },
   );
-  const completed = item.status !== "failed";
   let resultContent: unknown;
   if (completed) {
     const hits: Rec[] = [];
@@ -185,8 +271,7 @@ function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultConte
   } else {
     resultContent = { type: "web_search_tool_result_error", error_code: "unavailable" };
   }
-  const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `srvtoolu_${uuid()}`;
-  return { id, input, resultContent, completed };
+  return { id, name: "web_search", resultType: "web_search_tool_result", input, resultContent, completed };
 }
 
 /**
@@ -205,7 +290,7 @@ function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultConte
  * is not a claim about upstream's tokenizer, and it is not final — `message_delta` carries the
  * authoritative count for every reader that waits for it, exactly as before.
  */
-function messageSnapshot(model: string, confirmedUsage?: Rec, inputTokenFloor?: number): Rec {
+export function messageSnapshot(model: string, confirmedUsage?: Rec, inputTokenFloor?: number): Rec {
   const usage = confirmedUsage
     ?? (typeof inputTokenFloor === "number" && Number.isFinite(inputTokenFloor) && inputTokenFloor > 0
       ? { input_tokens: Math.trunc(inputTokenFloor), output_tokens: 0 }
@@ -220,6 +305,44 @@ function messageSnapshot(model: string, confirmedUsage?: Rec, inputTokenFloor?: 
     stop_sequence: null,
     usage,
   };
+}
+
+/**
+ * A Responses incomplete reason as the Anthropic client sees it: an output cap and a content
+ * filter are real stop reasons; every other reason is a retryable overload so Claude Code backs
+ * off instead of accepting a truncated turn.
+ */
+export function anthropicIncompleteOutcome(
+  reason: unknown,
+  message: unknown,
+): { stopReason: "max_tokens" | "refusal" } | { failMessage: string } {
+  if (reason === "max_output_tokens") return { stopReason: "max_tokens" };
+  if (reason === "content_filter") return { stopReason: "refusal" };
+  return {
+    failMessage: typeof message === "string" && message.trim()
+      ? message
+      : `upstream response was incomplete${typeof reason === "string" ? ` (${reason})` : ""}`,
+  };
+}
+
+/**
+ * The HTTP status a Responses `response.failed` error object maps to on the Anthropic wire.
+ * Internal failure envelopes carry the classified {type, code, message} but no numeric status,
+ * so it is derived with the same mapping /api/logs uses; a classified 429/401/400 then reaches
+ * Claude Code as its real Anthropic error type instead of a retryable overload.
+ */
+export function anthropicFailedStatus(error: Rec, message: string): number {
+  const code = typeof error.code === "string" ? error.code : undefined;
+  if (code === "context_length_exceeded") return 400;
+  return code === "translation_buffer_limit"
+    ? 413
+    : typeof error.status === "number"
+      ? error.status
+      : httpStatusFromTerminalError({
+        type: typeof error.type === "string" ? error.type : undefined,
+        code: typeof error.code === "string" ? error.code : null,
+        message,
+      });
 }
 
 interface OpenBlock {
@@ -242,6 +365,13 @@ interface OpenBlock {
   thinkingBuf?: string;
   thinkingBufBytes?: number;
   reasoningSig?: string;
+  /** The provider's own encrypted reasoning for this item; signed into the block on close. */
+  reasoningNative?: { enc: string; id?: string };
+}
+
+/** A provider-minted (not ocxr1) `encrypted_content`, or `""`. */
+function nativeEncryptedReasoning(encrypted: string): string {
+  return encrypted.length > 0 && !encrypted.startsWith(OCX_REASONING_PREFIX) ? encrypted : "";
 }
 
 /** Streaming: Responses SSE bytes -> Anthropic Messages SSE bytes. */
@@ -256,6 +386,7 @@ export function responsesSseToAnthropicSse(
      * upstream sent no confirmed usage before the first frame. See `messageSnapshot` (#4857).
      */
     inputTokenFloor?: number;
+    nativeReasoningTagFor?: (blob: string) => string | undefined;
   },
 ): ReadableStream<Uint8Array> {
   const translatorBudget = opts.translatorBudget;
@@ -344,6 +475,13 @@ export function responsesSseToAnthropicSse(
           open.webSearchArgsEmitted = true;
         }
         if (open.kind === "thinking") {
+          const native = open.reasoningNative;
+          const tag = native && opts.nativeReasoningTagFor?.(native.enc);
+          if (!open.thinkingBuf && !open.reasoningSig && !tag) {
+            releaseThinkingBuffer(open);
+            open = null;
+            return;
+          }
           // Delay the index and all thinking frames until closure so a matching
           // done envelope can put its redacted blocks first. The existing buffer
           // remains charged through signature emission, including queued frames.
@@ -358,7 +496,10 @@ export function responsesSseToAnthropicSse(
               delta: { type: "thinking_delta", thinking: open.thinkingBuf },
             });
           }
-          const signature = open.reasoningSig ?? encodeReasoningEnvelope({ txt: open.thinkingBuf ?? "" }, translatorBudget);
+          const signature = open.reasoningSig ?? encodeReasoningEnvelope({
+            txt: open.thinkingBuf ?? "",
+            ...(tag ? { nat: { ...native, model, tag } } : {}),
+          }, translatorBudget);
           emit("content_block_delta", {
             type: "content_block_delta", index: open.index,
             delta: { type: "signature_delta", signature },
@@ -434,7 +575,13 @@ export function responsesSseToAnthropicSse(
         terminalDelivered = true;
       };
 
+      let progressMirrorId: string | undefined;
       const handleFrame = (eventName: string, data: Rec) => {
+        const frameItem = isRec(data.item) ? data.item : null;
+        if (progressMirrorId && (data.item_id === progressMirrorId || frameItem?.id === progressMirrorId)) {
+          if (eventName === "response.output_item.done") progressMirrorId = undefined;
+          return;
+        }
         switch (eventName) {
           case "response.created":
           case "response.in_progress": {
@@ -586,7 +733,7 @@ export function responsesSseToAnthropicSse(
               const toolIndex = blockIndex++;
               emit("content_block_start", {
                 type: "content_block_start", index: toolIndex,
-                content_block: { type: "server_tool_use", id: pair.id, name: "web_search" },
+                content_block: { type: "server_tool_use", id: pair.id, name: pair.name },
               });
               emit("content_block_delta", {
                 type: "content_block_delta", index: toolIndex,
@@ -596,10 +743,10 @@ export function responsesSseToAnthropicSse(
               const resultIndex = blockIndex++;
               emit("content_block_start", {
                 type: "content_block_start", index: resultIndex,
-                content_block: { type: "web_search_tool_result", tool_use_id: pair.id, content: pair.resultContent },
+                content_block: { type: pair.resultType, tool_use_id: pair.id, content: pair.resultContent },
               });
               emit("content_block_stop", { type: "content_block_stop", index: resultIndex });
-              if (pair.completed) webSearchRequests++;
+              if (pair.completed && pair.name === "web_search") webSearchRequests++;
               break;
             }
             // Close the matching open block (message/reasoning items close implicitly on
@@ -646,11 +793,24 @@ export function responsesSseToAnthropicSse(
                 emit("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "redacted_thinking", data } });
                 emit("content_block_stop", { type: "content_block_stop", index: idx });
               }
-              if (env?.sig && open?.kind !== "thinking") {
+              // A provider's own blob is the only copy of its reasoning the client can hold, so
+              // it gets a thinking block even when no summary text arrived.
+              const native = nativeEncryptedReasoning(encrypted);
+              if ((env?.sig || native) && open?.kind !== "thinking") {
                 ensureBlock("thinking");
               }
               if (open?.kind === "thinking") {
+                if (env?.upd && typeof env.txt === "string") {
+                  // This plaintext was deliberately surfaced as commentary, unlike hidden reasoning.
+                  progressMirrorId = env.upd;
+                  const bytes = Buffer.byteLength(env.txt);
+                  translatorBudget.chargeRetained(bytes, { kind: "reasoning" });
+                  translatorBudget.releaseRetained(open.thinkingBufBytes ?? 0, { kind: "reasoning" });
+                  open.thinkingBuf = env.txt;
+                  open.thinkingBufBytes = bytes;
+                }
                 if (env?.sig) open.reasoningSig = env.sig;
+                if (native) open.reasoningNative = typeof item.id === "string" && item.id.length > 0 ? { enc: native, id: item.id } : { enc: native };
                 closeOpenBlock();
               }
             }
@@ -668,16 +828,9 @@ export function responsesSseToAnthropicSse(
           case "response.incomplete": {
             const response = isRec(data.response) ? data.response : {};
             const details = isRec(response.incomplete_details) ? response.incomplete_details : {};
-            if (details.reason === "max_output_tokens") {
-              finish("max_tokens", response.usage);
-            } else if (details.reason === "content_filter") {
-              finish("refusal", response.usage);
-            } else {
-              const message = typeof details.message === "string" && details.message.trim()
-                ? details.message
-                : `upstream response was incomplete${typeof details.reason === "string" ? ` (${details.reason})` : ""}`;
-              fail(529, message, true);
-            }
+            const outcome = anthropicIncompleteOutcome(details.reason, details.message);
+            if ("stopReason" in outcome) finish(outcome.stopReason, response.usage);
+            else fail(529, outcome.failMessage, true);
             break;
           }
           case "response.failed": {
@@ -688,26 +841,18 @@ export function responsesSseToAnthropicSse(
             if (code === "translation_buffer_limit") {
               throw new TranslatorBudgetExceededError("live_transient", TRANSLATOR_MAX_TURN_BYTES);
             }
-            const status = code === "translation_buffer_limit"
-              ? 413
-              : typeof error.status === "number"
-                ? error.status
-                // Internal response.failed envelopes carry the classified {type, code, message}
-                // but no numeric status. Derive it with the same mapping /api/logs uses so a
-                // classified 429/401/400 reaches Claude Code as its real Anthropic error type
-                // instead of being masked as retryable overload.
-                : httpStatusFromTerminalError({
-                  type: typeof error.type === "string" ? error.type : undefined,
-                  code: typeof error.code === "string" ? error.code : null,
-                  message,
-                });
+            const status = anthropicFailedStatus(error, message);
             // Unclassified status-absent response.failed (relaySseWithFailedTail synthetic
             // tail) still lands on a transient 5xx here — the mid-stream reset shape maps to
             // overloaded_error by design.
+            // The undeclared-tool refusal is deterministic and proxy-owned, not an upstream
+            // condition: keep its api_error type and code instead of a retryable overload.
+            const deterministic = code === UNDECLARED_TOOL_CALL_ERROR_CODE;
             fail(
               status,
               message,
-              true,
+              !deterministic,
+              deterministic || code === "context_length_exceeded" ? code : undefined,
             );
             break;
           }
@@ -861,14 +1006,15 @@ export function responsesSseToAnthropicSse(
 }
 
 /** Non-streaming: /v1/responses JSON -> Anthropic message JSON. */
-export function responsesJsonToAnthropicMessage(json: unknown, model: string, translatorBudget?: TranslatorBudget): Rec {
+export function responsesJsonToAnthropicMessage(json: unknown, model: string, translatorBudget?: TranslatorBudget, nativeReasoningTagFor?: (blob: string) => string | undefined): Rec {
   const body = isRec(json) ? json : {};
   const output = Array.isArray(body.output) ? body.output : [];
   const content: Rec[] = [];
   let sawToolUse = false;
   let webSearchRequests = 0;
 
-  for (const raw of output) {
+  for (const [index, raw] of output.entries()) {
+    if (index > 0 && isAnthropicProgressMirror(raw, anthropicProgressEnvelope(output[index - 1], translatorBudget))) continue;
     if (!isRec(raw)) continue;
     switch (raw.type) {
       case "message": {
@@ -897,10 +1043,14 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
         // Legacy combined envelopes place redacted blocks before the signed block,
         // matching the Anthropic adapter. New bridge output uses separate items.
         for (const data of env?.red ?? []) content.push({ type: "redacted_thinking", data });
-        // env.txt may be locally hidden text. Do not expose it here or manufacture
-        // a new signed continuity carrier; hidden-summary replay remains limited.
-        if (parts.length > 0 || env?.sig) {
-          content.push({ type: "thinking", thinking: parts.join("\n\n"), signature: env?.sig ?? encodeReasoningEnvelope({ txt: parts.join("\n\n") }, translatorBudget) });
+        // env.txt may be locally hidden text. Do not expose it here. A provider's own blob is
+        // carried in the envelope so the next request can hand it back (see inbound.ts).
+        const native = nativeEncryptedReasoning(encrypted);
+        const tag = native && nativeReasoningTagFor?.(native);
+        if (parts.length > 0 || env?.sig || tag) {
+          const text = env?.upd ? env.txt! : parts.join("\n\n");
+          const nat = tag ? { enc: native, model, tag, ...(typeof raw.id === "string" && raw.id.length > 0 ? { id: raw.id } : {}) } : undefined;
+          content.push({ type: "thinking", thinking: text, signature: env?.sig ?? encodeReasoningEnvelope({ txt: text, ...(nat ? { nat } : {}) }, translatorBudget) });
         }
         break;
       }
@@ -922,9 +1072,9 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
       case "web_search_call": {
         // Server-side search: emit the Anthropic pair. Does NOT set sawToolUse.
         const pair = webSearchPairFromItem(raw);
-        content.push({ type: "server_tool_use", id: pair.id, name: "web_search", input: pair.input });
-        content.push({ type: "web_search_tool_result", tool_use_id: pair.id, content: pair.resultContent });
-        if (pair.completed) webSearchRequests++;
+        content.push({ type: "server_tool_use", id: pair.id, name: pair.name, input: pair.input });
+        content.push({ type: pair.resultType, tool_use_id: pair.id, content: pair.resultContent });
+        if (pair.completed && pair.name === "web_search") webSearchRequests++;
         break;
       }
       default:
@@ -1040,28 +1190,48 @@ export async function collectAnthropicMessage(
     }
   };
 
+  const drainFrames = () => {
+    let sep: number;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const rawFrame = buffer.slice(0, sep);
+        buffer = replaceRetained(buffer, buffer.slice(sep + 2), "live_transient");
+        // Event name and data as SSE dispatches them: the last event field, untrimmed, and the
+        // data fields joined by newlines.
+        let eventName = "";
+        const dataLines: string[] = [];
+        for (const line of rawFrame.split("\n")) {
+          const eventValue = sseFieldValue(line, "event");
+          if (eventValue !== null) { eventName = eventValue; continue; }
+          const dataValue = sseFieldValue(line, "data");
+          if (dataValue !== null) dataLines.push(dataValue);
+        }
+        const dataLine = dataLines.join("\n");
+        if (!dataLine) continue;
+        let data: unknown;
+        try { data = JSON.parse(dataLine); } catch { continue; }
+        if (!isRec(data)) continue;
+        // A data-only frame is named by its payload type, the same rule the stream tap applies.
+        const name = eventName || (typeof data.type === "string" ? data.type : "");
+        if (name) handle(name, data);
+    }
+  };
+
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer = replaceRetained(buffer, buffer + decoder.decode(value, { stream: true }), "live_transient");
-      let sep: number;
-      while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        const rawFrame = buffer.slice(0, sep);
-        buffer = replaceRetained(buffer, buffer.slice(sep + 2), "live_transient");
-        let eventName = "";
-        let dataLine = "";
-        for (const line of rawFrame.split("\n")) {
-          const eventValue = sseFieldValue(line, "event");
-          if (eventValue !== null) { eventName = eventValue.trim(); continue; }
-          const dataValue = sseFieldValue(line, "data");
-          if (dataValue !== null) dataLine += dataValue;
-        }
-        if (!eventName || !dataLine) continue;
-        let data: unknown;
-        try { data = JSON.parse(dataLine); } catch { continue; }
-        if (isRec(data)) handle(eventName, data);
-      }
+      // Frame on LF only after normalizing CRLF/CR line endings, holding a trailing CR until the
+      // next chunk shows whether its LF follows, so a CRLF stream folds like an LF one.
+      const incoming = buffer + decoder.decode(value, { stream: true });
+      const heldCr = incoming.endsWith("\r");
+      const normalized = (heldCr ? incoming.slice(0, -1) : incoming).replace(/\r\n?/g, "\n") + (heldCr ? "\r" : "");
+      buffer = replaceRetained(buffer, normalized, "live_transient");
+      drainFrames();
+    }
+    // At EOF a held CR is a line ending: it can complete the final frame.
+    if (buffer.endsWith("\r")) {
+      buffer = replaceRetained(buffer, buffer.slice(0, -1) + "\n", "live_transient");
+      drainFrames();
     }
   } finally {
     reader.releaseLock();

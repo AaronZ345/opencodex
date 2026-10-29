@@ -193,6 +193,35 @@ describe("#2703 the projection does not strip the 5h window", () => {
   });
 });
 
+describe("Codex account identity projection", () => {
+  test("keeps validated join keys and slot identities while accepting older servers", async () => {
+    const key = `uai1_${"a".repeat(64)}`;
+    const fetchImpl = (async (url: string | URL | Request) => Response.json(
+      String(url).includes("/api/codex-auth/active")
+        ? { activeCodexAccountId: "__main__" }
+        : { accounts: [
+          { id: "__main__", slotId: "__main__", slotKind: "native-main", upstreamAccountKey: key },
+          { id: "pool-a", slotId: "pool-a", slotKind: "pool", upstreamAccountKey: key },
+          { id: "pool-b", slotId: "other-slot", upstreamAccountKey: key },
+          { id: "pool-legacy" },
+          { id: "pool-object", slotId: "pool-object", upstreamAccountKey: { toString: null, valueOf: null } },
+          { id: "pool-array", slotId: "pool-array", upstreamAccountKey: [key] },
+        ] },
+    )) as unknown as typeof fetch;
+    const { fetchCodexRows } = await import("../../src/cli/account-api");
+    const result = await fetchCodexRows({ baseUrl: "http://127.0.0.1:10100", fetchImpl },
+      "http://127.0.0.1:10100");
+    expect(result.rows.map(row => [row.slotId, row.slotKind, row.upstreamAccountKey])).toEqual([
+      ["__main__", "native-main", key],
+      ["pool-a", "pool", key],
+      ["pool-b", "pool", undefined],
+      ["pool-legacy", "pool", undefined],
+      ["pool-object", "pool", undefined],
+      ["pool-array", "pool", undefined],
+    ]);
+  });
+});
+
 describe("#2705 access key usage columns", () => {
   async function listOutput(payload: Record<string, unknown>): Promise<string> {
     const { handleAccessCommand } = await import("../../src/cli/access");
@@ -216,6 +245,7 @@ describe("#2705 access key usage columns", () => {
         id: "k_9f2a", name: "ci-runner", prefix: "ocx_data_abc...",
         usage: { requests7d: 1204, totalRequests: 18330, lastUsedAt: "2026-08-27T04:11:00Z" },
       }],
+      attributionSince: "2026-07-29T00:00:00Z",
     });
     expect(out).toContain("REQ 7D");
     expect(out).toContain("1,204");
@@ -229,6 +259,7 @@ describe("#2705 access key usage columns", () => {
     // use is the dangerous answer for someone deciding what to delete.
     const out = await listOutput({
       keys: [{ id: "k_11bd", name: "laptop", prefix: "ocx_data_def...", usage: { ambiguous: true } }],
+      attributionSince: "2026-07-29T00:00:00Z",
     });
     expect(out).toContain("ambiguous");
     expect(out).not.toMatch(/\b0\b/);
@@ -237,8 +268,42 @@ describe("#2705 access key usage columns", () => {
   test("a never-used key says never rather than showing an empty cell", async () => {
     const out = await listOutput({
       keys: [{ id: "k_new", name: "fresh", prefix: "ocx_data_ghi...", usage: { requests7d: 0, totalRequests: 0 } }],
+      attributionSince: "2026-08-29T00:00:00Z",
     });
     expect(out).toContain("never");
+  });
+
+  test("unavailable attribution does not report zero usage or never used", async () => {
+    const out = await listOutput({
+      keys: [{ id: "k_unknown", name: "unknown", prefix: "ocx_data_jkl...", usage: { requests7d: 0, totalRequests: 0 } }],
+    });
+    expect(out).toContain("unavailable");
+    expect(out).not.toMatch(/\b0\b/);
+    expect(out).not.toContain("never");
+  });
+
+  // "0" parses with Date.parse; an impossible calendar date parses by rolling over. Neither is
+  // the ISO instant the server emits, so both must read as unavailable.
+  test.each(["not-a-timestamp", "0", "2026-02-30T00:00:00Z"])(
+    "a malformed attributionSince string stays unavailable: %p",
+    async attributionSince => {
+      const out = await listOutput({
+        keys: [{ id: "k_bad", name: "bad", prefix: "ocx_data_mno...", usage: { requests7d: 0, totalRequests: 0 } }],
+        attributionSince,
+      });
+      expect(out).toContain("unavailable");
+      expect(out).not.toContain("attribution since");
+      expect(out).not.toMatch(/\b0\b/);
+    },
+  );
+
+  test("the server's toISOString attributionSince stays available", async () => {
+    const out = await listOutput({
+      keys: [{ id: "k_ms", name: "ms", prefix: "ocx_data_pqr...", usage: { requests7d: 3, totalRequests: 3 } }],
+      attributionSince: new Date(Date.UTC(2026, 6, 29)).toISOString(),
+    });
+    expect(out).toContain("attribution since 2026-07-29T00:00:00.000Z");
+    expect(out).not.toContain("unavailable");
   });
 
   test("dataset-level attribution and truncation print ONCE as a footer", async () => {

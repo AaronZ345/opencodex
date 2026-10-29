@@ -40,12 +40,16 @@ export function windowsWrapperKillScript(paths: readonly string[]): string {
     "  if ($_.ProcessId -eq $PID) { return $false };",
     "  $c = $_.CommandLine; if (-not $c) { return $false };",
     "  foreach ($p in $pats) {",
-    "    $i = $c.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase);",
-    "    if ($i -lt 0) { continue };",
-    "    $before = if ($i -gt 0) { $c.Substring($i - 1, 1) } else { ' ' };",
-    "    $end = $i + $p.Length;",
-    "    $after = if ($end -lt $c.Length) { $c.Substring($end, 1) } else { ' ' };",
-    "    if ($before -match '[\\s\"'']' -and $after -match '[\\s\"'']') { return $true };",
+    "    $i = 0;",
+    "    while ($i -lt $c.Length) {",
+    "      $i = $c.IndexOf($p, $i, [System.StringComparison]::OrdinalIgnoreCase);",
+    "      if ($i -lt 0) { break };",
+    "      $before = if ($i -gt 0) { $c.Substring($i - 1, 1) } else { ' ' };",
+    "      $end = $i + $p.Length;",
+    "      $after = if ($end -lt $c.Length) { $c.Substring($end, 1) } else { ' ' };",
+    "      if ($before -match '[\\s\"'']' -and $after -match '[\\s\"'']') { return $true };",
+    "      $i = $i + 1;",
+    "    }",
     "  };",
     "  $false",
     "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
@@ -59,14 +63,17 @@ export function windowsWrapperKillScript(paths: readonly string[]): string {
 export function killWindowsSchedulerWrappers(paths: {
   scriptPath: string;
   launcherPath: string;
-}): void {
+}, beforeMutation?: () => void): void {
   if (process.platform !== "win32") return;
+  let file: string, args: string[];
   try {
-    spawnSync(resolveTrustedWindowsPowerShellExe(), [
-      // No `-WindowStyle Hidden` here: Bun 1.3.14 can fail that direct CLI pair
-      // before the command runs (#1589). `windowsHide` below is sufficient.
-      "-NoProfile", "-NoLogo", "-NonInteractive",
-      "-Command", windowsWrapperKillScript([paths.scriptPath, paths.launcherPath]),
-    ], { stdio: "ignore", timeout: 5000, windowsHide: true });
+    file = resolveTrustedWindowsPowerShellExe();
+    args = ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command",
+      windowsWrapperKillScript([paths.scriptPath, paths.launcherPath])];
+  } catch { return; }
+  beforeMutation?.();
+  try {
+    // windowsHide avoids Bun's direct -WindowStyle argv failure (#1589).
+    spawnSync(file, args, { stdio: "ignore", timeout: 5000, windowsHide: true });
   } catch { /* best-effort */ }
 }

@@ -167,7 +167,7 @@ describe("Cursor protobuf tool-call events", () => {
         callId: "call_bad_freeform", modelCallId: "model_bad_freeform", toolCall,
       }),
     }), state)).toEqual([
-      { type: "error", message: "script call had invalid freeform arguments; expected {input:string}" },
+      { type: "error", message: "script call had invalid freeform arguments; expected {input:string} (received keys [+1 other])" },
     ]);
     expect(state.openToolCalls.has("call_bad_freeform")).toBe(false);
     expect(state.completedToolCalls.has("call_bad_freeform")).toBe(true);
@@ -1257,7 +1257,8 @@ describe("textual pseudo tool-call marker quarantine", () => {
   });
 
   test("a real frame wins over a textual echo in the same turn", () => {
-    const state = createCursorProtobufEventState({ clientToolNames: ["grep"] });
+    const budget = createTranslatorBudget();
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"], translatorBudget: budget });
     expect(mapCursorProtobufServerMessage(
       textDelta('[TOOL_CALL]grep[ARGS]{"pattern":"echo"}'),
       state,
@@ -1272,6 +1273,31 @@ describe("textual pseudo tool-call marker quarantine", () => {
       { type: "tool_call_start", id: "call_1", name: "grep" },
     ]);
     expect(events.some(event => event.type === "tool_call_delta" && event.arguments.includes("echo"))).toBe(false);
+    expect(budget.snapshot().currentBytes).toBe(0);
+    budget.dispose();
+  });
+
+  test("complete textual fallbacks are budgeted before they are retained", () => {
+    const budget = createTranslatorBudget({ maxCallArgumentBytes: 32, maxTurnBytes: 40 });
+    const state = createCursorProtobufEventState({ clientToolNames: ["grep"], translatorBudget: budget });
+    try {
+      expect(() => mapCursorProtobufServerMessage(
+        textDelta(`[TOOL_CALL]grep[ARGS]{"pattern":"${"x".repeat(40)}"}`),
+        state,
+      )).toThrow("translator tool_args buffer exceeded 32 bytes");
+      expect(state.bufferedTextToolCalls).toBeUndefined();
+      expect(budget.snapshot().currentBytes).toBe(0);
+
+      mapCursorProtobufServerMessage(textDelta('[TOOL_CALL]grep[ARGS]{"pattern":"12345678"}'), state);
+      expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
+      expect(() => mapCursorProtobufServerMessage(
+        textDelta('[TOOL_CALL]grep[ARGS]{"pattern":"abcdefgh"}'),
+        state,
+      )).toThrow("translator tool_args buffer exceeded 40 bytes");
+      expect(state.bufferedTextToolCalls).toHaveLength(1);
+    } finally {
+      budget.dispose();
+    }
   });
 
   test("a split marker is dropped when an incomplete real frame appears", () => {

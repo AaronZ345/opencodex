@@ -9,13 +9,16 @@ description: opencodex 개발 환경, 구조, 컨벤션, 프로바이더와 어�
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # 기존 관리형 pre-push·post-merge 제거
 bun run dev:proxy    # 개발 모드 프록시 API
 bun run dev:gui      # 대시보드 dev 서버(다른 터미널)
-bun run typecheck    # bun x tsc --noEmit
-bun run test:changed              # routine import-graph test selection
-bun test tests/routing/router.test.ts     # routine focused test
-bun run test                      # complete suite (PR-ready / explicit ask)
+bun run typecheck    # bun check --no-script --noEmit
+bun run test        # 전체 테스트 스위트 (기본)
 ```
+
+`bun run setup:hooks`는 수정되지 않은 기존 관리형 `pre-push`와 `post-merge` 훅을
+제거합니다. 사용자 정의 훅은 보존합니다. `pre-push` 훅은 더 이상 필수가 아니며,
+`bun run prepush`는 선택적으로 직접 실행할 수 있습니다.
 
 `bun run dev`는 계속 `bun run dev:proxy`의 별칭으로 동작합니다. 대시보드 dev 서버는
 `bun run dev:gui`이며, `GET /`에서 제공하는 패키지 대시보드는 `bun run build:gui`로 빌드해
@@ -28,6 +31,7 @@ bun run test                      # complete suite (PR-ready / explicit ask)
 
 ```bash
 bun run typecheck                 # 엄격한 TypeScript 검사
+bun run test:changed              # dev merge base 기준 import graph 테스트
 bun run test                      # tests/ 전체 스위트
 bun test tests/routing/router.test.ts     # 특정 테스트 파일
 bun run build:gui                 # Vite GUI 빌드 + 패키지 준비
@@ -35,10 +39,17 @@ bun run privacy:scan              # CI에서 쓰는 자격 증명/개인정보 �
 bun run prepare:package           # 패키지 런처/asset 갱신
 ```
 
+기본적으로 `bun run test`로 전체 테스트 스위트를 실행하세요. 작업 규모, 머신 자원 또는 동시에
+사용 중인 워크트리 때문에 전체 실행 비용이 지나치게 크다면, 최소한 변경한 동작을 실제로 검증하는
+집중 회귀 테스트를 실행해야 합니다. 예를 들어 `bun test tests/<domain>/<name>.test.ts`를 사용할 수
+있습니다. 범위를 줄인 이유와 정확한 실행 명령, 결과, 테스트하지 않은 범위를 명시하세요.
+`bun run test:changed`는 보완 수단이며 모든 간접 의존성을 찾지는 못합니다. CI에만 맡기거나
+로컬 테스트를 생략하는 일괄 면제는 없습니다. 병합 전에는 현재 PR 헤드의 정확한 커밋에서
+모든 필수 CI 검사가 통과해야 합니다.
+
 테스트는 `src/`를 따라 나눈 도메인 디렉터리(`tests/<domain>/`)에 놓인 Bun 테스트이며, 지도는 `scripts/test-layout/layout.json`입니다. 공용 fixture는
 `tests/helpers/`, 범위가 넓은 네이티브 동등성 시나리오는 `tests/e2e-style/`에 있습니다. 바꾼
-subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하세요. 공용 라우팅, 어댑터, 설정, 서버
-동작을 건드렸다면 전체 스위트도 실행합니다.
+subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하세요.
 
 지금 읽고 있는 문서 사이트는 `docs-site/`에 있습니다(Astro + Starlight).
 
@@ -110,14 +121,14 @@ Go 네이티브 포트를 담당했던 `dev2-go`는 정리했고, 두 라인을 
 
 ## 컨벤션
 
-- **ES Modules 전용**(`import`/`export`), TypeScript, `strict` 모드. `bun x tsc --noEmit`을 깨끗하게
+- **ES Modules 전용**(`import`/`export`), TypeScript, `strict` 모드. `bun run typecheck`을 깨끗하게
   유지하세요.
 - **파일당 최대 약 500줄** — 책임별로 나누세요. 단일 `index.ts` 뒤에 작고 집중된 모듈을 둔
   `web-search/`와 `vision/` 사이드카가 좋은 예입니다.
 - **비동기 오류는 경계에서 처리** — 사이드카는 요청 경로로 오류를 던지지 않고 적절한 marker로
   저하됩니다.
 - **Structure SOT** — 현재 유지보수 불변식은 `structure/`에 둡니다. 공개 사용자 워크플로는
-  `docs-site/`, 과거 조사/진단 기록은 `docs/`에 둡니다.
+  `docs-site/`, 계획과 조사 기록은 `devlog/`에 둡니다.
 - **export 보존** — 다른 모듈이 의존할 수 있습니다.
 
 ## 카탈로그에 프로바이더 추가하기
@@ -162,12 +173,15 @@ wire format을 쓴다는 이유만으로 다른 프로바이더 또는 목적지
 `passthrough`가 아닌 주장에는 구체적인 제한을 적고, fixture 기반 주장에는 이를 입증하는 정확한 assertion id를
 명시하세요. 비밀정보가 없는 request vector를 `tests/fixtures/compatibility/`에 추가하고 production adapter를
 대상으로 실행하는 집중 테스트를 작성합니다.
+`passthrough` claim은 manifest test에서 그 feature에 묶인 selector 위의 `equals` assertion 가운데,
+기대값이 같은 위치의 호출자 값 그대로인 것만 인용할 수 있습니다. 그래서 제거되거나 바뀌었거나 관계없는
+필드를 무손실로 표시할 수 없습니다. custom tool과 그 grammar처럼 한쪽만 보존될 수 있는 측면은 별도
+claim으로 나누세요.
 
 호환성 매니페스트는 수동적인 데이터입니다. 일반 router, Responses handler, server startup path가 manifest
 catalog를 import하거나 Compatibility Lab을 활성화해서는 안 됩니다.
 
 ## 완료를 주장하기 전에 검증하기
 
-변경을 증명하는 가장 좁은 명령부터 실행하세요. 타입은 `bun run typecheck`, 동작은 집중된
-`bun test tests/<name>.test.ts` 또는 런타임 probe로 확인한 뒤 영향 범위에 맞는 넓은 gate를
-실행합니다. opencodex는 큰 batch보다 작고 검증 가능한 commit을 선호합니다.
+위 테스트 정책을 따르고, 타입 변경에는 `bun run typecheck`를 포함해 영향 범위에 필요한 검사를
+실행하세요. 실행 명령, 결과, 테스트하지 않은 범위를 보고하고 실제로 완료한 검증만 주장하세요.

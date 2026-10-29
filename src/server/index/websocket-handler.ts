@@ -2,6 +2,7 @@ import { nativeSteeringUnavailableReason, nativeResponseControlMode, type Native
 import { NativeInjectionChannel } from "../responses/native-injection";
 import { NativeSteeringChannel, NativeSteeringError } from "../responses/native-steering";
 import { createNativeSteeringLogObserver } from "../responses/native-steering-log";
+import { reasoningArchiveErrorResponse } from "../responses/reasoning-archive-error";
 import type { Server, ServerWebSocket } from "bun";
 import {
   LIVE_SIDEBAND_UPSTREAM_OPEN_TIMEOUT_MS,
@@ -18,6 +19,7 @@ import {
   webSocketFrameBytes,
 } from "./live-sideband";
 import { markActivity } from "../../lib/sidecar-tracker";
+import { isReplayRefusalResponse } from "../../lib/upstream-retry";
 import {
   buildWarmupCompletionFrames,
   buildWsErrorFrame,
@@ -30,7 +32,9 @@ import {
 } from "../ws-bridge";
 import {
   CodexAccountCooldownError,
+  CodexMainAccountHardLockError,
   cooldownErrorMessage,
+  cooldownErrorResponse,
 } from "../../codex/auth-context";
 import { codexAccountNamespaceForModel } from "../../codex/account-namespace-match";
 import {
@@ -86,6 +90,8 @@ import {
 } from "../live";
 import type { ServeOptionsContext } from "./serve-options";
 import type { RequestMetricsRecorder } from "../request-metrics";
+import { resolveInboundBodyLimitBytes } from "../request-decompress";
+import { responseToolOwnership } from "../responses/response-tool-ownership";
 
 /**
  * The WebSocket half of the Bun.serve options, split out of serve-options.ts to keep that file
@@ -181,6 +187,8 @@ export function createWebsocketHandler(
           }
           return;
         }
+        if (ws.data.responsesActivity?.closing) return;
+        ws.data.responsesActivity?.touch();
         const rawBytes = typeof raw === "string" ? Buffer.byteLength(raw) : raw.byteLength;
         if (rawBytes > MAX_WS_FRAME_BYTES) {
           sendJsonFrame(ws, buildWsErrorFrame(413, {
@@ -190,17 +198,37 @@ export function createWebsocketHandler(
           ws.close(1009, "message too large");
           return;
         }
+        // An established control connection only ever carries control frames, so the
+        // inbound body limit applies to raw bytes before the parse materializes them.
+        if (ws.data.nativeControl && rawBytes > resolveInboundBodyLimitBytes(config.maxInboundBodyBytes)) {
+          sendJsonFrame(ws, buildWsErrorFrame(413, {
+            type: "invalid_request_error",
+            code: "inbound_body_too_large",
+            message: "Native response control frame exceeds the configured inbound body limit.",
+          }));
+          return;
+        }
         let frame: Record<string, unknown>;
         try {
           frame = JSON.parse(typeof raw === "string" ? raw : raw.toString()) as Record<string, unknown>;
         } catch {
           return; // text-only contract; ignore unparseable frames
         }
+        if ((frame.type === "response.inject" || frame.type === "response.steer")
+          && rawBytes > resolveInboundBodyLimitBytes(config.maxInboundBodyBytes)) {
+          sendJsonFrame(ws, buildWsErrorFrame(413, {
+            type: "invalid_request_error",
+            code: "inbound_body_too_large",
+            message: "Native response control frame exceeds the configured inbound body limit.",
+          }));
+          return;
+        }
         if (frame.type === "response.inject" || frame.type === "response.steer" || (frame.type === "response.create" && ws.data.nativeControl)) {
           try {
             if (frame.type === "response.inject") {
               if (!ws.data.nativeControl?.inject) throw new NativeSteeringError("injection_not_supported", "Native injection is disabled or unavailable on this route.");
               ws.data.nativeControl.inject(frame);
+              ws.data.responsesActivity?.acceptResults(frame.input);
               return;
             }
             if (frame.type === "response.steer") {
@@ -208,7 +236,10 @@ export function createWebsocketHandler(
               ws.data.nativeControl.steer(frame);
               return;
             }
-            if (ws.data.nativeControl?.continue(frame)) return;
+            if (ws.data.nativeControl?.continue(frame)) {
+              ws.data.responsesActivity?.acceptResults(frame.input);
+              return;
+            }
           } catch (error) {
             sendJsonFrame(ws, buildWsErrorFrame(400, {
               type: "invalid_request_error",
@@ -227,8 +258,8 @@ export function createWebsocketHandler(
           const idleMs = typeof config.stallTimeoutSec === "number" && Number.isFinite(config.stallTimeoutSec)
             ? Math.max(1, config.stallTimeoutSec) * 1000 : 300_000;
           const mode = nativeResponseControlMode(frame, config);
-          nativeControl = mode === "injection" ? new NativeInjectionChannel(frame, idleMs)
-            : mode === "steering" ? new NativeSteeringChannel(frame, idleMs) : undefined;
+          nativeControl = mode === "injection" ? new NativeInjectionChannel(frame, idleMs, config.maxUpstreamBodyBytes)
+            : mode === "steering" ? new NativeSteeringChannel(frame, idleMs, config.maxUpstreamBodyBytes) : undefined;
         } catch {
           sendJsonFrame(ws, buildWsErrorFrame(400, { type: "invalid_request_error", message: "Invalid native steering request settings" }));
           return;
@@ -272,6 +303,7 @@ export function createWebsocketHandler(
         }
 
         // Only a genuinely admitted turn may receive steering or continuations.
+        const finishActivity = ws.data.responsesActivity?.beginTurn(frame.input);
         ws.data.nativeControl = nativeControl;
         const payload: Record<string, unknown> = { ...frame };
         delete payload.type;
@@ -324,11 +356,22 @@ export function createWebsocketHandler(
                 terminalRecorder = recorder;
               },
             });
+            // This ingress finalizes directly, without the HTTP deferred logger.
+            // Preserve recorder provenance before framing a synthetic 429 as a WS error.
+            if (isReplayRefusalResponse(response)) {
+              logCtx.causeHint = "transport-ambiguous";
+              logCtx.terminalSource = "synthetic";
+            }
+            const observeLog = nativeControl?.relayActive
+              ? createNativeSteeringLogObserver(logCtx, () => recordFirstOutput(logCtx, start))
+              : (payload: string) => inspectResponseLogSsePayload(logCtx, payload);
+            const providerExecuted = responseToolOwnership(response);
             await sendResponseToWebSocket(ws, response, isCurrent, {
               untilEof: nativeControl?.relayActive === true,
-              onSsePayload: nativeControl?.relayActive
-                ? createNativeSteeringLogObserver(logCtx, () => recordFirstOutput(logCtx, start))
-                : payload => inspectResponseLogSsePayload(logCtx, payload),
+              onSsePayload: payload => {
+                ws.data.responsesActivity?.observePayload(payload, providerExecuted);
+                observeLog(payload);
+              },
               onTerminal: status => {
                 terminalRecorder?.(status, logCtx.terminalHttpStatus);
                 finalizeLog(httpStatusForRequestLogTerminal(status, logCtx), {
@@ -348,10 +391,26 @@ export function createWebsocketHandler(
                 const accountSelector = typeof payload.model === "string"
                   ? codexAccountNamespaceForModel(config.codexAccountNamespaces, payload.model)
                   : undefined;
+                if (err instanceof CodexMainAccountHardLockError) {
+                  // Same terminal usage-limit body and Retry-After as HTTP (#7046).
+                  const refusal = cooldownErrorResponse(err, Date.now(), accountSelector);
+                  const body = await refusal.json() as { error: Record<string, unknown> };
+                  sendJsonFrame(ws, buildWsErrorFrame(429, body.error, refusal.headers));
+                  return;
+                }
                 sendJsonFrame(ws, buildWsErrorFrame(429, {
                   type: "rate_limit_error",
                   message: cooldownErrorMessage(err, accountSelector),
                 }));
+                return;
+              }
+              // A local archive refusal happens before any send. Carry the same sanitized 503
+              // body and stable code as HTTP so no filesystem path reaches the client frame.
+              const archiveError = reasoningArchiveErrorResponse(err);
+              if (archiveError) {
+                finalizeLog(archiveError.status);
+                const body = await archiveError.json() as { error: Record<string, unknown> };
+                sendJsonFrame(ws, buildWsErrorFrame(archiveError.status, body.error));
                 return;
               }
               finalizeLog(502);
@@ -363,6 +422,7 @@ export function createWebsocketHandler(
               /* socket already gone or send dropped */
             }
           } finally {
+            finishActivity?.();
             turnAdmissionLease.release();
             if (ws.data.nativeControl === nativeControl) ws.data.nativeControl = undefined;
             if (!logged && turnAbort.signal.aborted) finalizeLog(499);

@@ -28,6 +28,11 @@ const FREEFORM_FALLBACK_KEYS: Readonly<Record<string, readonly string[]>> = {
   apply_patch: ["patch", "content"],
 };
 
+/** The field names a tool's freeform wrapper may unwrap through, besides canonical `input`. */
+export function freeformFallbackKeys(toolName: string): readonly string[] {
+  return FREEFORM_FALLBACK_KEYS[toolName] ?? [];
+}
+
 function stripMarkdownCodeFence(text: string, toolName: string): string {
   if (toolName !== "exec" && toolName !== "apply_patch") return text;
   const match = OUTER_MARKDOWN_CODE_FENCE.exec(text.trim());
@@ -46,7 +51,7 @@ export function unwrapFreeformToolInput(argumentsText: unknown, toolName = ""): 
           ? stripMarkdownCodeFence(record.input, toolName)
           : argumentsText;
       }
-      const fallbackKeys = FREEFORM_FALLBACK_KEYS[toolName] ?? [];
+      const fallbackKeys = freeformFallbackKeys(toolName);
       const candidates = fallbackKeys.filter(key => typeof record[key] === "string");
       if (candidates.length === 1) {
         return stripMarkdownCodeFence(record[candidates[0]] as string, toolName);
@@ -107,6 +112,41 @@ export function isCompletePatchEnvelope(text: string): boolean {
 export function mayBecomePatchEnvelope(text: string): boolean {
   if (text === "") return false;
   return text.startsWith(PATCH_BEGIN) || PATCH_BEGIN.startsWith(text);
+}
+
+/** Largest prefix of an exactly opened patch that completion cannot rewrite. */
+export function stableCanonicalPatchPrefix(text: string): string | null {
+  const lfOpening = `${PATCH_BEGIN}\n`;
+  const crlfOpening = `${PATCH_BEGIN}\r\n`;
+  if (!text.startsWith(lfOpening) && !text.startsWith(crlfOpening)) {
+    return lfOpening.startsWith(text) || crlfOpening.startsWith(text) ? "" : null;
+  }
+
+  let core = text;
+  let trailingBreak = "";
+  if (core.endsWith("\r\n")) {
+    core = core.slice(0, -2);
+    trailingBreak = "\r\n";
+  } else if (core.endsWith("\n")) {
+    core = core.slice(0, -1);
+    trailingBreak = "\n";
+  } else if (core.endsWith("\r")) {
+    // This may become the first byte of a CRLF. It is stable for a canonical
+    // closer, but must remain behind a decorated closer that may be rewritten.
+    core = core.slice(0, -1);
+    trailingBreak = "\r";
+  }
+  const lineStart = Math.max(core.lastIndexOf("\n"), core.lastIndexOf("\r")) + 1;
+  const line = core.slice(lineStart);
+  if (!line.startsWith(PATCH_END)) return text;
+
+  const suffix = line.slice(PATCH_END.length);
+  const decoration = " ***";
+  if (suffix === "") return core + trailingBreak;
+  if (decoration.startsWith(suffix)) {
+    return core.slice(0, lineStart + PATCH_END.length);
+  }
+  return text;
 }
 
 /**

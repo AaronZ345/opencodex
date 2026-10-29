@@ -15,6 +15,42 @@ const validatorSource = readFileSync(
 );
 
 describe("ocx.mjs package launcher (source invariants)", () => {
+  test("PATH fallback follows bundled installer recovery and returns process provenance", () => {
+    const start = source.indexOf("function resolveBun(");
+    const end = source.indexOf("// `ocx update --help`", start);
+    const resolver = source.slice(start, end);
+    expect(resolver.indexOf("bunDir = bunBinDir(launcherPath)")).toBeGreaterThan(resolver.indexOf('source: "override"'));
+    expect(resolver.indexOf("findPathBun(")).toBeGreaterThan(resolver.indexOf("spawnSync(process.execPath, [installJs]"));
+    expect(resolver.indexOf("fail(bunDir ?")).toBeGreaterThan(resolver.indexOf("findPathBun("));
+    expect(resolver).toContain('source: "process"');
+    expect(resolver).not.toContain('catch {\n    fail("the `bun` dependency is not installed.");');
+  });
+
+  test("fallback derives its compatibility floor from the package dependency", () => {
+    expect(source).toContain('typeof pkg.dependencies?.bun === "string" ? pkg.dependencies.bun : ""');
+    expect(source).toContain("pinnedVersion: pinnedBunVersion(launcherPath), deadlineMs: PATH_BUN_PROBE_BUDGET_MS");
+    // Bounded, but sized for a cold first run of a scanned bun.exe on Windows.
+    expect(source).toContain("const PATH_BUN_PROBE_BUDGET_MS = 5_000;");
+    expect(source).not.toContain('pinnedVersion: "1.4.2"');
+  });
+
+  test("terminal failure names Desktop only as a pointer; resolver and failure do not import supervision", () => {
+    const failStart = source.indexOf("function fail(");
+    const resolveStart = source.indexOf("function resolveBun(", failStart);
+    const resolveEnd = source.indexOf("// `ocx update --help`", resolveStart);
+    expect(failStart).toBeGreaterThanOrEqual(0);
+    expect(resolveStart).toBeGreaterThan(failStart);
+    expect(resolveEnd).toBeGreaterThan(resolveStart);
+    const failure = source.slice(failStart, resolveStart);
+    const resolver = source.slice(resolveStart, resolveEnd);
+    expect(failure).toContain("const desktopCli = findDesktopCli();");
+    expect(failure).toContain("An installed Desktop CLI is available:");
+    expect(failure).not.toMatch(/spawn(?:Sync)?\(/);
+    for (const body of [failure, resolver]) expect(body).not.toContain("desktop-supervision.mjs");
+    const pathRuntime = readFileSync(repoPath("src", "lib", "bun-path-runtime.mjs"), "utf8");
+    expect(pathRuntime).not.toContain("desktop-supervision.mjs");
+  });
+
   test("the Bun child receives the runtime provenance the launcher actually selected (#848)", () => {
     // The launcher is a plain-Node bin script executing at import time, so this is
     // asserted at the source level: the marker must reach the spawn env, and it must
@@ -23,7 +59,7 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     expect(source).toContain("[BUN_RUNTIME_SOURCE_ENV]: bunRuntime.source,");
 
     // The stamp must sit inside the spawn's env object, not merely somewhere in the file.
-    const spawnStart = source.indexOf("const child = spawn(bun, [cliPath");
+    const spawnStart = source.indexOf("const child = probeSpawn(bun, [cliPath");
     expect(spawnStart).toBeGreaterThanOrEqual(0);
     const spawnCall = source.slice(spawnStart, source.indexOf("});", spawnStart));
     expect(spawnCall).toContain("[BUN_RUNTIME_SOURCE_ENV]: bunRuntime.source");
@@ -31,7 +67,7 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     // Path and source come from one resolution, so the marker cannot describe another binary.
     expect(source).toContain("const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });");
     expect(source).toContain("const bun = bunRuntime.path;");
-    expect(source).toContain('return { path: bin, source: "bundled" };');
+    expect(source).toContain('return { path: bin, source: "bundled", version: bundledBunVersion(bunDir) };');
 
     // The launcher's literal name must match the TypeScript constant it mirrors.
     expect(runtimeSource).toContain('export const BUN_RUNTIME_SOURCE_ENV = "OCX_BUN_RUNTIME_SOURCE";');
@@ -48,7 +84,7 @@ describe("ocx.mjs package launcher (source invariants)", () => {
   });
 
   test("the long-running Bun child stays hidden under a headless Windows launcher (#1236)", () => {
-    const spawnStart = source.indexOf("const child = spawn(bun, [cliPath");
+    const spawnStart = source.indexOf("const child = probeSpawn(bun, [cliPath");
     expect(spawnStart).toBeGreaterThanOrEqual(0);
     const spawnCall = source.slice(spawnStart, source.indexOf("});", spawnStart));
 
@@ -64,11 +100,11 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     expect(source).toContain("pnpmOwnerInvocation(owner, args)");
     expect(source).toContain("const latestInvocation = managerInvocation(");
     expect(source).toContain("const installInvocation = managerInvocation(installArgs);");
-    expect(source).toContain("spawnSync(latestInvocation.file, latestInvocation.args");
+    expect(source).toContain("probeSpawnSync(latestInvocation.file, latestInvocation.args");
     // #1942: the staged install spawns through the same hardened npmInvocation resolver
     // inside the transactional runNpm callback.
     expect(source).toContain("const invocation = npmInvocation(args);");
-    expect(source).toContain("spawnSync(invocation.file, invocation.args");
+    expect(source).toContain("guardedSpawnSync(homePolicy.authorizeMutation, \"package\", invocation.file, invocation.args");
     expect(source).not.toContain("shell: true");
     expect(source).not.toContain('"npm.cmd"');
   });
@@ -102,11 +138,16 @@ describe("ocx.mjs package launcher (source invariants)", () => {
    */
   test("the inspection child does not inherit a duplicate copy of the snapshotted values", () => {
     expect(source).toContain("const inheritedEnv = { ...process.env };");
-    expect(source).toContain("...inheritedEnv,");
+    // The de-duplicated environment reaches the child; only its transpiler cache is scoped (#7362).
+    expect(source).toContain("...scopeTranspilerCacheToRuntime(inheritedEnv, bunRuntime.version, join),");
     // Windows spells the variable `Path` in practice, so an upper-case-only delete would
     // leave the duplicate behind. The match must be on the lowercase form of every key.
     expect(source).toContain("if (snapshotted.has(name.toLowerCase())) delete inheritedEnv[name];");
-    expect(source).toContain('["PATH", "PATHEXT", ...CODEX_CLI_VERSION_MANAGER_ROOT_ENV_SLOTS].map(name => name.toLowerCase())');
+    expect(source).toContain('...CODEX_CLI_TRANSPORT_ENV_KEYS].map(name => name.toLowerCase())');
+    expect(source).toContain("const preBunTransportEnv = captureCodexCliTransportEnv(process.env);");
+    expect(source).toContain("transportEnv: preBunTransportEnv,");
+    // The backing arch is the Node launcher's, bound before Bun (possibly another arch) starts.
+    expect(source).toContain("arch: process.arch,");
 
     // The de-duplication is scoped to the one-shot inspection launch; every other launch
     // must still inherit PATH, or the long-running proxy child loses its tooling lookup.
@@ -114,9 +155,11 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     expect(guard).toBeGreaterThan(-1);
 
     // The spawn must no longer splat the raw environment, or the deletes above are pointless.
-    const spawnStart = source.indexOf("const child = spawn(bun, [cliPath,");
+    const spawnStart = source.indexOf("const child = probeSpawn(bun, [cliPath,");
     expect(spawnStart).toBeGreaterThan(-1);
     expect(source.slice(spawnStart)).not.toContain("...process.env,");
+    expect(source.slice(spawnStart, source.indexOf("});", spawnStart)))
+      .toContain("...scopeTranspilerCacheToRuntime(inheritedEnv, bunRuntime.version, join),");
   });
 
   /**
@@ -137,10 +180,10 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     expect(source).toContain("const overridePath = resolve(override);");
     expect(source).toContain('if (isRealBunBinary(overridePath)) return { path: overridePath, source: "override" };');
 
-    const resolveStart = source.indexOf("function resolveBun({ allowInstall = true } = {}) {");
+    const resolveStart = source.indexOf("function resolveBun({ allowInstall = true, launcherPath, allowMissing = false } = {}) {");
     const overrideCheck = source.indexOf("process.env[BUN_OVERRIDE_ENV]?.trim()", resolveStart);
     const overrideResolve = source.indexOf("resolve(override)", overrideCheck);
-    const bundledLookup = source.indexOf("bunDir = bunBinDir()", resolveStart);
+    const bundledLookup = source.indexOf("bunDir = bunBinDir(launcherPath)", resolveStart);
     expect(resolveStart).toBeGreaterThanOrEqual(0);
     expect(overrideCheck).toBeGreaterThan(resolveStart);
     expect(overrideResolve).toBeGreaterThan(overrideCheck);
@@ -160,4 +203,24 @@ describe("ocx.mjs package launcher (source invariants)", () => {
     expect(validatorSource).toContain("export const REAL_BUN_MIN_BYTES = 1_000_000;");
     expect(validatorSource).toMatch(/export function isRealBunBinary\(path\) \{[\s\S]*?try \{[\s\S]*?statSync\(path\)[\s\S]*?catch \{[\s\S]*?return false;/);
   });
+});
+
+
+test("Desktop supervision is freshly checked before Node stop and both package-manager mutations", () => {
+  expect(source).toContain('from "../src/service/desktop-supervision.mjs"');
+  expect(source.match(/createSupervisionLatch\(\)/g)).toHaveLength(1);
+  const initial = source.indexOf("supervision: observeSupervision()", source.indexOf("const initialOwnership"));
+  const gate = source.indexOf("const preStopPlan = planUpdateRuntimeHandling({");
+  const stop = source.indexOf('const stopRes = guardedSpawnSync(homePolicy.authorizeMutation, serviceWasInstalled ? "service" : "runtime", process.execPath, [launcher, "stop"]');
+  const npm = source.indexOf("const tx = await transactionalNpmUpdate({");
+  const pnpm = source.indexOf("const update = runPnpmGlobalUpdate({");
+  expect(initial).toBeGreaterThan(0); expect(gate).toBeGreaterThan(initial);
+  expect(stop).toBeGreaterThan(gate); expect(npm).toBeGreaterThan(stop); expect(pnpm).toBeGreaterThan(stop);
+  const gateBody = source.slice(gate, stop);
+  expect(gateBody).toContain("supervision: observeSupervision()");
+  expect(gateBody).toContain("if (!preStopPlan.mayStopRuntime)");
+  expect(gateBody).toContain("process.exit(1)");
+  // Node has no identity-checked PID: the inspector must correlate its own records.
+  expect(source).toContain("supervisionLatch.observe(inspectDesktopSupervision())");
+  expect(source).not.toContain("inspectDesktopSupervision({ targetPid");
 });

@@ -4,7 +4,57 @@ import { createRequestExecutionBudget } from "../../../src/lib/request-execution
 import { budgetOwner } from "../../helpers/send-budget-owner";
 import type { AdapterRequest } from "../../../src/adapters/base";
 import { fetchAntigravityWithRetry, fetchDirectGeminiWithRetry, fetchVertexWithRetry } from "../../../src/adapters/google-http";
-import { safeVertexHttpErrorMessage, retryableGoogleStatus } from "../../../src/adapters/google-errors";
+import { ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, safeVertexHttpErrorMessage, retryableGoogleStatus } from "../../../src/adapters/google-errors";
+import { isAntigravityValidationRefusal } from "../../../src/server/responses/antigravity-validation-refusal";
+
+describe("Antigravity 403 body boundary", () => {
+  test("a complete structured reason inside 4096 bytes survives normalization", async () => {
+    const payload = JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+      details: [{ reason: "VALIDATION_REQUIRED" }] } });
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(payload, { status: 403 })) as typeof fetch,
+    });
+    expect((await result.text()).startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}:`)).toBe(true);
+  });
+
+  test("only a complete normalized marker admits rotation and inspection preserves the response", async () => {
+    const accepted = new Response(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: validation needed`, { status: 403 });
+    expect(await isAntigravityValidationRefusal(accepted)).toBe(true);
+    expect(await accepted.text()).toContain("validation needed");
+    for (const text of [ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, `${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}x: fake`,
+      `Antigravity access denied: ${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: fake`]) {
+      const refused = new Response(text, { status: 403 });
+      expect(await isAntigravityValidationRefusal(refused)).toBe(false);
+      expect(await refused.text()).toBe(text);
+    }
+    const controller = new AbortController();
+    controller.abort();
+    const aborted = new Response(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: validation needed`, { status: 403 });
+    expect(await isAntigravityValidationRefusal(aborted, controller.signal)).toBe(false);
+    expect(await aborted.text()).toContain("validation needed");
+  });
+
+  test("an oversized validation body is discarded before formatting", async () => {
+    const payload = JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "secret-canary",
+      filler: "x".repeat(4200), details: [{ reason: "VALIDATION_REQUIRED" }] } });
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(payload, { status: 403 })) as typeof fetch,
+    });
+    const text = await result.text();
+    expect(text).toBe("Antigravity access denied: HTTP 403");
+    expect(text).not.toContain("secret-canary");
+  });
+
+  test("a stalled validation body falls back after the 2 second bound", async () => {
+    const stalled = new ReadableStream<Uint8Array>({ start() {} });
+    const start = performance.now();
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(stalled, { status: 403 })) as typeof fetch,
+    });
+    expect(performance.now() - start).toBeLessThan(3500);
+    expect(await result.text()).toBe("Antigravity access denied: HTTP 403");
+  });
+});
 
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
@@ -33,6 +83,21 @@ function vertexError(code: number, status: string, message: string): string {
 }
 
 describe("vertex retry fetch", () => {
+  test("Google preserves the executor TypeError after its header deadline", async () => {
+    const original = new TypeError("google executor deadline rejection");
+    let sends = 0;
+    const executor = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sends += 1;
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) reject(original);
+        else signal?.addEventListener("abort", () => reject(original), { once: true });
+      });
+    }) as typeof fetch;
+    await expect(fetchVertexWithRetry(request, { executor, timeoutMs: 1 })).rejects.toBe(original);
+    expect(sends).toBe(retry.TRANSIENT_RETRY_MAX_ATTEMPTS);
+  });
+
   for (const [name, fetchResponse] of [["Vertex", fetchVertexWithRetry], ["Antigravity", fetchAntigravityWithRetry]] as const) {
     test.each([400, 429, 503, "reset"] as const)(`${name} prepaid final send prevents another inference or backoff (%s)`, async status => {
       const parent = createRequestExecutionBudget();
@@ -190,11 +255,14 @@ describe("vertex retry fetch", () => {
       value: () => neverSettles,
     });
     const mock = mockFetch([first, new Response("ok", { status: 200 })]);
+    // Retry-After is a floor over the jittered backoff (#7802), so stub the backoff sleep: the
+    // race below measures only whether the resend waits on the discarded body's cancellation.
+    const waits = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
 
     const res = await Promise.race([
       fetchVertexWithRetry(request, { timeoutMs: 5_000 }),
       Bun.sleep(250).then(() => { throw new Error("retry waited for response body cancellation"); }),
-    ]);
+    ]).finally(() => waits.mockRestore());
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -455,3 +523,62 @@ describe("adapter fetchResponse wiring", () => {
     }
   });
 });
+
+describe("Google Retry-After is a lower bound (#7802)", () => {
+  const wrappers = [
+    ["Vertex", fetchVertexWithRetry],
+    ["Antigravity", fetchAntigravityWithRetry],
+    ["Gemini direct", fetchDirectGeminiWithRetry],
+  ] as const;
+  const transient = (status: 429 | 503, retryAfter: string) => new Response(
+    vertexError(status, status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE", "rate limit, try again"),
+    { status, headers: { "Retry-After": retryAfter } },
+  );
+
+  for (const [name, fetchResponse] of wrappers) {
+    for (const status of [429, 503] as const) test(`${name} waits the full instructed delay before resending (${status})`, async () => {
+      const fixture = mockFetch([transient(status, "30"), new Response("ok", { status: 200 })]);
+      const waits: number[] = [];
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async ms => { waits.push(ms); });
+      try {
+        const res = await fetchResponse(request, { timeoutMs: 5_000 });
+        expect(res.status).toBe(200);
+        expect(fixture.calls).toHaveLength(2);
+        expect(waits).toHaveLength(1);
+        expect(waits[0]).toBeGreaterThanOrEqual(30_000);
+      } finally { sleep.mockRestore(); }
+    });
+
+    test(`${name} honours an HTTP-date Retry-After as the same floor`, async () => {
+      const at = new Date(Date.now() + 45_000).toUTCString();
+      const fixture = mockFetch([transient(503, at), new Response("ok", { status: 200 })]);
+      const waits: number[] = [];
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async ms => { waits.push(ms); });
+      try {
+        expect((await fetchResponse(request, { timeoutMs: 5_000 })).status).toBe(200);
+        expect(fixture.calls).toHaveLength(2);
+        expect(waits).toHaveLength(1);
+        expect(waits[0]).toBeGreaterThanOrEqual(43_000);
+        expect(waits[0]).toBeLessThanOrEqual(retry.RETRY_AFTER_CEILING_MS);
+      } finally { sleep.mockRestore(); }
+    });
+
+    for (const status of [429, 503] as const) test(`${name} ends with the upstream answer when the instruction outlives the wait deadline (${status})`, async () => {
+      const first = transient(status, "120");
+      const fixture = mockFetch([first, new Response("unexpected early resend", { status: 200 })]);
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
+      try {
+        const res = await fetchResponse(request, { timeoutMs: 5_000 });
+        expect(res.status).toBe(status);
+        expect(fixture.calls).toHaveLength(1);
+        expect(sleep).not.toHaveBeenCalled();
+        if (name === "Gemini direct") {
+          expect(res).toBe(first);
+          expect(res.headers.get("retry-after")).toBe("120");
+          expect(await res.text()).toContain("rate limit, try again");
+        }
+      } finally { sleep.mockRestore(); }
+    });
+  }
+});
+

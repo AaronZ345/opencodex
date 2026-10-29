@@ -6,7 +6,9 @@
  * `killAllOcxOnPort`, and successful ocx verification. A historical PID allowlist
  * never overrides a rejected verifier result; rejected live holders stay protected.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { readFile, readdir, readlink } from "node:fs/promises";
+import { promisify } from "node:util";
 import { verifyPidIdentity } from "../config/process-state";
 import { isProcessAlive, killProxy } from "../lib/process-control";
 import { isPortAvailable, type WaitForPortOptions } from "./ports";
@@ -14,6 +16,16 @@ import { dropWindowsTcpRowsForLocalPort } from "./windows-tcp-drop";
 
 export type ListenPidScan =
   | { ok: true; pids: number[] }
+  | { ok: false; error?: string };
+
+/** One listening socket with its bound local address (host part only). */
+export interface ListenEntry {
+  pid: number;
+  address: string;
+}
+
+export type ListenEntryScan =
+  | { ok: true; listeners: ListenEntry[] }
   | { ok: false; error?: string };
 
 export type ReclaimListenPortOptions = WaitForPortOptions & {
@@ -52,18 +64,62 @@ export type ReclaimListenPortOptions = WaitForPortOptions & {
   listListenPidsFn?: (port: number) => ListenPidScan | number[];
   isAliveFn?: (pid: number) => boolean;
   verifyOcxFn?: (pid: number) => number | null;
-  killFn?: (pid: number) => void;
-  dropTcpFn?: (port: number) => number | { dropped: number; skippedIpv6: number };
+  killFn?: (pid: number, mayMutate?: () => boolean) => void;
+  dropTcpFn?: (port: number, mayMutate?: () => boolean) => number | { dropped: number; skippedIpv6: number };
   isAvailableFn?: (port: number, hostname?: string) => Promise<boolean>;
+  /**
+   * Synchronous authority gate re-checked after each availability await and
+   * immediately before every destructive action (killFn / dropTcpFn). Returning
+   * false denies the mutation and ends the reclaim: the port is reported
+   * not-freed without touching processes or TCP rows. A throwing gate denies too.
+   */
+  mayMutateFn?: () => boolean;
   sleepMs?: (ms: number) => Promise<void>;
 };
 
+/** Split `host:port`/`[v6]:port` on a numeric port boundary; returns the host part. */
+function listenHost(token: string): string {
+  const bracketed = /^(\[[0-9a-fA-F:.]+\]):/.exec(token);
+  if (bracketed) return bracketed[1].slice(1, -1).toLowerCase();
+  // Only a trailing :<digits> is a port; a bare "::" or hostname wildcard has none.
+  const withPort = /^(.*):(\d+)$/.exec(token);
+  return (withPort ? withPort[1] : token).toLowerCase();
+}
+
+/** Normalize a listen-address host: strips brackets and the IPv4-mapped prefix. */
+export function normalizeListenAddress(token: string): string {
+  let host = listenHost(token);
+  if (host.startsWith("::ffff:")) host = host.slice(7);
+  return host;
+}
+
+/** Normalize a bare bind address (no port): drops brackets, keeps bare IPv6 whole. */
+function bareListenAddress(address: string): string {
+  let host = address.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host.startsWith("::ffff:")) host = host.slice(7);
+  return host;
+}
+
+const WILDCARD_LISTEN_HOSTS = new Set(["", "*", "0.0.0.0", "::"]);
+
 /**
- * Parse `netstat -ano` (Windows) / `netstat -anlp` listen lines for a port.
- * Exported for unit tests.
+ * Whether a socket bound to `listenerAddress` also serves connections to `bound` —
+ * exact match, or a wildcard listener, or a wildcard `bound` (the caller listens on
+ * every address). IPv4-mapped IPv6 forms of the same address are equalized first.
  */
-export function parseListenPidsFromNetstat(output: string, port: number): number[] {
-  const pids = new Set<number>();
+export function listenAddressServes(listenerAddress: string, bound: string): boolean {
+  const listener = normalizeListenAddress(listenerAddress);
+  const want = bareListenAddress(bound);
+  return WILDCARD_LISTEN_HOSTS.has(listener) || WILDCARD_LISTEN_HOSTS.has(want)
+    || listener === want;
+}
+
+/**
+ * Parse `netstat -ano` (Windows) / `netstat -anlp` listen lines for a port, keeping
+ * each distinct PID/address pair. Exported for unit tests.
+ */
+export function parseListenEntriesFromNetstat(output: string, port: number): ListenEntry[] {
+  const entries = new Map<string, ListenEntry>();
   const portSuffix = `:${port}`;
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -86,9 +142,116 @@ export function parseListenPidsFromNetstat(output: string, port: number): number
       : unixPid
         ? Number(unixPid[1])
         : NaN;
-    if (Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
+    if (Number.isSafeInteger(pid) && pid > 0) {
+      const address = normalizeListenAddress(parts[localIdx]);
+      entries.set(`${pid}|${address}`, { pid, address });
+    }
   }
-  return [...pids];
+  return [...entries.values()];
+}
+
+/** Parse netstat LISTEN owners, deduplicating PIDs after preserving their addresses. */
+export function parseListenPidsFromNetstat(output: string, port: number): number[] {
+  return [...new Set(parseListenEntriesFromNetstat(output, port).map(entry => entry.pid))];
+}
+
+/**
+ * Field names `ss -p` is known to emit inside a `users:` tuple. comm names are printed
+ * unescaped and are attacker-controlled, but bounded to 15 bytes (TASK_COMM_LEN - 1):
+ * a forged complete tuple needs `",pid=N,fd=N),("` — closing one tuple and opening the
+ * next leaves no room for a nonempty name — and a forged in-tuple field needs a key
+ * outside this list to stay under the bound, so it trips the grammar check instead.
+ */
+const SS_OWNER_FIELD_KEYS = new Set(["fd", "ino", "sk", "v6only"]);
+
+/**
+ * Strictly parse a `users:(("name",pid=N,fd=N)[,("name2",...)])` column, returning every
+ * attributed PID, or null when the column deviates from the grammar anywhere — a row that
+ * cannot be trusted must not attribute an owner at all. Every accepted tuple must carry
+ * its own `fd=`: a forged tuple fragment emitted inside a comm (a 15-byte comm has room
+ * for `a",pid=N),("b` but never for a full tuple plus `fd=`) supplies only `pid=`, so
+ * its PID must never reach the owner list.
+ */
+function parseSsOwnerPids(field: string): number[] | null {
+  if (!field.startsWith("users:(")) return null;
+  const pids: number[] = [];
+  let at = "users:(".length;
+  while (field.startsWith("(", at)) {
+    at += 1;
+    // ss prints comm raw between quotes with no escaping; a quote inside the name
+    // therefore ends it early and the rest of the name lands in field position.
+    const name = /^"[^"\n]*"/.exec(field.slice(at));
+    if (name === null || name[0] === `""`) return null;
+    at += name[0].length;
+    const pid = /^,pid=(\d+)/.exec(field.slice(at));
+    if (pid === null) return null;
+    at += pid[0].length;
+    let hasFd = false;
+    for (;;) {
+      const kv = /^,([a-z_]+)=([^,"()\s]+)/.exec(field.slice(at));
+      if (kv === null) break;
+      if (!SS_OWNER_FIELD_KEYS.has(kv[1]!)) return null;
+      if (kv[1] === "fd") hasFd = true;
+      at += kv[0].length;
+    }
+    if (field[at] !== ")" || !hasFd) return null;
+    pids.push(Number(pid[1]));
+    at += 1;
+    if (field.startsWith(",(", at)) at += 1;
+  }
+  return field[at] === ")" && field.slice(at + 1).trim() === "" ? pids : null;
+}
+
+/**
+ * Parse `ss -Hltnp` rows for a port, keeping each distinct PID/address pair. A row
+ * without a `pid=` attribution (another user's socket), or whose `users:` column
+ * does not parse cleanly, is dropped rather than reported unverifiable. Exported
+ * for unit tests.
+ */
+export function parseListenEntriesFromSs(output: string, port: number): ListenEntry[] {
+  const entries = new Map<string, ListenEntry>();
+  const portSuffix = `:${port}`;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!/^LISTEN\b/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    // LISTEN <recv-q> <send-q> <local-addr:port> <peer-addr:port> users:(...)
+    const localIdx = parts.findIndex(part => part.endsWith(portSuffix) || part.endsWith(`]:${port}`));
+    if (localIdx < 0) continue;
+    const usersIdx = line.indexOf("users:(");
+    if (usersIdx < 0) continue;
+    const ownerPids = parseSsOwnerPids(line.slice(usersIdx));
+    if (ownerPids === null) continue;
+    const address = normalizeListenAddress(parts[localIdx]);
+    for (const pid of ownerPids) {
+      if (Number.isSafeInteger(pid) && pid > 0) entries.set(`${pid}|${address}`, { pid, address });
+    }
+  }
+  return [...entries.values()];
+}
+
+/**
+ * Parse `lsof -nP -iTCP:<port> -sTCP:LISTEN` output (without -t), keeping each
+ * distinct PID/address pair. The NAME column is the last address token, optionally
+ * followed by `(LISTEN)`; skip the header and nonnumeric PIDs. Exported for tests.
+ */
+export function parseListenEntriesFromLsof(output: string, port: number): ListenEntry[] {
+  const entries = new Map<string, ListenEntry>();
+  const portSuffix = `:${port}`;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^COMMAND\b/.test(line)) continue;
+    const parts = line.split(/\s+/);
+    const pid = /^\d+$/.test(parts[1] ?? "") ? Number(parts[1]) : NaN;
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    let addressIdx = parts.length - 1;
+    if (/^\(.*\)$/.test(parts[addressIdx] ?? "")) addressIdx -= 1;
+    const address = parts[addressIdx] ?? "";
+    if (!address.endsWith(portSuffix) && !address.endsWith(`]:${port}`)) continue;
+    const normalized = normalizeListenAddress(address);
+    entries.set(`${pid}|${normalized}`, { pid, address: normalized });
+  }
+  return [...entries.values()];
 }
 
 function normalizeListenPidScan(result: ListenPidScan | number[]): ListenPidScan {
@@ -119,54 +282,238 @@ function readWindowsNetstatAno(): string {
 }
 
 /**
- * Scan for PIDs currently LISTENing on `port`.
- * Distinguishes probe failure (`ok: false`) from a successful empty result.
+ * Scan for the sockets currently LISTENing on `port`, with each listener's bound
+ * local address. Distinguishes probe failure (`ok: false`) from a successful empty
+ * result. POSIX backends are tried in order — `lsof`, `ss` (iproute2, the only
+ * scanner on minimal Linux installs), then `netstat` — and a missing scanner falls
+ * through to the next instead of failing the scan.
  */
-export function scanListenPids(port: number): ListenPidScan {
+export function scanListenEntries(port: number): ListenEntryScan {
   if (!Number.isFinite(port) || port <= 0 || port > 65535) {
     return { ok: false, error: "invalid port" };
   }
+  const scanned = Math.trunc(port);
   try {
     if (process.platform === "win32") {
-      return { ok: true, pids: parseListenPidsFromNetstat(readWindowsNetstatAno(), port) };
+      return { ok: true, listeners: parseListenEntriesFromNetstat(readWindowsNetstatAno(), scanned) };
     }
+    const errors: string[] = [];
     try {
-      const output = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
+      const output = execFileSync("lsof", ["-nP", `-iTCP:${scanned}`, "-sTCP:LISTEN"], {
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 3000,
       });
-      return {
-        ok: true,
-        pids: output
-          .split(/\r?\n/)
-          .map(line => Number(line.trim()))
-          .filter(pid => Number.isSafeInteger(pid) && pid > 0),
-      };
-    } catch (lsofErr) {
-      try {
-        const output = execFileSync("netstat", ["-anlp"], {
-          encoding: "utf-8",
-          stdio: ["ignore", "pipe", "ignore"],
-          timeout: 3000,
-        });
-        return { ok: true, pids: parseListenPidsFromNetstat(output, Math.trunc(port)) };
-      } catch (netstatErr) {
-        return {
-          ok: false,
-          error: `lsof/netstat unavailable: ${String(lsofErr)} / ${String(netstatErr)}`,
-        };
-      }
+      return { ok: true, listeners: parseListenEntriesFromLsof(output, scanned) };
+    } catch (error) {
+      errors.push(`lsof: ${String(error)}`);
     }
+    try {
+      const output = execFileSync("ss", ["-Hltnp"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+      });
+      return { ok: true, listeners: parseListenEntriesFromSs(output, scanned) };
+    } catch (error) {
+      errors.push(`ss: ${String(error)}`);
+    }
+    try {
+      const output = execFileSync("netstat", ["-anlp"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+      });
+      return { ok: true, listeners: parseListenEntriesFromNetstat(output, scanned) };
+    } catch (error) {
+      errors.push(`netstat: ${String(error)}`);
+    }
+    return { ok: false, error: `no listener scanner available (${errors.join(" / ")})` };
   } catch (error) {
     return { ok: false, error: String(error) };
   }
+}
+
+/**
+ * Scan for PIDs currently LISTENing on `port`.
+ * Distinguishes probe failure (`ok: false`) from a successful empty result.
+ */
+export function scanListenPids(port: number): ListenPidScan {
+  const scan = scanListenEntries(port);
+  if (!scan.ok) return { ok: false, error: scan.error };
+  return { ok: true, pids: [...new Set(scan.listeners.map(entry => entry.pid))] };
+}
+
+/**
+ * PIDs LISTENing on `port` that actually serve `address`: listeners bound to that
+ * exact address plus wildcards (0.0.0.0/::). A listener on a different loopback or
+ * interface address (e.g. 127.0.0.2 while the tunnel binds 127.0.0.1) never receives
+ * the connection and must not block or qualify a readiness check.
+ */
+export function scanListenPidsForAddress(port: number, address = "127.0.0.1"): ListenPidScan {
+  const scan = scanListenEntries(port);
+  if (!scan.ok) return { ok: false, error: scan.error };
+  const pids = new Set<number>();
+  for (const entry of scan.listeners) {
+    if (listenAddressServes(entry.address, address)) pids.add(entry.pid);
+  }
+  return { ok: true, pids: [...pids] };
 }
 
 /** Best-effort PIDs currently LISTENing on `port`. Empty on probe failure. */
 export function listListenPids(port: number): number[] {
   const scan = scanListenPids(port);
   return scan.ok ? scan.pids : [];
+}
+
+const execFileAsync = promisify(execFile);
+const OWNER_LOOKUP_TIMEOUT_MS = 2_000;
+const MAX_PROC_NET_BYTES = 4 * 1024 * 1024;
+const MAX_PROCESS_FDS = 4_096;
+
+/** The exact IPv4 listener the Child relay contacts; ::1 and wildcard binds are not proof. */
+export function parseProcLoopbackListenInodes(tcp: string, tcp6: string, port: number): string[] {
+  const wantedPort = port.toString(16).toUpperCase().padStart(4, "0");
+  const inodes = new Set<string>();
+  for (const [content, wantedAddress] of [
+    [tcp, "0100007F"],
+    [tcp6, "0000000000000000FFFF00000100007F"], // ::ffff:127.0.0.1 in proc word order
+  ] as const) {
+    for (const line of content.split(/\r?\n/).slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      const [address, hexPort] = (fields[1] ?? "").toUpperCase().split(":");
+      if (address !== wantedAddress || hexPort !== wantedPort || fields[3] !== "0A") continue;
+      const inode = fields[9];
+      if (inode && /^[1-9]\d*$/.test(inode)) inodes.add(inode);
+    }
+  }
+  return [...inodes];
+}
+
+/** Parse only 127.0.0.1:port LISTEN owners; an unrelated [::1]:port must not veto it. */
+export function parseIpv4LoopbackListenPidsFromNetstat(output: string, port: number): number[] {
+  const pids = new Set<number>();
+  for (const raw of output.split(/\r?\n/)) {
+    const fields = raw.trim().split(/\s+/);
+    if (fields[0]?.toUpperCase() !== "TCP" || fields[1] !== `127.0.0.1:${port}`) continue;
+    const state = fields[3] ?? "";
+    const foreign = fields[2] ?? "";
+    if (!/^LISTEN/i.test(state) && !["0.0.0.0:0", "[::]:0", "*:*"].includes(foreign)) continue;
+    const pid = Number(fields.at(-1));
+    if (Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
+  }
+  return [...pids];
+}
+
+async function runOwnerLookup(file: string, args: string[], timeoutMs: number): Promise<string> {
+  const { stdout } = await execFileAsync(file, args, {
+    encoding: "utf8", timeout: timeoutMs, maxBuffer: MAX_PROC_NET_BYTES, windowsHide: true,
+  });
+  return stdout;
+}
+
+export type LoopbackOwnerLookupResult = {
+  kind: "match" | "mismatch" | "lookup_error" | "deadline";
+  elapsedMs: number;
+};
+
+export interface LoopbackOwnerLookupIo {
+  platform?: NodeJS.Platform;
+  nowMs?: () => number;
+  scheduleDeadline?: (callback: () => void, timeoutMs: number) => () => void;
+  readProc?: (path: string) => Promise<string>;
+  listFds?: (path: string) => Promise<string[]>;
+  readFdLink?: (path: string) => Promise<string>;
+  run?: (file: string, args: string[], timeoutMs: number) => Promise<string>;
+}
+
+/**
+ * Classify fresh IPv4 loopback LISTEN ownership within the bounded lookup deadline.
+ * Only match proves the expected PID; mismatch, inspection failure and timeout remain distinct.
+ * elapsedMs uses a monotonic clock by default, and no raw OS output is returned.
+ */
+export async function inspectIpv4LoopbackListener(
+  port: number,
+  expectedPid: number,
+  io: LoopbackOwnerLookupIo = {},
+): Promise<LoopbackOwnerLookupResult> {
+  const now = io.nowMs ?? (() => performance.now());
+  const startedAt = now();
+  const result = (kind: LoopbackOwnerLookupResult["kind"]): LoopbackOwnerLookupResult =>
+    ({ kind, elapsedMs: Math.max(0, now() - startedAt) });
+  if (!Number.isInteger(port) || port < 1 || port > 65535
+    || !Number.isSafeInteger(expectedPid) || expectedPid < 1) return result("mismatch");
+  const platform = io.platform ?? process.platform;
+  const lookup = async (): Promise<boolean> => {
+    if (platform === "linux") {
+      const readProc = io.readProc ?? (path => readFile(path, "utf8"));
+      const tcp = await readProc("/proc/net/tcp");
+      const tcp6 = await readProc("/proc/net/tcp6").catch(error => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+        throw error;
+      });
+      if (tcp.length > MAX_PROC_NET_BYTES || tcp6.length > MAX_PROC_NET_BYTES) return false;
+      const inodes = parseProcLoopbackListenInodes(tcp, tcp6, port);
+      if (inodes.length !== 1) return false;
+      const fdDir = `/proc/${expectedPid}/fd`;
+      const fds = await (io.listFds ?? readdir)(fdDir);
+      if (fds.length > MAX_PROCESS_FDS) return false;
+      const wanted = `socket:[${inodes[0]}]`;
+      const readFdLink = io.readFdLink ?? readlink;
+      for (const fd of fds) {
+        try { if (await readFdLink(`${fdDir}/${fd}`) === wanted) return true; }
+        catch { /* an fd may close while it is enumerated */ }
+      }
+      return false;
+    }
+    const run = io.run ?? runOwnerLookup;
+    if (platform === "darwin") {
+      const stdout = await run("/usr/sbin/lsof", ["-nP", "-a", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN", "-t"], OWNER_LOOKUP_TIMEOUT_MS);
+      const pids = new Set(stdout.split(/\r?\n/).map(line => Number(line.trim())).filter(pid => Number.isSafeInteger(pid) && pid > 0));
+      return pids.size === 1 && pids.has(expectedPid);
+    }
+    if (platform === "win32") {
+      const netstat = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\netstat.exe`;
+      const stdout = await run(netstat, ["-ano", "-p", "tcp"], OWNER_LOOKUP_TIMEOUT_MS);
+      const pids = parseIpv4LoopbackListenPidsFromNetstat(stdout, port);
+      return pids.length === 1 && pids[0] === expectedPid;
+    }
+    return false;
+  };
+  const scheduleDeadline = io.scheduleDeadline ?? ((callback, timeoutMs) => {
+    const timer = setTimeout(callback, timeoutMs);
+    timer.unref?.();
+    return () => clearTimeout(timer);
+  });
+  let cancelDeadline: (() => void) | undefined;
+  const deadline = new Promise<LoopbackOwnerLookupResult["kind"]>(resolve => {
+    cancelDeadline = scheduleDeadline(() => resolve("deadline"), OWNER_LOOKUP_TIMEOUT_MS);
+  });
+  const inspected = lookup().then(
+    matches => matches ? "match" as const : "mismatch" as const,
+    error => {
+      const failure = error as {
+        killed?: boolean; signal?: string | null; code?: unknown; stdout?: unknown; stderr?: unknown;
+      } | null;
+      // lsof exits 1 with no output when no socket matches its selectors.
+      if (platform === "darwin" && failure?.code === 1 && !failure.killed
+        && failure.signal == null && failure.stdout === "" && failure.stderr === "") return "mismatch" as const;
+      // execFile's timeout kills with SIGTERM; other spawn/exit/buffer errors are lookup failures.
+      return failure?.killed === true && failure.signal === "SIGTERM" && failure.code === null
+        ? "deadline" as const : "lookup_error" as const;
+    },
+  );
+  try { return result(await Promise.race([inspected, deadline])); }
+  finally { cancelDeadline?.(); }
+}
+
+/** Boolean compatibility API: only a proven match admits the listener. */
+export async function ownsIpv4LoopbackListener(
+  port: number,
+  expectedPid: number,
+  io: LoopbackOwnerLookupIo = {},
+): Promise<boolean> {
+  return (await inspectIpv4LoopbackListener(port, expectedPid, io)).kind === "match";
 }
 
 /**
@@ -176,6 +523,8 @@ export function listListenPids(port: number): number[] {
  * revalidates immediately before each kill.
  * Never overrides a rejected ocx verifier result. Never drops TCP rows while a
  * rejected live or protected ocx listener owns the port, or when the scan failed.
+ * A denied `mayMutateFn` ends the wait: no kill or TCP-row drop may run under
+ * an authority that no longer holds.
  */
 export async function reclaimListenPort(
   port: number,
@@ -199,13 +548,21 @@ export async function reclaimListenPort(
   const dropTcpFn = opts.dropTcpFn ?? dropWindowsTcpRowsForLocalPort;
   const isAvailableFn = opts.isAvailableFn ?? isPortAvailable;
   const sleep = opts.sleepMs ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  let denied = false;
+  const mayMutate = (): boolean => {
+    try { denied ||= opts.mayMutateFn !== undefined && opts.mayMutateFn() !== true; } catch { denied = true; }
+    return !denied;
+  };
 
   const deadline = Date.now() + timeoutMs;
   let lastScan = 0;
   const killed = new Set<number>();
 
   for (;;) {
-    if (await isAvailableFn(port, hostname)) return true;
+    const available = await isAvailableFn(port, hostname);
+    // The authority may have changed while the availability probe was in flight.
+    if (!mayMutate()) return false;
+    if (available) return true;
     if (Date.now() >= deadline) return false;
 
     if (Date.now() - lastScan >= scanIntervalMs) {
@@ -246,10 +603,13 @@ export async function reclaimListenPort(
         if (!killed.has(pid)) {
           // Revalidate immediately before termination.
           if (isAliveFn(pid) && verifyOcxFn(pid) === pid && mayKillThis) {
+            if (!mayMutate()) return false;
             try {
-              killFn(pid);
+              if (opts.mayMutateFn) killFn(pid, mayMutate);
+              else killFn(pid);
               killed.add(pid);
             } catch {
+              if (denied) return false;
               // Kill failed: keep waiting and never reset this listener's TCP rows.
               protectedOcxListener = true;
             }
@@ -279,9 +639,13 @@ export async function reclaimListenPort(
       // Reset those IPv4 TCBs (and ghost LISTEN rows) so the configured port can bind again —
       // without killing the browser process. Only safe when no live foreign/protected listener remains.
       if (dropTcpRows) {
+        // Same gate as the kill path: denied authority never runs SetTcpEntry.
+        if (!mayMutate()) return false;
         try {
-          dropTcpFn(port);
+          if (opts.mayMutateFn) dropTcpFn(port, mayMutate);
+          else dropTcpFn(port);
         } catch {
+          if (denied) return false;
           /* access denied / unsupported — keep waiting */
         }
       }

@@ -36,6 +36,14 @@ const CURSOR_MODEL_EFFORT_TIERS: Record<string, readonly string[]> = {
   "claude-opus-4-8-fast": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-5-fast": ["low", "medium", "high"],
+  // 260923 Opus 5.5: live GetUsableModels roster advertises low..max in both regular and fast forms.
+  "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-5-5-fast": ["low", "medium", "high", "xhigh", "max"],
+  // 260929 preemptive Sonnet 5.5: Anthropic documents low..max; flat ids like Opus 5.5 until the
+  // live GetUsableModels roster lists the model.
+  // 261008 preemptive Haiku 5.5: flat regular low..max ids, per Cursor docs.
+  "claude-haiku-5-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
   "glm-5.2": ["high", "max"],
   // 260825 live GetUsableModels. gemini-3.6-flash was the first Cursor model exposing
@@ -48,6 +56,9 @@ const CURSOR_MODEL_EFFORT_TIERS: Record<string, readonly string[]> = {
   // glm-5.3 was. Google documents low/medium/high with no `minimal` for this generation,
   // unlike 3.6. The seed is inert until Cursor's live roster lists the id.
   "gemini-3.8-flash": ["low", "medium", "high"],
+  // 261014 preemptive: Gemini 4 Argon, low/medium/high with no `minimal` (a documented 400).
+  // Inert until Cursor's live roster lists the id.
+  "gemini-4-argon": ["low", "medium", "high"],
   // Explicit-thinking variants (260825 live roster). Tiers are the rungs the wire actually
   // lists for each family, which is not always the same set the non-thinking id carries:
   // 4.6-opus thinks only at high/max, 4.5-opus only at high, 4.6-sonnet only at medium.
@@ -79,6 +90,10 @@ const CURSOR_MODEL_EFFORT_TIERS: Record<string, readonly string[]> = {
   // Cursor's 260813 lineup exposes Grok 4.6 Extra High in both regular and Fast forms.
   "grok-4.6": ["low", "medium", "high", "xhigh"],
   "grok-4.6-fast": ["low", "medium", "high", "xhigh"],
+  // 4.7 live ids have no cursor- prefix and Fast follows effort; see
+  // devlog/_fin/260923_grok47_parity/010_probe-evidence.md.
+  "grok-4.7": ["low", "medium", "high", "xhigh"],
+  "grok-4.7-fast": ["low", "medium", "high", "xhigh"],
   "gpt-5.1": ["low", "high"],
   "gpt-5.1-codex-max": ["low", "medium", "high", "xhigh"],
   "gpt-5.1-codex-mini": ["low", "high"],

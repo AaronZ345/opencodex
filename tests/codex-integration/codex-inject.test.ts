@@ -12,7 +12,6 @@ import {
   setRootRealtimeWsBaseUrl,
   stripInjectedOpenaiBaseUrl,
   stripOpencodexConfig,
-  stripRootContextWindowOverrides,
   standaloneCodexRoutingTarget,
 } from "../../src/codex/inject";
 import {
@@ -21,14 +20,38 @@ import {
   buildProviderTableBlockForTarget,
   resolveCodexProviderDisplayName,
 } from "../../src/codex/inject/config-toml";
-import { extractOcxProviderTableBlock } from "../../src/codex/inject/remove";
-import { OCX_SECTION_MARKER, stripJournaledOpenaiBaseUrl } from "../../src/codex/injected-marker";
+import {
+  appendOcxProviderTableBlock,
+  extractOcxProviderTableBlock,
+} from "../../src/codex/inject/remove";
+import { remoteThreadListCompatibilityWarning } from "../../src/codex/inject/routing-target";
+import { OCX_ROUTING_MARKER_LINE, OCX_SECTION_MARKER, stripJournaledOpenaiBaseUrl } from "../../src/codex/injected-marker";
 import {
   MANAGED_AGENTS_TABLE_MARKER,
   MANAGED_SUBAGENT_DEFAULT_MARKER,
 } from "../../src/codex/subagent-defaults";
 
 describe("Codex config injection", () => {
+  test("remote-list compatibility warning follows provider identity, not provider display name", () => {
+    const designB = standaloneCodexRoutingTarget(10100, {});
+    expect(remoteThreadListCompatibilityWarning(designB)).toBe("");
+    for (const config of [
+      { codexClientCompaction: true },
+      { codexDesktopAuthless: true },
+      { hostname: "192.168.1.20" },
+    ]) {
+      const target = standaloneCodexRoutingTarget(10100, config);
+      const before = structuredClone(target);
+      const warning = remoteThreadListCompatibilityWarning(target);
+      expect(warning).toContain("thread/list");
+      expect(warning).toContain("modelProviders: []");
+      expect(warning).toContain("not deleted history");
+      expect(target).toEqual(before);
+      expect(buildProfileFileForTarget(target, null, false, undefined, "Custom label"))
+        .toContain('model_provider = "opencodex"');
+    }
+  });
+
   describe("provider display name (#4810)", () => {
     const target = standaloneCodexRoutingTarget(10100, {});
     // The reference profile only carries a provider table when the target uses one; plain
@@ -258,31 +281,6 @@ describe("Codex config injection", () => {
     expect(buildProviderTableBlock(10100, false, false, "2001:db8::5")).toContain('base_url = "http://[2001:db8::5]:10100/v1"');
   });
 
-  test("strips stale root context-window overrides on injection so the catalog drives model context (gpt-5.5 regression)", () => {
-    const cleaned = stripRootContextWindowOverrides([
-      'model_provider = "opencodex"',
-      "model_context_window = 1000000",
-      "model_auto_compact_token_limit = 900000",
-      'model_auto_compact_token_limit_scope = "total"',
-      'model = "gpt-5.5"',
-      "",
-      "[model_providers.opencodex]",
-      "# a nested table key must survive",
-      "model_context_window = 272000",
-      "",
-    ].join("\n"));
-
-    // Only the stale root context-window override is removed. Compaction is a user-owned limit.
-    expect(cleaned).not.toMatch(/^model_context_window = 1000000$/m);
-    expect(cleaned).toContain("model_auto_compact_token_limit = 900000");
-    expect(cleaned).toContain('model_auto_compact_token_limit_scope = "total"');
-    // Non-context-window root keys are untouched.
-    expect(cleaned).toContain('model_provider = "opencodex"');
-    expect(cleaned).toContain('model = "gpt-5.5"');
-    // Table-nested keys (after the first [table]) are preserved.
-    expect(cleaned).toContain("model_context_window = 272000");
-  });
-
   test("preserves user root context-window overrides when restoring native Codex", () => {
     const stripped = stripOpencodexConfig([
       'model = "gpt-5.5"',
@@ -469,7 +467,7 @@ describe("Design B openai_base_url injection", () => {
 
     expect(keptUserBaseUrl).toBe(false);
     const lines = content.split("\n");
-    const markerIdx = lines.findIndex(l => l.includes("Auto-injected by opencodex"));
+    const markerIdx = lines.findIndex(l => l.includes(OCX_SECTION_MARKER));
     const keyIdx = lines.findIndex(l => l.startsWith("openai_base_url"));
     const tableIdx = lines.findIndex(l => l.trim() === "[features]");
     expect(markerIdx).toBeGreaterThanOrEqual(0);
@@ -521,8 +519,10 @@ describe("Design B openai_base_url injection", () => {
       const lines = content.split("\n");
       const routing = lines.indexOf('openai_base_url = "http://127.0.0.1:10100/v1"');
       expect(routing).toBeGreaterThan(0);
-      expect(lines[routing - 1]).toContain("Auto-injected by opencodex");
-      expect(lines[routing + 1]).toContain("Auto-injected by opencodex");
+      // Asserted as the whole routing marker, not a substring of it: a substring check passes
+      // even when the wrong ownership line is written above a routing key (#5261).
+      expect(lines[routing - 1]).toBe(OCX_ROUTING_MARKER_LINE);
+      expect(lines[routing + 1]).toBe(OCX_ROUTING_MARKER_LINE);
       expect(lines[routing + 2]).toBe('experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"');
       expect(lines.indexOf("[features]")).toBeGreaterThan(routing + 2);
       expect(content.match(/Auto-injected by opencodex/g)?.length).toBe(2);
@@ -709,6 +709,51 @@ describe("Design B openai_base_url injection", () => {
     ].join("\n"));
   });
 
+  test("provider-table retention refuses to rebind tagged threads to a different table", () => {
+    const captured = [
+      "# Auto-injected by opencodex",
+      "[model_providers.opencodex]",
+      'name = "OpenCodex Proxy"',
+      'base_url = "http://127.0.0.1:10100/v1"',
+      "",
+    ].join("\n");
+    const restored = [
+      "[model_providers.opencodex]",
+      'name = "Unrelated Provider"',
+      'base_url = "https://unrelated.invalid/v1"',
+      "",
+    ].join("\n");
+
+    expect(() => appendOcxProviderTableBlock(restored, captured)).toThrow(
+      "native config already defines a different [model_providers.opencodex] table",
+    );
+    expect(appendOcxProviderTableBlock(captured, captured)).toBe(captured);
+  });
+
+  test("provider-table retention accepts a table that differs only in blank-line count", () => {
+    // Semantic comparison ignores cosmetic spacing outside values while keeping
+    // the existing bytes; capture never collapses newlines inside string contents.
+    const captured = [
+      "# Auto-injected by opencodex",
+      "[model_providers.opencodex]",
+      'name = "OpenCodex Proxy"',
+      'base_url = "http://127.0.0.1:10100/v1"',
+      "",
+    ].join("\n");
+    const current = [
+      "# Auto-injected by opencodex",
+      "[model_providers.opencodex]",
+      'name = "OpenCodex Proxy"',
+      'base_url = "http://127.0.0.1:10100/v1"',
+      "",
+      "",
+      "",
+    ].join("\n");
+
+    expect(extractOcxProviderTableBlock(current)).toBe(captured);
+    expect(appendOcxProviderTableBlock(current, captured)).toBe(current);
+  });
+
   test("legacy marker directly before the provider table survives the root strip order (removeOcxSection keeps its anchor)", () => {
     // No Design B form present — stripInjectedOpenaiBaseUrl must not eat the legacy EOF marker
     // in a way that leaves the [model_providers.opencodex] table behind.
@@ -852,12 +897,19 @@ describe("EOL boundary helpers (Windows CRLF configs)", () => {
   });
 });
 
+/**
+ * What an injection does to a marker it already owns: the routing keys carry the recovery
+ * command (#5261), and a rewrite in place refreshes a bare marker left by an earlier build.
+ * Only our own ownership line moves; everything else below is asserted unchanged.
+ */
+const refreshed = (content: string) => content.replace(OCX_SECTION_MARKER, OCX_ROUTING_MARKER_LINE);
+
 test('managed injection is idempotent and retains every unrelated value',()=>{
  const source=`model = "gpt-6-astra"\n${OCX_SECTION_MARKER}\nopenai_base_url = "http://127.0.0.1:10100/v1"\nservice_tier = "fast"\n[features]\ncontext_management.experimental_mode = true\n[features.multi_agent_v2]\nenabled = true\n`;
  const target={baseUrl:'http://127.0.0.1:10100/v1',requiresAdmissionToken:false,tokenEnv:'OPENCODEX_API_AUTH_TOKEN' as const};
  const result=setRootOpenaiBaseUrl(source,target);
  expect(result.keptUserBaseUrl).toBe(false);
- expect(result.content).toBe(source.replace('10100/v1','10100/backend-api/codex'));
+ expect(result.content).toBe(refreshed(source).replace('10100/v1','10100/backend-api/codex'));
  expect(setRootOpenaiBaseUrl(result.content,target).content).toBe(result.content);
  expect(buildRealtimeWsBaseUrlLine(target)).toContain('10100/v1');
  expect(setRootOpenaiBaseUrl(source,10100).content).toBe(result.content);
@@ -866,7 +918,7 @@ test('feature disabled and user-owned routing remain intact',()=>{
  const source='openai_base_url = "http://127.0.0.1:10100/v1"\n[features]\ncontext_management.experimental_mode = true\n';
  expect(setRootOpenaiBaseUrl(source,10100)).toEqual({content:source,keptUserBaseUrl:true});
  const managed=`${OCX_SECTION_MARKER}\nopenai_base_url = "http://127.0.0.1:10100/v1"\n[features]\ncontext_management.experimental_mode = false\n`;
- expect(setRootOpenaiBaseUrl(managed,10100).content).toBe(managed);
+ expect(setRootOpenaiBaseUrl(managed,10100).content).toBe(refreshed(managed));
 });
 
 
@@ -877,7 +929,9 @@ test("malformed TOML preserves user routing and does not enable context injectio
     const managed = `${OCX_SECTION_MARKER}\nopenai_base_url = "http://127.0.0.1:10100/v1"\n${malformed}\n`;
     for (const inject of [(source: string) => setRootOpenaiBaseUrl(source, 10100), (source: string) => setRootOpenaiBaseUrl(source, target)]) {
       expect(inject(userOwned)).toEqual({ content: userOwned, keptUserBaseUrl: true });
-      expect(inject(managed)).toEqual({ content: managed, keptUserBaseUrl: false });
+      // A file we cannot parse is still not rewritten beyond the routing we own: the marker
+      // refreshes, the malformed tail is returned byte for byte.
+      expect(inject(managed)).toEqual({ content: refreshed(managed), keptUserBaseUrl: false });
     }
   }
 });

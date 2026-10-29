@@ -7,10 +7,15 @@ export type SharedTransport = "same-origin" | "direct" | "relay";
  * Read without removing the tag: unlike the session meta, which is consumed once so a
  * credential does not linger in the DOM, the role is non-secret and may be read again.
  */
-function runtimeRoleFromDocument(): string | null {
+export function runtimeRoleFromDocument(): "standalone" | "hub" | "client" | null {
   if (typeof document === "undefined") return null;
   const meta = document.querySelector('meta[name="opencodex-runtime-role"]');
-  return meta?.getAttribute("content")?.trim() || null;
+  const role = meta?.getAttribute("content")?.trim();
+  return role === "standalone" || role === "hub" || role === "client" ? role : null;
+}
+
+export function isStandaloneRuntime(): boolean {
+  return runtimeRoleFromDocument() === "standalone";
 }
 
 /**
@@ -74,6 +79,8 @@ export interface ApiTargets {
   shared: ApiTarget;
   apiKeyId?: string;
   catalogSyncedAt?: string;
+  /** Remote Link Child: the shared plane is the Home, read-only, relayed by this machine. */
+  link?: { linkId: string; home: string | null };
 }
 
 export interface MachineStatusV1 {
@@ -88,6 +95,7 @@ export interface MachineStatusV1 {
   connectedAt: string;
   catalogSyncedAt?: string;
   hubReachability: "unknown" | "online" | "offline" | "unauthorized";
+  link?: { linkId: string; home: string | null; readOnly: true };
 }
 
 function trimBase(value: string): string {
@@ -135,6 +143,15 @@ function validStatus(value: unknown): value is MachineStatusV1 {
     && (row.catalogSyncedAt === undefined || typeof row.catalogSyncedAt === "string");
 }
 
+/** The optional Remote Link block; a malformed one is ignored rather than trusted. */
+function linkFromStatus(value: unknown): ApiTargets["link"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  if (typeof row.linkId !== "string" || !/^lnk_[0-9a-f]{16}$/.test(row.linkId)) return undefined;
+  const home = typeof row.home === "string" && row.home.trim() && row.home.length <= 255 ? row.home.trim() : null;
+  return { linkId: row.linkId, home };
+}
+
 export function relayUrlForPath(shared: ApiTarget, path: string): string {
   if (shared.transport !== "relay" || (!path.startsWith("/api/") && path !== "/opencodex-session")) {
     throw new TypeError("path is not eligible for the fixed hub relay");
@@ -169,7 +186,8 @@ export function targetsFromMachineStatus(initialBase: string, status: MachineSta
   const shared = status.managementTransport === "relay"
     ? target("shared", `${trimBase(initialBase)}/api/machine/hub-relay`, sharedOrigin, "relay")
     : target("shared", sharedOrigin, sharedOrigin, "direct");
-  return { connected: true, machine, shared, apiKeyId: status.apiKeyId, catalogSyncedAt: status.catalogSyncedAt };
+  const link = linkFromStatus(status.link);
+  return { connected: true, machine, shared, apiKeyId: status.apiKeyId, catalogSyncedAt: status.catalogSyncedAt, ...(link ? { link } : {}) };
 }
 
 export function apiBaseForPlane(plane: ApiPlane, targets: ApiTargets): string {

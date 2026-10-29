@@ -1,41 +1,22 @@
+import { createUploadWaiter } from "./socks5-upload-waiter";
 import net, { type Socket } from "node:net";
 import tls, { type TLSSocket } from "node:tls";
 import { classifyContentCoding, isNullBodyStatus } from "./http-response-semantics";
+import { socks5Credentials, socks5Handshake, Socks5HandshakeError } from "./socks5-handshake";
 
 const DEFAULT_SOCKS5_PORT = 1080;
 const SOCKS5_CONNECT_TIMEOUT_MS = 30_000;
 const SOCKS5_RESPONSE_TIMEOUT_MS = 200_000;
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 const MAX_BODY_SLICE_BYTES = 64 * 1024;
+const MAX_DECODED_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_STREAM_DECODE_EXPANSION_RATIO = 128;
 const SOCKS5_VERSION = 0x05;
-const SOCKS5_NO_AUTH = 0x00;
-const SOCKS5_USER_PASS = 0x02;
-const SOCKS5_CONNECT = 0x01;
-const SOCKS5_DOMAIN = 0x03;
-const SOCKS5_SUCCESS = 0x00;
 const CRLF = Buffer.from("\r\n");
 const HEADER_END = Buffer.from("\r\n\r\n");
 
 export class Socks5FetchError extends Error {
   override readonly name = "Socks5FetchError";
-}
-
-function proxyCredentials(proxy: URL): { username?: Uint8Array; password?: Uint8Array } {
-  if (!proxy.username && !proxy.password) return {};
-  let username: string;
-  let password: string;
-  try {
-    username = decodeURIComponent(proxy.username);
-    password = decodeURIComponent(proxy.password);
-  } catch {
-    throw new Socks5FetchError("SOCKS5 proxy credentials contain invalid percent encoding");
-  }
-  const usernameBytes = new TextEncoder().encode(username);
-  const passwordBytes = new TextEncoder().encode(password);
-  if (usernameBytes.byteLength > 255 || passwordBytes.byteLength > 255) {
-    throw new Socks5FetchError("SOCKS5 proxy credentials must each fit in 255 UTF-8 bytes");
-  }
-  return { username: usernameBytes, password: passwordBytes };
 }
 
 function validateProxy(proxy: string): URL {
@@ -53,7 +34,10 @@ function validateProxy(proxy: string): URL {
     throw new Socks5FetchError("SOCKS5 proxy port is invalid");
   }
   if (parsed.search || parsed.hash) throw new Socks5FetchError("SOCKS5 proxy URL must not contain a query or fragment");
-  proxyCredentials(parsed);
+  try { socks5Credentials(parsed); } catch (error) {
+    if (error instanceof Socks5HandshakeError) throw new Socks5FetchError(error.message);
+    throw error;
+  }
   return parsed;
 }
 
@@ -107,7 +91,7 @@ function connectSocket(hostname: string, port: number, signal?: AbortSignal): Pr
 }
 
 class SocketReader {
-  private buffer = Buffer.alloc(0);
+  private buffer: Buffer = Buffer.alloc(0);
   private ended = false;
   private failure: Error | undefined;
   private readonly exactWaiters: Array<{
@@ -116,6 +100,7 @@ class SocketReader {
     reject: (error: unknown) => void;
   }> = [];
   private readonly anyWaiters: Array<{
+    maxBytes: number;
     resolve: (value: Buffer) => void;
     reject: (error: unknown) => void;
   }> = [];
@@ -128,13 +113,25 @@ class SocketReader {
     socket.resume();
   }
 
+  write(bytes: Uint8Array): void {
+    this.socket.write(bytes);
+  }
+
+  readExact(bytes: number, signal?: AbortSignal): Promise<Buffer> {
+    return this.read(bytes, signal);
+  }
+
   private readonly onData = (chunk: Buffer | string): void => {
     const value = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
     if (this.anyWaiters.length > 0) {
-      this.anyWaiters.shift()!.resolve(value);
+      const waiter = this.anyWaiters.shift()!;
+      const end = Math.min(value.byteLength, waiter.maxBytes);
+      if (end < value.byteLength) this.buffer = value.subarray(end);
+      if (this.buffer.byteLength >= MAX_BODY_SLICE_BYTES) this.socket.pause();
+      waiter.resolve(end === value.byteLength ? value : value.subarray(0, end));
       return;
     }
-    this.buffer = Buffer.concat([this.buffer, value]);
+    this.buffer = this.buffer.byteLength === 0 ? value : Buffer.concat([this.buffer, value]);
     this.flushExact();
     if (this.buffer.byteLength >= MAX_BODY_SLICE_BYTES) this.socket.pause();
   };
@@ -219,12 +216,13 @@ class SocketReader {
     }
   }
 
-  readAny(signal?: AbortSignal): Promise<Buffer> {
+  readAny(signal?: AbortSignal, maxBytes = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("The operation was aborted"));
     if (this.buffer.byteLength > 0) {
-      const value = this.buffer;
-      this.buffer = Buffer.alloc(0);
-      this.socket.resume();
+      const end = Math.min(this.buffer.byteLength, maxBytes);
+      const value = end === this.buffer.byteLength ? this.buffer : this.buffer.subarray(0, end);
+      this.buffer = end === this.buffer.byteLength ? Buffer.alloc(0) : this.buffer.subarray(end);
+      if (this.buffer.byteLength < MAX_BODY_SLICE_BYTES) this.socket.resume();
       return Promise.resolve(value);
     }
     if (this.failure) return Promise.reject(this.failure);
@@ -236,6 +234,7 @@ class SocketReader {
         waiter.reject(signal?.reason ?? new Error("The operation was aborted"));
       };
       const waiter = {
+        maxBytes,
         resolve: (value: Buffer) => { signal?.removeEventListener("abort", onAbort); resolve(value); },
         reject: (error: unknown) => { signal?.removeEventListener("abort", onAbort); reject(error); },
       };
@@ -246,13 +245,17 @@ class SocketReader {
     });
   }
 
-  dispose(): void {
+  dispose(preserveBuffered = false): void {
     this.socket.pause();
     this.socket.removeListener("data", this.onData);
     this.socket.removeListener("error", this.onError);
     this.socket.removeListener("end", this.onEnd);
     this.socket.removeListener("close", this.onEnd);
-    if (this.buffer.byteLength > 0) this.socket.unshift(this.buffer);
+    // Only a successful handshake hands unread bytes to another socket owner.
+    // Terminal cleanup must not unshift after EOF or retain abandoned payload.
+    if (preserveBuffered && !this.ended && !this.socket.destroyed && this.buffer.byteLength > 0) {
+      this.socket.unshift(this.buffer);
+    }
     this.buffer = Buffer.alloc(0);
     this.rejectExact(new Socks5FetchError("SOCKS5 reader disposed"));
     this.rejectAny(new Socks5FetchError("SOCKS5 reader disposed"));
@@ -261,7 +264,7 @@ class SocketReader {
 
 async function socks5Connect(proxy: string, target: URL, signal?: AbortSignal): Promise<Socket> {
   const parsedProxy = validateProxy(proxy);
-  const credentials = proxyCredentials(parsedProxy);
+  const credentials = socks5Credentials(parsedProxy);
   const proxyHost = parsedProxy.hostname.replace(/^\[|\]$/g, "");
   const socket = await connectSocket(proxyHost, Number(parsedProxy.port) || DEFAULT_SOCKS5_PORT, signal);
   socket.setTimeout(SOCKS5_CONNECT_TIMEOUT_MS, () => {
@@ -269,52 +272,15 @@ async function socks5Connect(proxy: string, target: URL, signal?: AbortSignal): 
   });
   const reader = new SocketReader(socket);
   try {
-    const methods = credentials.username ? Buffer.from([SOCKS5_NO_AUTH, SOCKS5_USER_PASS]) : Buffer.from([SOCKS5_NO_AUTH]);
-    socket.write(Buffer.from([SOCKS5_VERSION, methods.byteLength, ...methods]));
-    const greeting = await reader.read(2, signal);
-    if (greeting[0] !== SOCKS5_VERSION) throw new Socks5FetchError("SOCKS5 proxy returned an invalid greeting");
-    if (greeting[1] === SOCKS5_USER_PASS && credentials.username && credentials.password) {
-      socket.write(Buffer.from([
-        0x01,
-        credentials.username.byteLength,
-        ...credentials.username,
-        credentials.password.byteLength,
-        ...credentials.password,
-      ]));
-      const auth = await reader.read(2, signal);
-      if (auth[0] !== 0x01 || auth[1] !== 0x00) throw new Socks5FetchError("SOCKS5 proxy authentication failed");
-    } else if (greeting[1] !== SOCKS5_NO_AUTH) {
-      throw new Socks5FetchError("SOCKS5 proxy does not accept an offered authentication method");
-    }
-
-    const hostname = new TextEncoder().encode(target.hostname);
-    if (hostname.byteLength > 255) throw new Socks5FetchError("SOCKS5 target hostname is too long");
-    const port = targetPort(target);
-    socket.write(Buffer.from([
-      SOCKS5_VERSION,
-      SOCKS5_CONNECT,
-      0x00,
-      SOCKS5_DOMAIN,
-      hostname.byteLength,
-      ...hostname,
-      port >> 8,
-      port & 0xff,
-    ]));
-    const reply = await reader.read(4, signal);
-    if (reply[0] !== SOCKS5_VERSION) throw new Socks5FetchError("SOCKS5 proxy returned an invalid connect response");
-    if (reply[1] !== SOCKS5_SUCCESS) throw new Socks5FetchError(`SOCKS5 proxy refused the connection (code ${reply[1]})`);
-    if (reply[2] !== 0x00 || ![0x01, SOCKS5_DOMAIN, 0x04].includes(reply[3]!)) {
-      throw new Socks5FetchError("SOCKS5 proxy returned an invalid address type or reserved byte");
-    }
-    const addressLength = reply[3] === 0x01 ? 4 : reply[3] === SOCKS5_DOMAIN ? (await reader.read(1, signal))[0]! : 16;
-    await reader.read(addressLength + 2, signal);
+    await socks5Handshake(reader, { host: target.hostname, port: targetPort(target) }, credentials, signal);
     socket.setTimeout(0);
     return socket;
   } catch (error) {
     socket.destroy();
+    if (error instanceof Socks5HandshakeError) throw new Socks5FetchError(error.message);
     throw error;
   } finally {
-    reader.dispose();
+    reader.dispose(true);
   }
 }
 
@@ -339,25 +305,50 @@ function requestHeaders(request: Request, target: URL): { text: string; chunked:
 
 async function secureSocket(socket: Socket, target: URL, signal: AbortSignal): Promise<TLSSocket> {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      socket.destroy();
+      reject(signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted"));
+      return;
+    }
     const tlsSocket = tls.connect({
       socket,
       servername: target.hostname,
       rejectUnauthorized: true,
     });
-    const onAbort = () => {
-      tlsSocket.destroy();
-      reject(signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted"));
-    };
-    const onSecureConnect = () => {
+    let settled = false;
+    // Absolute deadline: a peer sending occasional TLS bytes must not extend the handshake.
+    const timer = setTimeout(() => {
+      fail(new Socks5FetchError("SOCKS5 TLS handshake timed out"));
+    }, SOCKS5_CONNECT_TIMEOUT_MS);
+    const cleanup = () => {
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
+      tlsSocket.removeListener("secureConnect", onSecureConnect);
+      tlsSocket.removeListener("error", onError);
+      tlsSocket.removeListener("close", onClose);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // No error argument: pending event observers must not receive a second error.
+      tlsSocket.destroy();
+      reject(error);
+    };
+    const onAbort = () => fail(signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted"));
+    const onError = (error: Error) => fail(error);
+    const onClose = () => fail(new Socks5FetchError("SOCKS5 upstream closed during TLS handshake"));
+    const onSecureConnect = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(tlsSocket);
     };
     tlsSocket.once("secureConnect", onSecureConnect);
-    tlsSocket.once("error", error => {
-      signal.removeEventListener("abort", onAbort);
-      reject(error);
-    });
+    tlsSocket.once("error", onError);
+    tlsSocket.once("close", onClose);
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -444,6 +435,7 @@ function responseBody(
   const chunked = (headers.get("transfer-encoding") ?? "").toLowerCase().split(",").some(value => value.trim() === "chunked");
   let remaining = contentLength;
   let chunkRemaining = 0;
+  let chunkTerminatorPending = false;
   let complete = false;
   const finish = () => {
     if (complete) return;
@@ -455,8 +447,24 @@ function responseBody(
   };
   const onAbort = () => socket.destroy();
   signal.addEventListener("abort", onAbort, { once: true });
+  // Framing needs exact reads, payload does not: waiting to fill 64 KiB can hold
+  // many complete SSE events behind bytes the upstream has not generated yet.
+  const readPayload = async (length: number): Promise<Buffer> => {
+    const value = await reader.readAny(signal, Math.min(length, MAX_BODY_SLICE_BYTES));
+    if (value.byteLength === 0) {
+      throw new Socks5FetchError("SOCKS5 socket ended before the expected bytes arrived");
+    }
+    return value;
+  };
   const readChunk = async (): Promise<Buffer | null> => {
     if (chunked) {
+      // Verify the previous chunk's delimiter before accepting another chunk,
+      // without holding already-received payload while the delimiter is delayed.
+      if (chunkTerminatorPending) {
+        const ending = await reader.read(2, signal);
+        if (!ending.equals(CRLF)) throw new Socks5FetchError("SOCKS5 upstream returned an invalid chunk terminator");
+        chunkTerminatorPending = false;
+      }
       if (chunkRemaining === 0) {
         const line = (await reader.readUntil(CRLF, MAX_RESPONSE_HEADER_BYTES, signal)).subarray(0, -2).toString("ascii");
         const size = parseChunkSize(line);
@@ -469,21 +477,18 @@ function responseBody(
         }
         chunkRemaining = size;
       }
-      const value = await reader.read(Math.min(chunkRemaining, MAX_BODY_SLICE_BYTES), signal);
+      const value = await readPayload(chunkRemaining);
       chunkRemaining -= value.byteLength;
-      if (chunkRemaining === 0) {
-        const ending = await reader.read(2, signal);
-        if (!ending.equals(CRLF)) throw new Socks5FetchError("SOCKS5 upstream returned an invalid chunk terminator");
-      }
+      chunkTerminatorPending = chunkRemaining === 0;
       return value;
     }
     if (remaining !== undefined) {
       if (remaining === 0) return null;
-      const value = await reader.read(Math.min(remaining, MAX_BODY_SLICE_BYTES), signal);
+      const value = await readPayload(remaining);
       remaining -= value.byteLength;
       return value;
     }
-    const value = await reader.readAny(signal);
+    const value = await reader.readAny(signal, MAX_BODY_SLICE_BYTES);
     return value.byteLength === 0 ? null : value;
   };
   return new ReadableStream<Uint8Array>({
@@ -496,6 +501,12 @@ function responseBody(
           return;
         }
         controller.enqueue(value);
+        // A fixed-length response needs no further read to prove completion.
+        // Release its connection even when the consumer leaves this chunk queued.
+        if (!chunked && remaining === 0) {
+          finish();
+          controller.close();
+        }
       } catch (error) {
         finish();
         controller.error(error);
@@ -526,15 +537,46 @@ function bodylessResponse(method: string, status: number): boolean {
  * response means an upstream ignored that; gzip and deflate are undone here, and any other
  * coding fails closed rather than surfacing bytes no caller can parse.
  *
- * No decompressed-size ceiling is imposed. The identity path has no total-size bound either —
- * it cannot, because a long-lived SSE stream is legitimately unbounded — and a ceiling on only
- * the coded path would fail responses that succeed uncompressed.
+ * Buffered decoded bodies have an absolute cap. Event streams instead have an expansion bound,
+ * so a long stream can continue without allowing a tiny coded response to inflate unchecked.
+ * Identity bodies retain their existing streaming behavior; providers are asked to use that path.
  */
 function contentCodingFormat(headers: Headers): "gzip" | "deflate" | undefined {
   const coding = classifyContentCoding(headers);
   if (coding.kind === "identity") return undefined;
   if (coding.kind === "decodable") return coding.format;
   throw new Socks5FetchError("SOCKS5 upstream returned an unsupported content-encoding: " + coding.coding);
+}
+
+/** Bound buffered bodies absolutely and event streams relative to consumed coded bytes. */
+function decodedBody(
+  body: ReadableStream<Uint8Array>,
+  format: "gzip" | "deflate",
+  eventStream: boolean,
+): ReadableStream<Uint8Array> {
+  const decompressor = new DecompressionStream(format) as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
+  let codedBytes = 0;
+  let decodedBytes = 0;
+  const countedBody = eventStream ? body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      codedBytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  })) : body;
+  return countedBody.pipeThrough(decompressor).pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      decodedBytes += chunk.byteLength;
+      const limit = eventStream
+        ? Math.max(MAX_DECODED_BODY_BYTES, codedBytes * MAX_STREAM_DECODE_EXPANSION_RATIO)
+        : MAX_DECODED_BODY_BYTES;
+      if (decodedBytes > limit) {
+        throw new Socks5FetchError(eventStream
+          ? "SOCKS5 decoded event stream exceeds expansion limit"
+          : `SOCKS5 decoded response exceeds ${MAX_DECODED_BODY_BYTES} byte cap`);
+      }
+      controller.enqueue(chunk);
+    },
+  }));
 }
 
 /** Read response heads until the final one, consuming the interim informational answers. */
@@ -549,37 +591,9 @@ async function finalResponseHead(
   return head;
 }
 
-/**
- * A promise that rejects with the caller's abort reason, and a way to stop listening.
- *
- * Destroying the socket is not enough to end a pending `bodyReader.read()`: that promise belongs
- * to the caller's body stream, which knows nothing about this socket. Racing it against this one
- * is what turns an abort into a settled fetch instead of a permanently pending one.
- */
-function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
-  let onAbort = (): void => { /* replaced below */ };
-  const promise = new Promise<never>((_resolve, reject) => {
-    // Reject with the caller's reason exactly, including `null` and `false`. A real
-    // `AbortSignal` always has one — `abort()` with no argument supplies an AbortError — so
-    // the fallback covers only a hand-built signal that exposes none.
-    onAbort = () => reject(signal.reason === undefined ? new Error("The operation was aborted") : signal.reason);
-    if (signal.aborted) onAbort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  });
-  // The race below may settle on another branch first; this rejection must not be reported as
-  // unhandled when nobody is left waiting for it.
-  promise.catch(() => { /* surfaced by whoever loses the race */ });
-  return { promise, dispose: () => signal.removeEventListener("abort", onAbort) };
-}
-
-/**
- * The two races below have different possible outcomes, so they have different result types.
- * One union covering both would let the compiler accept reading `value` off a drain result,
- * which is the kind of mistake a type is supposed to catch rather than describe.
- */
-type Answered = { kind: "answered" };
-type BodyStep = { kind: "chunk"; value: Uint8Array } | { kind: "end" } | Answered;
-type DrainStep = { kind: "drained" } | Answered;
+/** Read and drain results stay distinct; the waiter adds the shared early-answer outcome. */
+type BodyStep = { kind: "chunk"; value: Uint8Array } | { kind: "end" };
+type DrainStep = { kind: "drained" };
 
 /**
  * Send the request body, settling on caller abort or on an answer that arrives first.
@@ -603,21 +617,13 @@ async function uploadRequestBody(
   if (!body) return;
   const signal = request.signal;
   const bodyReader = body.getReader();
-  const abort = abortRejection(signal);
-  const answered: Promise<Answered> = head.then(
-    (): Answered => ({ kind: "answered" }),
-    (): Answered => ({ kind: "answered" }),
-  );
+  const waiter = createUploadWaiter(head, signal);
   let completed = false;
   try {
     for (;;) {
-      const read: Promise<BodyStep> = bodyReader.read().then(
+      const step = await waiter.wait(() => bodyReader.read().then(
         (result): BodyStep => (result.done ? { kind: "end" } : { kind: "chunk", value: result.value }),
-      );
-      // Releasing the lock below rejects a read still waiting on a source that stopped
-      // producing. That rejection is this function's own doing, not a failure to report.
-      read.catch(() => { /* settled by releasing the reader */ });
-      const step = await Promise.race([read, answered, abort.promise]);
+      ));
       if (step.kind === "answered") break;
       if (step.kind === "end") {
         completed = true;
@@ -627,17 +633,16 @@ async function uploadRequestBody(
         ? Buffer.concat([Buffer.from(`${step.value.byteLength.toString(16)}\r\n`), Buffer.from(step.value), CRLF])
         : step.value;
       if (socket.write(payload)) continue;
-      const drain: Promise<DrainStep> = waitForDrain(socket, signal).then((): DrainStep => ({ kind: "drained" }));
-      if ((await Promise.race([drain, answered, abort.promise])).kind === "answered") break;
+      const drain = await waiter.wait(() => waitForDrain(socket, signal).then((): DrainStep => ({ kind: "drained" })));
+      if (drain.kind === "answered") break;
     }
     // A terminating chunk written after the peer has already answered goes into a conversation
     // that is over, and a peer that has moved on may read it as the head of the next request.
     if (completed && chunked && !socket.write("0\r\n\r\n")) {
-      const drain: Promise<DrainStep> = waitForDrain(socket, signal).then((): DrainStep => ({ kind: "drained" }));
-      await Promise.race([drain, answered, abort.promise]);
+      await waiter.wait(() => waitForDrain(socket, signal).then((): DrainStep => ({ kind: "drained" })));
     }
   } finally {
-    abort.dispose();
+    waiter.dispose();
     if (!completed) {
       // Cancelling runs the caller's own cancel algorithm, which is free to never settle, so it
       // is started rather than awaited. Releasing the lock is what actually frees a read still
@@ -708,19 +713,15 @@ export async function socks5Fetch(
       // The declared length describes the coded bytes, not what the caller now reads.
       responseHeaders.delete("content-length");
     }
-    // `DecompressionStream` declares its writable side as `WritableStream<BufferSource>`, and
-    // TypeScript measures `WritableStream` as invariant in its chunk type, so the pair is not
-    // assignable to `ReadableWritablePair<Uint8Array, Uint8Array>` even though every chunk this
-    // body produces is a valid `BufferSource`. The conversion states that relationship and
-    // nothing else; it does not widen what is actually written.
-    const decompressor = codingFormat === undefined
-      ? undefined
-      : new DecompressionStream(codingFormat) as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
-    const decodedBody = body !== null && decompressor !== undefined
-      ? body.pipeThrough(decompressor)
+    const responseBodyStream = body !== null && codingFormat !== undefined
+      ? decodedBody(
+        body,
+        codingFormat,
+        responseHead.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream",
+      )
       : body;
     request.signal.removeEventListener("abort", onAbort);
-    return new Response(decodedBody, {
+    return new Response(responseBodyStream, {
       status: responseHead.status,
       statusText: responseHead.statusText,
       headers: responseHeaders,

@@ -1,14 +1,32 @@
+import { captureAccountAutoPauseAttempt, wasAccountAutoPaused, wasPermanentAccountRefusal } from "../../oauth/account-auto-pause";
+import { spendLedgerStorageErrorResponse } from "./spend-storage-error";
+import { createPhysicalSendReporter, rebindPhysicalSend } from "../../lib/request-execution-budget";
+import { hasResponseMediaType } from "../../lib/http-response-semantics";
+import { createInferenceSendBudget } from "../inference/context";
+import { unboundPoolSpendRefusalResponse } from "../workflow-refusal";
 import { capturePoolQuotaWriter } from "../../codex/account-store";
+import { join } from "node:path";
+import { rmSync } from "node:fs";
+import { previewXaiOauthWireModel } from "./core-normalize";
+import {
+  admissionModelDeniedResponse,
+  AdmissionModelDeniedError,
+  assertRouteAllowedByScope,
+  resolveAdmissionModelScope,
+} from "../admission-model-scope";
 import type { Server } from "bun";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import {
   getConfigPath,
+  getConfigDir,
   multiAgentGuidanceEnabled,
 } from "../../config";
 import { resolveProviderApiKey } from "../../providers/key-store";
 import { parseRequest } from "../../responses/parser";
 import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages } from "../../responses/compaction";
+import { applyReasoningRetention, appendRetentionNotice, type ReasoningRetentionResult } from "../../responses/reasoning-retention";
 import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/openai-responses";
+import { repairUrlCitationAnnotations, stripProviderInputItemMetadata } from "../../adapters/openai-responses/request-strips";
 import { expandPreviousResponseInput, previousResponseProviderState, rememberResponseState } from "../../responses/state";
 import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-tool-name-repair";
 import { NoEligiblePolicyCandidateError, routeCompactionModel } from "../../router";
@@ -45,7 +63,8 @@ import { describeImagesInPlace, planVisionSidecar, shouldResolveOpenAiVisionSide
 import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/run-turn-queue";
 import {
   applyCodexAuthContextToProvider,
-  createCodexReserveDispatchGuard,
+  callerCodexWorkspaceAccountId,
+  createCodexAuthDispatchGuard,
   unwrapUpstreamRetryEvidenceError,
   CodexMainProfileDrainingError,
   headersForCodexAuthContext,
@@ -62,6 +81,7 @@ import {
 } from "../../codex/auth-context";
 import {
   forceRefreshMainAccountToken,
+  mainAccountTokenQuotaWriter,
   type NativeMainRefreshDependencies,
 } from "../../codex/main-account";
 import {
@@ -70,6 +90,7 @@ import {
   recordCodexUpstreamOutcome,
   type CodexUpstreamOutcome,
 } from "../../codex/routing";
+import { codexFailureWindowOutcomeMeta } from "../../codex/routing/failure-window";
 import {
   applyAccountChangeConversationStateScrub,
   conversationStateBindingFromAuth,
@@ -110,11 +131,20 @@ import {
   ForwardAdmissionCredentialError,
   contextPrincipalIdOf,
   hasForwardableCodexBearer,
+  resolveContextPrincipal,
   validateForwardAdmissionCredential,
 } from "../auth-cors";
 import type { DataPlaneAdmission } from "../auth-cors";
 import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
 import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider, supportsNativeResponsesCompactEndpoint } from "../../providers/openai-tiers";
+import { buildResponsesTransport, copyResponsesClientMetadata } from "../../adapters/openai-responses/transport";
+import { scrubOcxCompactionItems, stripCanonicalOnlyInputItems, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough } from "../../adapters/openai-responses/request-strips";
+import { dropResponsesReasoningInputItems } from "../../adapters/openai-responses/reasoning";
+import { requiresPlaintextReasoningReplay } from "../../adapters/openai-responses/passthrough";
+import { destinationDecodesNativeCompactionBlob, isOpenAiOperatedResponsesDestination } from "../../providers/openai-tiers-destination";
+import { bindRouteReasoningReplayScope } from "./core-replay";
+import { commitReasoningReplayServingIdentity } from "../../responses/reasoning-replay-cache";
+import { nativeCompactResponseSchema } from "../../responses/schema";
 import { NATIVE_RESERVE_MODEL } from "../../codex/catalog/native-models";
 import {
   isCodexReserveOptInMissing,
@@ -139,7 +169,11 @@ import {
   UnsupportedContentEncodingError,
 } from "../request-decompress";
 import { resolveAdapter, resolveWireProtocolOverride } from "../adapter-resolve";
-import { hasKeyPoolFailover, rotateProviderTransportOn429, selectProactiveApiKeyTransport } from "../../providers/key-failover";
+import { hasKeyPoolFailover, rotateProviderTransportOn429, selectProactiveApiKeyTransport, transientRetryPolicyFor } from "../../providers/key-failover";
+import { transientSendCapFor } from "./request-send-budget";
+import { distributedKeyPhysicalFetch, recordDistributedResponseFailure } from "../../providers/api-key-response-ownership";
+import { providerApiKeySelectionIsCurrent, resolveCurrentProviderApiKeyTransport } from "../../providers/api-key-selection";
+import { stampApiKeyAccountLabel } from "../../providers/label";
 import { shouldAttemptImageTierRetry } from "../image-retry";
 import { resolveProviderTransport } from "../../providers/xai-transport";
 import type { WsData } from "../ws-bridge";
@@ -147,7 +181,8 @@ import { codexAccountSelectionForTurn, registerTurn, trackStreamLifetime, unregi
 import type { AdmissionLease } from "../../lib/admission";
 import { redactSecretString } from "../../lib/redact";
 import { readBoundedResponseBytes } from "../../lib/bounded-body";
-import { resolveStallTimeoutSec } from "../../stall-timeout";
+import { resolveConnectTimeoutMs, resolveStallTimeoutMs } from "../../stall-timeout";
+import { isLocalUpstream } from "../../lib/local-upstream";
 import { isRateLimitOrQuotaFailureMessage } from "../../lib/errors";
 import { supportedLadderFor } from "../effort-policy";
 import {
@@ -155,6 +190,7 @@ import {
   catalogModelSupportsServiceTier,
   finishRequestAttempt,
   inspectResponseLogJson,
+  noteProviderAttemptSend,
   readConfiguredCodexServiceTier,
   requestLogSpeedLabel,
   sealRequestAttemptIdentity,
@@ -173,6 +209,8 @@ import {
 import { hasResponsesItemIdRepair, relaySseWithResponsesItemIdRepair } from "../responses-item-id-repair";
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
+import { rebindPoolCreditPolicy } from "../../codex/pool-credit-policy";
+import { clientCancelledResponse } from "./core-errors";
 
 import {
   codexAccountGatedCanonicalWireModel,
@@ -180,13 +218,17 @@ import {
   handleResponses,
   preAuthUpstreamHostCircuitKey,
   poolCredentialRefreshIncompleteResponse,
+  shouldRetryCodexScopedQuotaOnAlternate,
   upstreamHostCircuitOpenResponse,
   usesCodexForwardPoolAuth,
 } from "./core";
-import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
+import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel, sendWithConnectionPolicy } from "./fetch-helpers";
+import { requestPacingOverloadResponse } from "./pacing-overload";
+import { shouldRetryCodexPoolAccountQuota, shouldRetryCodexPoolAccountTransient } from "./core-codex-account";
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
-import { linkRequestSessionLane, sessionLaneIdFromRequest } from "../request-log-conversation";
+import { linkRequestSessionLane, sessionLaneIdFromRequest, reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromRequest } from "../request-log-conversation";
 import { recallComboForLane } from "./combo-session-recall";
+import { redactHostedImageDisplayPaths } from "../responses-hosted-image-display";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -331,6 +373,7 @@ async function refreshNativeMainCompactContext(args: {
       ...authCtx,
       accessToken: refreshed.accessToken,
       chatgptAccountId: refreshed.chatgptAccountId,
+      mainQuotaWriter: mainAccountTokenQuotaWriter(refreshed) ?? authCtx.mainQuotaWriter,
     };
     const refreshedProvider = applyCodexAuthContextToProvider(
       stripCodexRuntimeProviderFields(provider),
@@ -424,6 +467,9 @@ async function refreshPoolCompactContext(args: {
       generation: refreshed.generation,
       poolQuotaWriter: capturePoolQuotaWriter(authCtx.accountId, refreshed),
     };
+    // See the core counterpart: the spread dropped the WeakMap-bound credit policy, so a hold
+    // or opt-out landing during the refresh await would go unchecked on the copy.
+    rebindPoolCreditPolicy(authCtx, refreshedAuthCtx);
     const refreshedProvider = applyCodexAuthContextToProvider(
       stripCodexRuntimeProviderFields(provider),
       refreshedAuthCtx,
@@ -452,6 +498,16 @@ async function refreshPoolCompactContext(args: {
     if (isTerminalCompactPoolRefreshFailure(error)) {
       return { ok: false, quarantine: true, response: reauthResponse() };
     }
+    if (req.signal.aborted) {
+      return { ok: false, quarantine: false, response: clientCancelledResponse() };
+    }
+    // See the core counterpart: a policy refusal raised after a successful refresh maps like
+    // the admission path — a reset-bound 429, never a 503 mislabeled as a refresh failure.
+    const policyResponse = mapCodexAuthContextErrorToResponse(error, {
+      now: Date.now(),
+      accountSelector: args.codexAccountNamespace,
+    });
+    if (policyResponse) return { ok: false, quarantine: false, response: policyResponse };
     return {
       ok: false,
       quarantine: false,
@@ -554,6 +610,7 @@ export async function bufferCompactResponse(
   upstream: Response,
   signal: AbortSignal,
   stallTimeoutSec?: number,
+  localUpstream?: boolean,
 ): Promise<Response> {
   const headers = compactResponseHeaders(upstream);
   try {
@@ -573,7 +630,9 @@ export async function bufferCompactResponse(
     const result = await readBoundedResponseBytes(upstream, {
       signal,
       maxBytes: COMPACT_RESPONSE_MAX_BYTES,
-      inactivityTimeoutMs: resolveStallTimeoutSec(stallTimeoutSec) * 1_000,
+      // Compaction buffers the complete body while holding an active-turn lease. Keep its
+      // default bounded even for local destinations so silent bodies cannot exhaust that gate.
+      inactivityTimeoutMs: resolveStallTimeoutMs(stallTimeoutSec),
     });
     if (signal.aborted) return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
     if (result.oversized) return compactResponseTooLargeError();
@@ -610,6 +669,8 @@ export async function handleResponsesCompact(
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return formatErrorResponse(400, "invalid_request_error", "Invalid compaction request body");
   }
+  // Compaction forwards client history upstream too; keep local artifact paths out of it.
+  redactHostedImageDisplayPaths(body);
   if (!options.compactionRoutingOverride) {
     options = { ...options, compactionRoutingOverride: applyCompactionRoutingOverride(body, req.headers, config, { endpoint: "compact" }) };
   }
@@ -655,7 +716,20 @@ export async function handleResponsesCompact(
     // routes ordinary turns elsewhere (#2901); the compaction-scoped router
     // may land that on the configured default provider instead of 404.
     route = routeCompactionModel(config, compactModel, evidenceFromBody(raw));
+    // A compaction override picks the model, not the caller, so the key's scope
+    // is applied to what the override resolved to rather than to the selector
+    // the client sent.
+    // Routed xAI OAuth compaction must preview its Fast wire model here;
+    // native compact keeps checking the destination it dispatches directly.
+    const callerTier = (raw as Record<string, unknown>).service_tier;
+    assertRouteAllowedByScope(resolveAdmissionModelScope(config, admission), compactRequestedModel, {
+      providerName: route.providerName,
+      modelId: previewXaiOauthWireModel({ options: {
+        serviceTier: compactFastRow ? "priority" : typeof callerTier === "string" ? callerTier : undefined,
+      } }, route, config, "responses"),
+    });
   } catch (err) {
+    if (err instanceof AdmissionModelDeniedError) return admissionModelDeniedResponse(err);
     if (err instanceof NoEligiblePolicyCandidateError) {
       // Persist the evaluation trace (per-candidate exclusions + the
       // no-eligible reason) so a failed compact policy request stays
@@ -670,13 +744,16 @@ export async function handleResponsesCompact(
   // reads the account namespace as a routed provider prefix — so keying on `raw.model` sent
   // exactly the selector form back down the native compact endpoint this guard exists to avoid.
   // `route.modelId` is the same value `applyCodexAccountGatedWireNormalization` uses in core.ts.
-  const accountGatedCompactWireModel = codexAccountGatedCanonicalWireModel(selectedModelId);
+  const accountGatedCompactWireModel = isCanonicalOpenAiForwardProvider(route.provider)
+    ? codexAccountGatedCanonicalWireModel(selectedModelId) : undefined;
   logCtx.requestedModel = compactRequestedModel;
   logCtx.model = selectedModelId;
   logCtx.routeDecision = route.routeDecision;
+  logCtx.policyEligibility = route.policyEligibility;
   logCtx.provider = route.codexAccountNamespace
     ? `${route.providerName}-${route.codexAccountNamespace}`
     : route.providerName;
+  logCtx.spendPoolId = route.providerName;
   logCtx.providerAdapter = route.provider.adapter;
   // #4940, and the same refusal the ordinary Responses path makes in request-prepare.ts. Compact has
   // to repeat it rather than inherit it: the native branch below dispatches straight to
@@ -698,6 +775,7 @@ export async function handleResponsesCompact(
     captureOpenAiVirtualWirePolicy(route, virtual);
     logCtx.model = virtual.selectedModelId;
     logCtx.resolvedModel = virtual.wireModelId;
+    logCtx.wireModel = virtual.wireModelId;
   } else {
     logCtx.resolvedModel = route.modelId;
   }
@@ -747,8 +825,8 @@ export async function handleResponsesCompact(
   }
 
   // Native /responses/compact exists on the canonical ChatGPT backend and on the
-  // official OpenAI API. Any other Responses-shaped gateway must take the routed
-  // summarizer path below, or compaction fails against an endpoint it never had (#422).
+  // official OpenAI API, or a gateway explicitly declaring the native endpoint. Other
+  // Responses-shaped gateways still take the routed summarizer path (#422).
   // Combo-resolved targets skip native compact so failover can advance through the
   // combo target list when the picked model returns 429/5xx — the routed path below
   // dispatches through handleResponses → handleComboResponses with full failover.
@@ -758,7 +836,7 @@ export async function handleResponsesCompact(
   // failure that hands off, continues here. The routed turn used to call handleResponses with
   // no budget at all, so `handleResponsesInner` minted a fresh four after the native attempt
   // had already spent some of the first one.
-  const sendBudget: RequestExecutionBudget = options.sendBudget ?? createRequestExecutionBudget();
+  const sendBudget: RequestExecutionBudget = options.sendBudget ?? createInferenceSendBudget(req, logCtx);
   // A manual override onto another backend must not mint ciphertext the conversation model cannot replay.
   const manualOverrideCrossesProvider = options.compactionRoutingOverride
     ? !compactionRoutingKeepsProviderIdentity(config, options.compactionRoutingOverride, route)
@@ -787,7 +865,7 @@ export async function handleResponsesCompact(
       compactHostAdmissionLease = admission.lease;
     }
     try {
-    // Native ChatGPT/OpenAI model: forward the compact request verbatim to the real backend.
+    // Native-capable destination: forward the compact request to its configured backend.
     // Resolve the SAME pool/thread auth context as /v1/responses — forwarding the caller's raw
     // headers would run compaction on the wrong account (or 401) whenever a pool account is
     // active for this thread while normal turns succeed.
@@ -854,19 +932,35 @@ export async function handleResponsesCompact(
       // codexAccountMode cases, and the picker returns null for them anyway.
       // Transport variant, for the same reason as the Responses core: the persisted row has no
       // registry backfills, and compactProvider is read for its transport fields below.
-      const warmKeyProvider = selectProactiveApiKeyTransport(config, route.providerName, compactProvider);
+      let warmKeyProvider;
+      try { warmKeyProvider = selectProactiveApiKeyTransport(config, route.providerName, compactProvider); }
+      catch (error) {
+        const refusal = requestPacingOverloadResponse(error);
+        if (refusal) return refusal;
+        throw error;
+      }
       if (warmKeyProvider?.apiKey) compactProvider = warmKeyProvider;
       headers.set("authorization", `Bearer ${resolveProviderApiKey(compactProvider.apiKey)}`);
+      stampApiKeyAccountLabel(logCtx, route.providerName, compactProvider);
     }
     const { reasoning: _reasoning, ...compactBodyRaw } = raw as typeof raw & { reasoning?: unknown };
+    const requireCompactPlaintextReasoning = !isOpenAiOperatedResponsesDestination(compactProvider)
+      && requiresPlaintextReasoningReplay(compactProvider);
     // The regular /v1/responses path applies sanitizeReasoningInputContent via the adapter's
     // buildRequest, but the compact endpoint forwards directly. Apply the same sanitizer here
-    // so routed-model reasoning items (reasoning_text content) don't 400 the ChatGPT backend.
+    // so canonical reasoning stays blank and custom gateways honor their explicit plaintext policy.
     // #5095: the compact endpoint forwards `raw` directly, so it needs the same legacy dotted
     // call-name repair the adapter applies. A damaged item here refuses the compaction itself,
     // which is the request a long task depends on to keep going.
+    // Direct compact bypasses the adapter's Google replay projection (#7111).
     const compactBody = repairLegacyDottedToolCallNames(
-      sanitizeReasoningInputContent(compactBodyRaw),
+      stripProviderInputItemMetadata(sanitizeReasoningInputContent(compactBodyRaw, {
+        preserveRawReasoningContent: !isOpenAiOperatedResponsesDestination(compactProvider)
+          && compactProvider.preserveResponsesReasoningContent === true,
+        dropNullContentChannel: !isOpenAiOperatedResponsesDestination(compactProvider),
+        stripEncryptedContent: requireCompactPlaintextReasoning,
+        requirePlaintextReasoning: requireCompactPlaintextReasoning,
+      })),
     ) as typeof compactBodyRaw;
     {
       const binding = conversationStateBindingFromAuth(authCtx, codexPoolAffinityKey(req.headers));
@@ -893,9 +987,35 @@ export async function handleResponsesCompact(
         });
       }
     }
-    const compactUrl = `${base}/responses/compact`;
+    // Gateway protocol capability never grants official credential authority. Reuse the normal
+    // Responses transport for custom paths, static auth and explicitly forwarded client metadata.
+    const gatewayTransport = !isCanonicalOpenAiForwardProvider(compactProvider)
+      && compactProvider.supportsNativeCompactEndpoint === true
+      ? buildResponsesTransport({ ...compactProvider, apiKey: compactProvider.apiKey ? resolveProviderApiKey(compactProvider.apiKey) : undefined }, { headers: req.headers })
+      : undefined;
+    if (gatewayTransport) headers = new Headers(gatewayTransport.headers);
+    // Native v1 bypasses the adapter serializer. Bind the same replay provenance as ordinary
+    // turns, but leave canonical compact's established account-state handling unchanged.
+    const gatewayReplayParsed = gatewayTransport ? parseRequest(raw) : undefined;
+    if (gatewayReplayParsed) {
+      gatewayReplayParsed.modelId = route.modelId;
+      gatewayReplayParsed._clientThreadId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
+      const clientThreadId = reasoningReplayConversationIdFromResponsesRequest({
+        clientThreadId: gatewayReplayParsed._clientThreadId,
+        threadIdHeader: req.headers.get("thread-id"),
+        cursorConversationId: gatewayReplayParsed._cursorConversationId,
+        sessionIdHeader: sessionIdHeaderFromRequest(req.headers),
+      });
+      if (clientThreadId) {
+        gatewayReplayParsed._reasoningReplayScope = {
+          clientThreadId,
+          clientPrincipalId: resolveContextPrincipal(req, config, admission),
+        };
+      }
+    }
+    let compactUrl = gatewayTransport ? `${gatewayTransport.url.replace(/\/+$/, "")}/compact` : `${base}/responses/compact`;
     const compactTargetKey = `${route.providerName}|${route.modelId}|compact`;
-    const actualCompactHostKey = upstreamHostHealthKey(
+    let actualCompactHostKey = upstreamHostHealthKey(
       route.providerName,
       safeOriginLabel(compactUrl),
     );
@@ -934,7 +1054,7 @@ export async function handleResponsesCompact(
       }
       compactHostAdmissionLease = null;
     };
-    const connectMs = config.connectTimeoutMs ?? 200_000;
+    const connectMs = () => resolveConnectTimeoutMs(config.connectTimeoutMs, { localUpstream: isLocalUpstream(compactUrl) });
     // Takes its context explicitly: the alternate-account flow below records a rejection
     // against A while promoting B, then records B's own outcome. A closure over a single
     // `authCtx` cannot express either.
@@ -947,9 +1067,12 @@ export async function handleResponsesCompact(
         promoteAccountId?: string;
       } = {},
     ) => {
-      if (!usesCodexForwardPoolAuth(ctx, route.provider)) return;
+      // A gateway response is not evidence about any Codex account.
+      if (gatewayTransport || !usesCodexForwardPoolAuth(ctx, route.provider)) return;
+      if ((outcome === 401 || outcome === 403) && upstream && wasPermanentAccountRefusal(upstream)) return;
       recordCodexUpstreamOutcome(config, ctx.accountId, outcome, {
         ...meta,
+        ...codexFailureWindowOutcomeMeta(ctx),
         threadId: ctx.kind === "pool" || ctx.kind === "main-pool" ? ctx.affinityKey : undefined,
         fixedAccount: ctx.fixedAccount,
         modelId: selectedModelId,
@@ -976,42 +1099,136 @@ export async function handleResponsesCompact(
     // `kind === "pool"` and a main-pool credential left it false -- so 401 then 429 really did
     // reach five. The single sends spend the base allowance first and then the one shared
     // final-recovery reserve, which is the same rule the Responses path follows.
-    const sendSingleCompactAttempt = (
+    const sendSingleCompactAttempt = async (
       doFetch: () => Promise<Response>,
     ): Promise<Response> => {
       if (sendBudget.remainingBaseSends(TRANSIENT_RETRY_MAX_ATTEMPTS) > 0) {
-        sendBudget.used += 1;
-        return doFetch();
+        const report = createPhysicalSendReporter(sendBudget, () => ({ poolId: logCtx.spendPoolId ?? route.providerName,
+          identityId: logCtx.accountLogLabel }));
+        let started = false;
+        try {
+          if (report.beforeSend?.() === false) throw new SendBudgetExhaustedError(safeHostLabel(compactUrl));
+          started = true;
+          return await (report.execute ? report.execute(doFetch) : doFetch());
+        } finally {
+          try { if (started) report(1); }
+          finally { report.close?.(); }
+        }
       }
       const decision = sendBudget.reserveDispatch({
         sendClass: "auth-recovery",
         targetKey: compactTargetKey,
       });
       if (!decision.allowed) return Promise.reject(new SendBudgetExhaustedError(safeHostLabel(compactUrl)));
-      if (!decision.permit.use()) return Promise.reject(new SendBudgetExhaustedError(safeHostLabel(compactUrl)));
-      return doFetch();
+      const dispatch = () => {
+        if (!decision.permit.use()) {
+          decision.permit.release();
+          throw new SendBudgetExhaustedError(safeHostLabel(compactUrl));
+        }
+        return doFetch();
+      };
+      return decision.permit.execute ? decision.permit.execute(dispatch) : dispatch();
     };
     const sendCompactAttempt = (
       sendProvider: OcxProviderConfig,
       sendHeaders: Headers,
       recovery: "normal" | "single",
       sendAuthCtx: CodexAuthContext,
+      onPhysicalDispatch?: () => void,
     ): Promise<Response> => {
+      // A gateway send carries only its own transport headers, whatever recovery handed in.
+      let wireHeaders = gatewayTransport ? new Headers(gatewayTransport.headers) : sendHeaders;
+      sendHeaders = wireHeaders;
+      const buildCompactSendBody = () => {
+        if (gatewayReplayParsed) bindRouteReasoningReplayScope({
+          parsed: gatewayReplayParsed, providerName: route.providerName, provider: sendProvider,
+          adapterName: sendProvider.adapter, codexAuthContext: sendAuthCtx, forwardHeaders: wireHeaders,
+        });
+        const requireSendPlaintextReasoning = !isOpenAiOperatedResponsesDestination(sendProvider)
+          && requiresPlaintextReasoningReplay(sendProvider);
+        let replayBody = gatewayReplayParsed ? sanitizeReasoningInputContent(scrubOcxCompactionItems(
+          compactBody, destinationDecodesNativeCompactionBlob(sendProvider),
+          gatewayReplayParsed._stripReasoningEncryptedContent === true,
+        ), {
+          preserveRawReasoningContent: !isOpenAiOperatedResponsesDestination(sendProvider)
+            && sendProvider.preserveResponsesReasoningContent === true,
+          dropNullContentChannel: !isOpenAiOperatedResponsesDestination(sendProvider),
+          stripEncryptedContent: gatewayReplayParsed._stripReasoningEncryptedContent === true || requireSendPlaintextReasoning,
+          dropForeignItemId: gatewayReplayParsed._dropForeignReasoningItemIds === true,
+          requirePlaintextReasoning: requireSendPlaintextReasoning,
+        }) : compactBody;
+        if (!isOpenAiOperatedResponsesDestination(sendProvider) && sendProvider.dropResponsesReasoningItems === true) {
+          replayBody = dropResponsesReasoningInputItems(replayBody) as typeof replayBody;
+        }
+        if (!isOpenAiOperatedResponsesDestination(sendProvider) && sendProvider.preserveResponsesMessageMetadata !== true) {
+          replayBody = stripInternalChatMessageMetadataPassthrough(replayBody) as typeof replayBody;
+        }
+        // A queued key selection can refresh the destination; project only for this send.
+        return isOpenAiOperatedResponsesDestination(sendProvider)
+          ? repairUrlCitationAnnotations(replayBody) : stripCanonicalOnlyInputItems(stripCanonicalOnlyTopLevelFields(replayBody));
+      };
       const doFetch = (upstreamRecovery?: UpstreamSendRecovery) => fetchWithHeaderTimeout(
         compactUrl,
         applyUpstreamRecoveryInit({
           method: "POST",
-          headers: sendHeaders,
-          body: JSON.stringify({ ...compactBody, model: route.modelId }),
+          headers: wireHeaders,
+          body: JSON.stringify({ ...buildCompactSendBody() as typeof compactBody, model: route.modelId }),
         }, upstreamRecovery),
         req.signal,
-        connectMs,
+        // Keyed sends can refresh their destination after pacing. Their physical send below
+        // owns the header clock; the outer wrapper owns pacing and client cancellation only.
+        sendProvider.authMode !== "forward" && sendProvider.apiKey ? 0 : connectMs(),
         false,
         providerFetch(sendProvider, undefined, {
           providerName: route.providerName,
           modelId: route.modelId,
+          accountAutoPause: (name, provider, headers) => captureAccountAutoPauseAttempt(name, provider, { config, codex: sendAuthCtx }, headers),
           beforeDispatch: isCanonicalOpenAiForwardProvider(sendProvider)
-            ? createCodexReserveDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
+            ? createCodexAuthDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
+          dispatchOverride: sendProvider.authMode !== "forward" && sendProvider.apiKey
+            ? async (_input, init, execute, reacquirePacing) => {
+              for (let attempt = 0; !providerApiKeySelectionIsCurrent(config, route.providerName, sendProvider); attempt++) {
+                if (attempt >= 3) throw new Error("Provider key selection changed repeatedly before compact dispatch");
+                let current = resolveCurrentProviderApiKeyTransport(config, route.providerName, sendProvider);
+                if (!current && sendProvider.requestPacing?.enabled
+                  && (sendProvider.requestPacing.keys || sendProvider.requestPacing.keySelection === "round-robin")) {
+                  const fresh = resolveCurrentProviderApiKeyTransport(config, route.providerName, { ...sendProvider, _apiKeyAttempt: undefined });
+                  if (fresh) current = selectProactiveApiKeyTransport(config, route.providerName, fresh) ?? fresh;
+                }
+                if (!current?.apiKey || !supportsNativeResponsesCompactEndpoint(route.providerName, current)) {
+                  throw new Error("Provider key selection is no longer available for compact");
+                }
+                const rebuilt = new Headers(sendHeaders);
+                for (const name of Object.keys(sendProvider.headers ?? {})) rebuilt.delete(name);
+                for (const [name, value] of Object.entries(current.headers ?? {})) rebuilt.set(name, value);
+                rebuilt.set("authorization", `Bearer ${resolveProviderApiKey(current.apiKey)}`);
+                const currentGateway = gatewayTransport
+                  ? buildResponsesTransport({ ...current, apiKey: resolveProviderApiKey(current.apiKey) }, { headers: req.headers })
+                  : undefined;
+                sendHeaders = wireHeaders = headers = currentGateway ? new Headers(currentGateway.headers) : rebuilt;
+                sendProvider = compactProvider = current;
+                compactUrl = currentGateway ? `${currentGateway.url.replace(/\/+$/, "")}/compact`
+                  : `${(current.baseUrl ?? "").replace(/\/+$/, "")}/responses/compact`;
+                actualCompactHostKey = upstreamHostHealthKey(route.providerName, safeOriginLabel(compactUrl));
+                if (current.requestPacing?.enabled
+                  && (current.requestPacing.keys || current.requestPacing.keySelection === "round-robin")) {
+                  if (!reacquirePacing) throw new Error("Refreshed compact dispatch requires pacing readmission");
+                  await reacquirePacing(current, route.modelId);
+                }
+              }
+              if (req.signal.aborted) throw req.signal.reason;
+              stampApiKeyAccountLabel(logCtx, route.providerName, sendProvider);
+              if (!rebindPhysicalSend(sendBudget, { poolId: logCtx.spendPoolId ?? route.providerName,
+                identityId: logCtx.accountLogLabel })) throw new SendBudgetExhaustedError(safeHostLabel(compactUrl));
+              noteProviderAttemptSend(logCtx, route.providerName, sendProvider, logCtx.usageLogInputTokens, upstreamRecovery);
+              const physicalFetch = ((input, physicalInit) => sendWithConnectionPolicy(
+                distributedKeyPhysicalFetch((sendProvider as { fetch?: typeof fetch }).fetch ?? execute, route.providerName, sendProvider, compactUrl), String(input),
+                physicalInit, { providerName: route.providerName, provider: sendProvider })) as typeof fetch;
+              return fetchWithHeaderTimeout(compactUrl,
+                { ...init, headers: sendHeaders, body: JSON.stringify({ ...buildCompactSendBody() as typeof compactBody, model: route.modelId }) },
+                init.signal ?? req.signal, connectMs(), false, physicalFetch);
+            } : undefined,
+          ...(onPhysicalDispatch ? { onPhysicalDispatch } : {}),
         }),
         // Every credential-bearing forward send gets manual redirects, not only
         // pool sends: direct mode carries the caller's credential too (#914).
@@ -1027,10 +1244,13 @@ export async function handleResponsesCompact(
         : fetchWithTransientRetry(doFetch, {
           abortSignal: req.signal,
           label: safeHostLabel(compactUrl),
-          // Draws the shared remainder instead of a fresh three. Compact is a native endpoint
-          // of the same logical turn, so its sends belong to the same cap.
-          attempts: sendBudget.remainingBaseSends(TRANSIENT_RETRY_MAX_ATTEMPTS),
-          onSendsConsumed: (used: number) => { sendBudget.used += Math.max(0, used); },
+          // Key-auth policy is a logical-request total; canonical forward keeps its default
+          // ladder. Both intersect the same shared base remainder as ordinary Responses.
+          attempts: sendBudget.remainingBaseSends(transientSendCapFor(
+            transientRetryPolicyFor(sendProvider)?.attempts, sendBudget.used,
+          )),
+          onSendsConsumed: createPhysicalSendReporter(sendBudget, () => ({ poolId: logCtx.spendPoolId ?? route.providerName,
+            identityId: logCtx.accountLogLabel })),
         });
     };
 
@@ -1038,9 +1258,12 @@ export async function handleResponsesCompact(
     // actually happens, so every recorder call names the context that produced it.
     let outcomeCtx = authCtx;
     const localDispatchRefusal = (error: unknown): Response | undefined => {
-      const response = mapCodexAuthContextErrorToResponse(unwrapUpstreamRetryEvidenceError(error), {
-        now: Date.now(), accountSelector: route.codexAccountNamespace,
-      });
+      const cause = unwrapUpstreamRetryEvidenceError(error);
+      const response = requestPacingOverloadResponse(cause) ?? spendLedgerStorageErrorResponse(error, logCtx) ?? (cause instanceof SendBudgetExhaustedError
+        ? unboundPoolSpendRefusalResponse(logCtx) ?? formatErrorResponse(429, "request_send_budget_exhausted", cause.message)
+        : mapCodexAuthContextErrorToResponse(cause, {
+          now: Date.now(), accountSelector: route.codexAccountNamespace,
+        }));
       if (response) {
         releaseUpstreamHostAdmission(compactHostAdmissionLease);
         compactHostAdmissionLease = null;
@@ -1081,9 +1304,11 @@ export async function handleResponsesCompact(
       return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
     }
 
+    recordDistributedResponseFailure(upstream, config, route.providerName, req.signal);
     if (
-      upstream.status === 401
+      upstream.status === 401 && !wasPermanentAccountRefusal(upstream)
       && (authCtx.kind === "main-pool" || authCtx.kind === "pool")
+      && !gatewayTransport
       && usesCodexForwardPoolAuth(authCtx, compactProvider)
       && !req.signal.aborted
     ) {
@@ -1153,17 +1378,65 @@ export async function handleResponsesCompact(
       }
     }
 
+    // The settle for an alternate send that threw, shared by the quota and transient moves. By the
+    // time it runs the request already names the alternate (outcomeCtx), so health goes to it.
+    const failedAlternateCompactSend = (err: unknown): Response => {
+      if (req.signal.aborted) {
+        recordCompactPoolOutcome(outcomeCtx, 499);
+        return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+      }
+      const localRefusal = localDispatchRefusal(err);
+      if (localRefusal) return localRefusal;
+      const outcome = classifyTransportFailureKind(err);
+      // Host-level evidence stands regardless of pool membership (#914 review).
+      if (outcome === "connect_neutral") {
+        if (compactHostCircuitEnabled) {
+          recordUpstreamHostFailure(actualCompactHostKey, {
+            code: transportErrorCode(err),
+            threshold: config.upstreamHostCircuitThreshold,
+            lease: compactHostAdmissionLease,
+          });
+        } else {
+          recordUpstreamHostFailure(actualCompactHostKey, { code: transportErrorCode(err) });
+        }
+      } else {
+        releaseUpstreamHostAdmission(compactHostAdmissionLease);
+      }
+      compactHostAdmissionLease = null;
+      recordCompactPoolOutcome(outcomeCtx, outcome);
+      return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
+    };
+    const scrubCompactStateForAlternate = (alternateAuthCtx: CodexAuthContext): void => {
+      const binding = conversationStateBindingFromAuth(
+        alternateAuthCtx,
+        (authCtx.kind === "pool" || authCtx.kind === "main-pool")
+          ? authCtx.affinityKey
+          : codexPoolAffinityKey(req.headers),
+      );
+      if (!binding) return;
+      for (const body of [raw, compactBody]) {
+        applyAccountChangeConversationStateScrub({
+          body,
+          bindingKey: binding.bindingKey,
+          servingAccountId: binding.accountId,
+          priorAccountId: authCtx.accountId,
+          logCtx,
+        });
+      }
+    };
+
     // Bounded same-request alternate: the regular /v1/responses path already does this
     // (core.ts:319-423) and recognizes exactly 429/402. Without it a pool rejection
     // surfaces to the client, which retries the compact task OUTSIDE the logical request
     // — reporting exhausted retries while another pool account sat idle (#913).
     if (
-      (upstream.status === 429 || upstream.status === 402)
+      (upstream.status === 429 || upstream.status === 402 || wasAccountAutoPaused(upstream))
       // A replay refusal this proxy synthesized carries 429 for the client's benefit only.
       // It is not pool quota evidence, and the alternate account below is another send of a
       // compact turn that may already have been processed.
       && !isNonReplayableResponse(upstream)
-      && !storedPool401ReplayAttempted
+      && (!storedPool401ReplayAttempted || wasAccountAutoPaused(upstream))
+      && !gatewayTransport
       && usesCodexForwardPoolAuth(authCtx, route.provider)
       && !authCtx.fixedAccount
       && route.codexAccountMode
@@ -1200,9 +1473,36 @@ export async function handleResponsesCompact(
       if (alternate && req.signal.aborted) {
         releaseCodexAuthContextProbeLease(alternate.authCtx);
         recordCompactPoolOutcome(outcomeCtx, 499);
+        void upstream.body?.cancel(req.signal.reason).catch(() => undefined);
         return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
       }
-      if (alternate) {
+      // The same scope binding the regular path applies: an organization-scoped
+      // exhaustion refuses every credential in that workspace, so a proven
+      // same-workspace alternate pays a cold prompt prefix for no new capacity.
+      // Suppression is not silence — the buffered recorder below still attributes
+      // the 429/402 to the account that produced it.
+      const sharedWorkspaceScope = alternate != null
+        && !await shouldRetryCodexScopedQuotaOnAlternate(
+          upstream,
+          authCtx.chatgptAccountId,
+          alternate.authCtx.kind === "pool" || alternate.authCtx.kind === "main-pool"
+            ? alternate.authCtx.chatgptAccountId
+            : callerCodexWorkspaceAccountId(req.headers),
+          req.signal,
+        );
+      // The scope check reads the rejection body asynchronously — the same window the
+      // comment above covers. Re-check before the branch below records A, cancels its
+      // body, and sends B for a caller that is gone.
+      if (alternate && req.signal.aborted) {
+        releaseCodexAuthContextProbeLease(alternate.authCtx);
+        recordCompactPoolOutcome(outcomeCtx, 499);
+        void upstream.body?.cancel(req.signal.reason).catch(() => undefined);
+        return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+      }
+      if (alternate && sharedWorkspaceScope) {
+        releaseCodexAuthContextProbeLease(alternate.authCtx);
+      }
+      if (alternate && !sharedWorkspaceScope) {
         // Same order the regular path uses (core.ts:349-357): a 429/402 carries the
         // quota snapshot that produced it, so refresh A's cache before recording its
         // rejection. Skipping this leaves quota-strategy routing and the dashboard
@@ -1214,7 +1514,8 @@ export async function handleResponsesCompact(
             upstream.headers,
             authCtx.writerGeneration,
             authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
-            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined },
+            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined,
+              poolResponse: authCtx.kind === "pool" },
           );
         }
         recordCompactPoolOutcome(authCtx, upstream.status, {
@@ -1225,57 +1526,82 @@ export async function handleResponsesCompact(
         await upstream.body?.cancel().catch(() => undefined);
         outcomeCtx = alternate.authCtx;
         logCtx.accountLogLabel = codexAuthContextLogLabel(alternate.authCtx, config);
-        {
-          const binding = conversationStateBindingFromAuth(
-            alternate.authCtx,
-            (authCtx.kind === "pool" || authCtx.kind === "main-pool")
-              ? authCtx.affinityKey
-              : codexPoolAffinityKey(req.headers),
-          );
-          if (binding) {
-            applyAccountChangeConversationStateScrub({
-              body: raw,
-              bindingKey: binding.bindingKey,
-              servingAccountId: binding.accountId,
-              priorAccountId: authCtx.accountId,
-              logCtx,
-            });
-            applyAccountChangeConversationStateScrub({
-              body: compactBody,
-              bindingKey: binding.bindingKey,
-              servingAccountId: binding.accountId,
-              priorAccountId: authCtx.accountId,
-              logCtx,
-            });
-          }
-        }
+        scrubCompactStateForAlternate(alternate.authCtx);
         try {
           upstream = await sendCompactAttempt(alternate.provider, alternate.headers, "single", alternate.authCtx);
         } catch (err) {
-          if (req.signal.aborted) {
-            recordCompactPoolOutcome(outcomeCtx, 499);
-            return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+          return failedAlternateCompactSend(err);
+        }
+      }
+    }
+    // A transient 5xx that survived the same-account ladder above (#6969). The regular path moves
+    // it to another Pool account; compact used to move only on 429/402, so the client retried the
+    // compact task outside this request while another account sat idle. One bounded alternate send,
+    // the same guards as the quota move, and a 5xx whose body confirms quota keeps today's path.
+    if (
+      shouldRetryCodexPoolAccountTransient(upstream)
+      && (!storedPool401ReplayAttempted || wasAccountAutoPaused(upstream))
+      && !gatewayTransport
+      && usesCodexForwardPoolAuth(authCtx, route.provider)
+      && !authCtx.fixedAccount
+      && route.codexAccountMode
+      && outcomeCtx === authCtx
+      && !req.signal.aborted
+      && !conversationCarriesUploadedFiles(raw)
+      && !await shouldRetryCodexPoolAccountQuota(upstream, req.signal)
+    ) {
+      const firstStatus = upstream.status;
+      const firstRetryAfter = upstream.headers.get("retry-after");
+      const firstResetAt = [
+        upstream.headers.get("x-codex-primary-reset-at"),
+        upstream.headers.get("x-codex-secondary-reset-at"),
+        upstream.headers.get("x-codex-tertiary-reset-at"),
+      ].filter(Boolean);
+      const alternate = await resolveAlternateCompactContext({
+        req,
+        admission,
+        config,
+        route,
+        selectedModelId,
+        excludeAccountId: authCtx.accountId,
+        turnAdmissionLease,
+      });
+      if (alternate && req.signal.aborted) {
+        releaseCodexAuthContextProbeLease(alternate.authCtx);
+        recordCompactPoolOutcome(outcomeCtx, 499);
+        void upstream.body?.cancel(req.signal.reason).catch(() => undefined);
+        return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+      }
+      if (alternate) {
+        const firstLabel = logCtx.accountLogLabel;
+        // B's identity before B's admission, so every budget and spend check runs against B. A's
+        // response stays intact until B is actually sent.
+        logCtx.accountLogLabel = codexAuthContextLogLabel(alternate.authCtx, config);
+        scrubCompactStateForAlternate(alternate.authCtx);
+        const recordFirstMove = () => {
+          recordCompactPoolOutcome(authCtx, firstStatus, { retryAfter: firstRetryAfter, resetAt: firstResetAt });
+          void upstream.body?.cancel().catch(() => undefined);
+          outcomeCtx = alternate.authCtx;
+        };
+        let alternateResponse: Response | undefined;
+        // Whether B's send actually left this process. Every local refusal before that point -- a
+        // spent budget, a dispatch guard such as disabled credits, a pacing refusal -- keeps A.
+        let alternateDispatched = false;
+        try {
+          alternateResponse = await sendCompactAttempt(alternate.provider, alternate.headers, "single", alternate.authCtx,
+            () => { alternateDispatched = true; });
+        } catch (err) {
+          if (alternateDispatched) {
+            recordFirstMove();
+            return failedAlternateCompactSend(err);
           }
-          const localRefusal = localDispatchRefusal(err);
-          if (localRefusal) return localRefusal;
-          const outcome = classifyTransportFailureKind(err);
-          // Host-level evidence stands regardless of pool membership (#914 review).
-          if (outcome === "connect_neutral") {
-            if (compactHostCircuitEnabled) {
-              recordUpstreamHostFailure(actualCompactHostKey, {
-                code: transportErrorCode(err),
-                threshold: config.upstreamHostCircuitThreshold,
-                lease: compactHostAdmissionLease,
-              });
-            } else {
-              recordUpstreamHostFailure(actualCompactHostKey, { code: transportErrorCode(err) });
-            }
-          } else {
-            releaseUpstreamHostAdmission(compactHostAdmissionLease);
-          }
-          compactHostAdmissionLease = null;
-          recordCompactPoolOutcome(outcomeCtx, outcome);
-          return formatErrorResponse(502, "upstream_error", "Failed to connect to compact upstream");
+          // Refused before anything left: A's answer and identity stand, recorded once below.
+          logCtx.accountLogLabel = firstLabel;
+          releaseCodexAuthContextProbeLease(alternate.authCtx);
+        }
+        if (alternateResponse) {
+          recordFirstMove();
+          upstream = alternateResponse;
         }
       }
     }
@@ -1283,7 +1609,7 @@ export async function handleResponsesCompact(
     if (outcomeCtx.kind === "pool") {
       const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/quota");
       applyAccountQuotaFromUpstreamHeaders(outcomeCtx.accountId, upstream.headers, outcomeCtx.writerGeneration,
-        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter });
+        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter, poolResponse: true });
     }
     const retryAfter = upstream.headers.get("retry-after");
     const resetAt = [
@@ -1291,7 +1617,7 @@ export async function handleResponsesCompact(
       upstream.headers.get("x-codex-secondary-reset-at"),
       upstream.headers.get("x-codex-tertiary-reset-at"),
     ].filter(Boolean);
-    const buffered = await bufferCompactResponse(upstream, req.signal, config.stallTimeoutSec);
+    const buffered = await bufferCompactResponse(upstream, req.signal, config.stallTimeoutSec, isLocalUpstream(compactUrl));
     const bufferedErrorText = buffered.ok
       ? ""
       : await buffered.clone().text().catch(() => "");
@@ -1324,10 +1650,18 @@ export async function handleResponsesCompact(
     // request log; the routed branch gets the same through handleResponses. The
     // synthetic buffer errors are not upstream bodies and stay uninspected.
     if (buffered.ok) {
-      inspectResponseLogJson(logCtx, await buffered.clone().text());
+      const compactText = await buffered.clone().text();
+      if (gatewayReplayParsed) {
+        try {
+          if (nativeCompactResponseSchema.safeParse(JSON.parse(compactText)).success) {
+            commitReasoningReplayServingIdentity(gatewayReplayParsed._reasoningReplayScope);
+          }
+        } catch { /* A malformed body cannot establish serving provenance. */ }
+      }
+      inspectResponseLogJson(logCtx, compactText);
       if (!options.compactionRoutingOverride) forgetCompactHandoffRoute(req, admission);
       rememberServingConversationStateIssuer(outcomeCtx, codexPoolAffinityKey(req.headers));
-    } else if (!options.compactionRoutingOverride && quotaFailure && !storedPool401ReplayAttempted) {
+    } else if (!options.compactionRoutingOverride && quotaFailure && (!storedPool401ReplayAttempted || wasAccountAutoPaused(upstream))) {
       const fallbackModel = compactHandoffRoute(req, admission, raw.model);
       if (fallbackModel && !req.signal.aborted) {
         const fallbackReq = new Request(req.url, {
@@ -1365,112 +1699,147 @@ export async function handleResponsesCompact(
 
   // ROUTED model: run the v2 synthetic-compaction turn internally (appends COMPACT_PROMPT, no
   // tools) and decode the resulting ocx1 envelope into plain v1 replacement-history items.
-  const inputItems = Array.isArray(raw.input) ? (raw.input as unknown[]) : [];
-  const internalBody = {
-    ...raw,
-    // Canonical ChatGPT Responses rejects non-streaming turns. Daybreak cannot use the
-    // native compact endpoint either, so run its synthetic compaction as SSE and collapse
-    // the completed event back into the v1 compact JSON contract below. Combo-dispatched
-    // turns also go out as SSE: failover can land on a canonical child that rejects a
-    // non-streaming turn, and every combo-capable provider already serves streaming traffic.
-    stream: isCanonicalOpenAiForwardProvider(route.provider) || accountGatedCompactWireModel || route.combo ? true : false,
-    input: [...inputItems, { type: "compaction_trigger" }],
-  };
-  const internalHeaders = new Headers({ "content-type": "application/json" });
-  for (const name of FORWARD_HEADERS) {
-    const value = req.headers.get(name);
-    if (value) internalHeaders.set(name, value);
-  }
-  const internalReq = new Request("http://localhost/v1/responses", {
-    method: "POST",
-    headers: internalHeaders,
-    body: JSON.stringify(internalBody),
-  });
-  linkRequestSessionLane(req, internalReq);
-  // The routed compaction turn is a handoff inside the same logical request, so it draws the
-  // REMAINDER. Minting here is what let a native attempt spend three sends and the routed
-  // fallback spend four more.
-  const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease, sendBudget, compactionRoutingOverride: options.compactionRoutingOverride, ...(admission ? { admission } : {}) });
-  if (!response.ok) return response;
-  let json: { output?: unknown[]; status?: unknown; error?: unknown };
-  if (response.headers.get("content-type")?.includes("text/event-stream")) {
-    if (!response.body) {
-      return formatErrorResponse(502, "server_error", "compaction turn returned an empty event stream");
+  const rawInputItems = Array.isArray(raw.input) ? (raw.input as unknown[]) : [];
+  // Keep readable reasoning local until success, outside the summarizer request.
+  // Opaque compaction responses below keep their original protocol and ciphertext.
+  const retention: ReasoningRetentionResult = config.reasoningRetention?.enabled === true
+    && !isCanonicalOpenAiForwardProvider(route.provider) ? applyReasoningRetention(rawInputItems, {
+    archiveDir: join(getConfigDir(), "reasoning-archive"),
+    contextWindow: route.staticPolicy.model.contextWindow ?? route.staticPolicy.model.maxInputTokens,
+    maxContextPercent: config.reasoningRetention?.maxContextPercent,
+    maxTokens: config.reasoningRetention?.maxTokens,
+  }) : { input: rawInputItems };
+  let keepArchive = false;
+  try {
+    const inputItems = retention.input;
+    const internalBody = {
+      ...raw,
+      // Canonical ChatGPT Responses rejects non-streaming turns. Daybreak cannot use the
+      // native compact endpoint either, so run its synthetic compaction as SSE and collapse
+      // the completed event back into the v1 compact JSON contract below. Combo-dispatched
+      // turns also go out as SSE: failover can land on a canonical child that rejects a
+      // non-streaming turn, and every combo-capable provider already serves streaming traffic.
+      stream: isCanonicalOpenAiForwardProvider(route.provider) || accountGatedCompactWireModel || route.combo ? true : false,
+      input: [...inputItems, { type: "compaction_trigger" }],
+    };
+    const internalHeaders = new Headers({ "content-type": "application/json" });
+    for (const name of FORWARD_HEADERS) {
+      const value = req.headers.get(name);
+      if (value) internalHeaders.set(name, value);
     }
-    const terminal = { status: "incomplete" as "completed" | "failed" | "incomplete" };
-    let completed: { id?: unknown; output?: unknown; status?: unknown } | undefined;
-    await new Promise<void>(resolve => {
-      consumeForInspection(
-        response.body!,
-        status => { terminal.status = status; },
-        req.signal,
-        resolve,
-        undefined,
-        undefined,
-        value => { completed = value; },
-      );
+    copyResponsesClientMetadata(internalHeaders, req.headers, route.provider);
+    const internalReq = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify(internalBody),
     });
+    linkRequestSessionLane(req, internalReq);
+    // The routed compaction turn is a handoff inside the same logical request, so it draws the
+    // REMAINDER. Minting here is what let a native attempt spend three sends and the routed
+    // fallback spend four more.
+    // internalReq keeps only FORWARD_HEADERS, so the caller principal is resolved from req.
+    const replayPrincipal = { clientPrincipalId: resolveContextPrincipal(req, config, admission) };
+    const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease, sendBudget, compactionRecoveryKind: "compaction-v1", compactionRoutingOverride: options.compactionRoutingOverride, replayPrincipal, ...(admission ? { admission } : {}) });
+    if (req.signal.aborted) {
+      void response.body?.cancel(req.signal.reason).catch(() => undefined);
+      return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+    }
+    if (!response.ok) return response;
+    let json: { output?: unknown[]; status?: unknown; error?: unknown };
+    if (hasResponseMediaType(response.headers, "text/event-stream")) {
+      if (!response.body) {
+        return formatErrorResponse(502, "server_error", "compaction turn returned an empty event stream");
+      }
+      const terminal = { status: "incomplete" as "completed" | "failed" | "incomplete" };
+      let completed: { id?: unknown; output?: unknown; status?: unknown } | undefined;
+      await new Promise<void>(resolve => {
+        consumeForInspection(
+          response.body!,
+          status => { terminal.status = status; },
+          req.signal,
+          resolve,
+          undefined,
+          undefined,
+          value => { completed = value; },
+        );
+      });
+      if (req.signal.aborted) {
+        return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+      }
+      if (terminal.status !== "completed" || !completed) {
+        return formatErrorResponse(502, "upstream_error", `compaction turn did not complete (status: ${terminal.status})`);
+      }
+      json = completed as { output?: unknown[]; status?: unknown; error?: unknown };
+    } else {
+      try {
+        json = await response.json() as { output?: unknown[]; status?: unknown; error?: unknown };
+      } catch {
+        return formatErrorResponse(502, "server_error", "compaction turn returned a non-JSON response");
+      }
+    }
     if (req.signal.aborted) {
       return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
     }
-    if (terminal.status !== "completed" || !completed) {
-      return formatErrorResponse(502, "upstream_error", `compaction turn did not complete (status: ${terminal.status})`);
+    // The internal turn answers 200 even when it failed or was truncated, so the body
+    // has to be inspected. Reporting a failure beats installing "(no summary
+    // available)" as replacement history and silently losing the conversation (#422).
+    if (json.error) {
+      const message = typeof json.error === "string"
+        ? json.error
+        : (json.error as { message?: unknown })?.message;
+      return formatErrorResponse(502, "upstream_error", typeof message === "string" ? message : "compaction turn failed");
     }
-    json = completed as { output?: unknown[]; status?: unknown; error?: unknown };
-  } else {
-    try {
-      json = await response.json() as { output?: unknown[]; status?: unknown; error?: unknown };
-    } catch {
-      return formatErrorResponse(502, "server_error", "compaction turn returned a non-JSON response");
+    if (json.status !== "completed") {
+      return formatErrorResponse(
+        502,
+        "upstream_error",
+        `compaction turn did not complete (status: ${String(json.status ?? "unknown")})`,
+      );
     }
-  }
-  // The internal turn answers 200 even when it failed or was truncated, so the body
-  // has to be inspected. Reporting a failure beats installing "(no summary
-  // available)" as replacement history and silently losing the conversation (#422).
-  if (json.error) {
-    const message = typeof json.error === "string"
-      ? json.error
-      : (json.error as { message?: unknown })?.message;
-    return formatErrorResponse(502, "upstream_error", typeof message === "string" ? message : "compaction turn failed");
-  }
-  if (json.status !== "completed") {
-    return formatErrorResponse(
-      502,
-      "upstream_error",
-      `compaction turn did not complete (status: ${String(json.status ?? "unknown")})`,
+    const compactionItems = (json.output ?? []).filter(
+      (item): item is { type: string; encrypted_content?: string } =>
+        !!item && typeof item === "object" && (item as { type?: string }).type === "compaction",
     );
-  }
-  const compactionItems = (json.output ?? []).filter(
-    (item): item is { type: string; encrypted_content?: string } =>
-      !!item && typeof item === "object" && (item as { type?: string }).type === "compaction",
-  );
-  if (compactionItems.length !== 1) {
-    return formatErrorResponse(
-      502,
-      "invalid_response_error",
-      `compaction turn produced ${compactionItems.length} compaction items, expected exactly 1`,
-    );
-  }
-  // Native Responses backends return a real opaque OpenAI-encrypted compaction item. OCX cannot
-  // and should not decrypt it; preserve that item for /responses/compact callers. Synthetic
-  // routed summaries are our `ocx1:` envelope and must be decoded into v1 history items.
-  if (typeof compactionItems[0]!.encrypted_content === "string"
-    && compactionItems[0]!.encrypted_content.trim().length > 0
-    && !compactionItems[0]!.encrypted_content.startsWith("ocx1:")) {
-    const result = new Response(JSON.stringify({ output: compactionItems }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    if (compactionItems.length !== 1) {
+      return formatErrorResponse(
+        502,
+        "invalid_response_error",
+        `compaction turn produced ${compactionItems.length} compaction items, expected exactly 1`,
+      );
+    }
+    // Native Responses backends return a real opaque OpenAI-encrypted compaction item. OCX cannot
+    // and should not decrypt it; preserve that item for /responses/compact callers. Synthetic
+    // routed summaries are our `ocx1:` envelope and must be decoded into v1 history items.
+    if (typeof compactionItems[0]!.encrypted_content === "string"
+      && compactionItems[0]!.encrypted_content.trim().length > 0
+      && !compactionItems[0]!.encrypted_content.startsWith("ocx1:")) {
+      // Failover may reach native compaction after readable reasoning was withheld locally.
+      // The opaque item cannot contain that text, so publish it (or its archive notice) alongside.
+      const output = [...compactionItems, ...(retention.retainedReasoning ?? [])];
+      if (retention.archived) output.push({ type: "message", role: "user",
+        content: [{ type: "input_text", text: appendRetentionNotice("", retention.archived).trimStart() }] });
+      const result = new Response(JSON.stringify({ output }), {
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!options.compactionRoutingOverride) rememberCompactHandoffRoute(req, admission, raw.model);
+      keepArchive = true;
+      return result;
+    }
+    const encrypted = compactionItems[0]!.encrypted_content;
+    const decoded = typeof encrypted === "string" ? decodeCompactionSummary(encrypted) : null;
+    // An empty `ocx1:` envelope decodes to "" rather than null, so length is what matters.
+    if (decoded === null || decoded.trim().length === 0) {
+      return formatErrorResponse(502, "invalid_response_error", "compaction turn produced an empty summary");
+    }
+    const summary = appendRetentionNotice(decoded, retention.archived);
+    const output = [...buildCompactV1Output(extractCompactUserMessages(inputItems), summary),
+      ...(retention.retainedReasoning ?? [])];
     if (!options.compactionRoutingOverride) rememberCompactHandoffRoute(req, admission, raw.model);
+    const result = new Response(JSON.stringify({ output }), { headers: { "Content-Type": "application/json" } });
+    keepArchive = true;
     return result;
+  } finally {
+    // Keep an archive only after successful replacement history publishes its path.
+    if (!keepArchive && retention.archived) rmSync(retention.archived.path, { force: true });
   }
-  const encrypted = compactionItems[0]!.encrypted_content;
-  const decoded = typeof encrypted === "string" ? decodeCompactionSummary(encrypted) : null;
-  // An empty `ocx1:` envelope decodes to "" rather than null, so length is what matters.
-  if (decoded === null || decoded.trim().length === 0) {
-    return formatErrorResponse(502, "invalid_response_error", "compaction turn produced an empty summary");
-  }
-  const summary = decoded;
-  const output = buildCompactV1Output(extractCompactUserMessages(inputItems), summary);
-  if (!options.compactionRoutingOverride) rememberCompactHandoffRoute(req, admission, raw.model);
-  return new Response(JSON.stringify({ output }), { headers: { "Content-Type": "application/json" } });
 }

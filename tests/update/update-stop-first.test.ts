@@ -196,6 +196,8 @@ function recoveryInstrumentationPrelude(directory: string): string {
   // Reuse exactly the projector exercised by the in-process redaction tests.
   return `
 import { spawn as fixtureSpawn, spawnSync } from "node:child_process";
+const probeSpawnSync = spawnSync;
+const probeSpawn = spawn;
 import { openSync as fixtureOpen, closeSync as fixtureClose, appendFileSync as fixtureAppend } from "node:fs";
 const fixtureDiagnosticDir = ${JSON.stringify(directory)};
 const RECOVERY_ERROR_CODES = new Set(${JSON.stringify([...RECOVERY_ERROR_CODES])});
@@ -238,15 +240,15 @@ function instrumentRecoveryLauncher(source: string, directory: string): string {
     if (source.split(needle).length !== 2) throw new Error("recovery diagnostic fixture: launcher seam changed");
     source = source.replace(needle, () => replacement);
   };
-  replaceOnce('import { spawn, spawnSync } from "node:child_process";', recoveryInstrumentationPrelude(directory));
+  replaceOnce('import { probeSpawn, probeSpawnSync } from "../src/update/mutation-guard.mjs";', recoveryInstrumentationPrelude(directory));
   const boot = 'const probe = bootRestoreProbe(resolve(here, ".."));';
   replaceOnce(boot, `fixtureStatus("boot-restore-enter");\n    ${boot}\n    fixtureStatus("boot-restore-result", { action: probe.action });`);
   replaceOnce('} catch { /* the probe must never block launch */ }', '} catch (error) { fixtureStatus("boot-restore-error", recoveryErrorFields(error)); /* the probe must never block launch */ }');
   const runtime = 'const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });';
   replaceOnce(runtime, `fixtureStatus("runtime-resolution-enter");\n${runtime}\nfixtureStatus("runtime-resolved", { source: bunRuntime.source });`);
-  const install = 'const r = spawnSync(process.execPath, [installJs], { stdio: "inherit" });';
+  const install = 'const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });';
   replaceOnce(install, `fixtureStatus("runtime-install-enter");\n    ${install}\n    fixtureStatus("runtime-install-result", { exitCode: r.status, signal: r.signal, ...recoveryErrorFields(r.error) });`);
-  replaceOnce('const child = spawn(bun,', 'fixtureStatus("runtime-spawn-call");\nconst child = spawn(bun,');
+  replaceOnce('const child = probeSpawn(bun,', 'fixtureStatus("runtime-spawn-call");\nconst child = probeSpawn(bun,');
   // The updater exits before its detached child, so observe the Bun child from the
   // recovery launcher itself, BEFORE the existing handler mirrors its exit/signal.
   replaceOnce('child.on("exit", (code, signal) => {', `child.on("exit", (code, signal) => {
@@ -340,12 +342,12 @@ describe("bounded recovery diagnostics", () => {
 
   test("instrumentation fails closed if any selected launcher seam disappears or duplicates", () => {
     const seams = [
-      'import { spawn, spawnSync } from "node:child_process";',
+      'import { probeSpawn, probeSpawnSync } from "../src/update/mutation-guard.mjs";',
       'const probe = bootRestoreProbe(resolve(here, ".."));',
       '} catch { /* the probe must never block launch */ }',
       'const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });',
-      'const r = spawnSync(process.execPath, [installJs], { stdio: "inherit" });',
-      'const child = spawn(bun,', 'child.on("exit", (code, signal) => {',
+      'const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });',
+      'const child = probeSpawn(bun,', 'child.on("exit", (code, signal) => {',
       'child.on("error", err => {', 'const clearHandlers = () => {',
     ];
     for (const seam of seams) {
@@ -369,7 +371,7 @@ describe("bounded recovery diagnostics", () => {
     let nextFd = 10;
     // Evaluate ONLY the generated prelude with inert dependencies, never the real updater.
     const prelude = recoveryInstrumentationPrelude("/fixture").replace(/^import .*;\n/gm, "");
-    const fixture = new Function("fixtureSpawn", "fixtureOpen", "fixtureClose", "fixtureAppend", "process",
+    const fixture = new Function("fixtureSpawn", "fixtureOpen", "fixtureClose", "fixtureAppend", "process", "spawnSync",
       `${prelude}\nreturn { spawn, fixtureStatus };`)(
       (...args: unknown[]) => { calls.push(args); if (failSpawn) throw failure; return child; },
       (_path: string, flags: string, mode: number) => {
@@ -384,6 +386,7 @@ describe("bounded recovery diagnostics", () => {
         records.push(record);
       },
       { argv: ["node", "fixture", "start"], pid: 123, on: () => {} },
+      () => { throw new Error("unexpected sync spawn in capture-only fixture"); },
     ) as { spawn: (bin: string, args: string[], options: Record<string, unknown>) => typeof child; fixtureStatus: (event: string, fields?: object) => void };
     const args = ["launcher", "start", "--port", "1234"];
     const env = { FIXTURE: "unchanged" };
@@ -421,17 +424,17 @@ describe("bounded recovery diagnostics", () => {
   });
 
   test("instrumented inert launcher records milestones without changing error/exit handlers", () => {
-    const inertSource = `import { spawn, spawnSync } from "node:child_process";
+    const inertSource = `import { probeSpawn, probeSpawnSync } from "../src/update/mutation-guard.mjs";
 try {
   const probe = bootRestoreProbe(resolve(here, ".."));
 } catch { /* the probe must never block launch */ }
 function resolveBun() {
-  const r = spawnSync(process.execPath, [installJs], { stdio: "inherit" });
+  const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });
   return { source: "bundled", path: "fixture-bun" };
 }
 const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });
 const bun = bunRuntime.path;
-const child = spawn(bun, ["fixture-cli", "start"], childOptions);
+const child = probeSpawn(bun, ["fixture-cli", "start"], childOptions);
 const clearHandlers = () => { events.push("clear"); };
 child.on("error", err => { clearHandlers(); events.push(err); process.exit(1); });
 child.on("exit", (code, signal) => {
@@ -528,17 +531,19 @@ describe("update stops the running proxy before replacing files", () => {
   });
 
   test("bun/source update path gates on the pid file and spawns 'stop' before the package manager", () => {
-    expect(updateSource).toContain('spawnSync(process.execPath, selfLaunchArgv(["stop"])');
+    expect(updateSource).toContain('guardedSpawnSync(homePolicy.authorizeMutation, serviceWasInstalled ? "service" : "runtime", process.execPath, selfLaunchArgv(["stop"])');
     const stopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
-    const updateAt = updateSource.indexOf("spawnSync(target.bin, target.args", stopAt);
+    const updateAt = updateSource.indexOf('guardedSpawnSync(homePolicy.authorizeMutation, "package", target.bin, target.args', stopAt);
     expect(stopAt).toBeGreaterThan(-1);
     expect(updateAt).toBeGreaterThan(-1);
     expect(stopAt).toBeLessThan(updateAt);
-    expect(updateSource).toContain("if (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding())");
+    // The four signals are now inside a runtime-ownership veto: a desktop-owned runtime is
+    // not stopped at all. Every original reason to stop still reaches the gate unchanged.
+    expect(updateSource).toContain("if (!homePolicy.packageOnly && runtimePlan.mayStopRuntime && (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding()))");
   });
 
   test("integrity pre-flight runs BEFORE the stop so anomalous metadata never unloads the proxy", () => {
-    const gateAt = updateSource.indexOf("const integrity = checkUpdatePackageIntegrity(latest, spawnSync, installer, owner);");
+    const gateAt = updateSource.indexOf("const integrity = checkUpdatePackageIntegrity(latest, probeSpawnSync, installer, owner);");
     const abortAt = updateSource.indexOf("aborting the update before stopping the proxy");
     const stopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
     expect(gateAt).toBeGreaterThan(-1);
@@ -550,8 +555,8 @@ describe("update stops the running proxy before replacing files", () => {
   test("cache access gates in both CLI entry points precede every tray/proxy stop", () => {
     const runtimeGate = updateSource.indexOf("const cachePreflight = runNpmCachePreflight();");
     const runtimeStop = updateSource.indexOf('selfLaunchArgv(["stop"])');
-    const launcherGate = launcherSource.indexOf("const cachePreflight = runNpmCachePreflight();");
-    const launcherTrayStop = launcherSource.indexOf('runTrayLifecycle(launcher, "stop")');
+    const launcherGate = launcherSource.indexOf("runNpmCachePreflight({ cachePath: npmCache.path })");
+    const launcherTrayStop = launcherSource.indexOf('runTrayLifecycle(launcher, "stop", homePolicy.authorizeMutation)');
     const launcherProxyStop = launcherSource.indexOf('[launcher, "stop"]');
 
     expect(runtimeGate).toBeGreaterThan(-1);
@@ -559,10 +564,12 @@ describe("update stops the running proxy before replacing files", () => {
     expect(runtimeGate).toBeLessThan(runtimeStop);
     expect(launcherGate).toBeLessThan(launcherTrayStop);
     expect(launcherGate).toBeLessThan(launcherProxyStop);
+    // #6288: the stage installs into the very cache root the gate checked.
+    expect(launcherSource.indexOf("cachePath: npmCachePath,")).toBeGreaterThan(launcherSource.indexOf("transactionalNpmUpdate({"));
   });
 
   test("npm launcher update path stops via its own launcher path before npm install", () => {
-    expect(launcherSource).toContain('spawnSync(process.execPath, [launcher, "stop"]');
+    expect(launcherSource).toContain('guardedSpawnSync(homePolicy.authorizeMutation, serviceWasInstalled ? "service" : "runtime", process.execPath, [launcher, "stop"]');
     const stopAt = launcherSource.indexOf('[launcher, "stop"]');
     // #1942: the destructive step is now the transactional staged update, not a direct
     // global npm install. The stop must still precede it.
@@ -600,9 +607,9 @@ describe("update stops the running proxy before replacing files", () => {
     expect(updateSource).toContain("serviceReinstallArgs()");
     expect(launcherSource).toContain("aborting the update");
     expect(launcherSource).toContain('"service", "repair"');
-    // The launcher still reads service-state.json for service-installed detection, and
-    // for the backend choice on the genuinely-absent install fallback.
-    expect(launcherSource).toContain('"service-state.json"');
+    // The launcher reads the shared active/default state-path set for service-installed
+    // detection and the authoritative backend on the genuinely-absent install fallback.
+    expect(launcherSource).toContain("serviceStateFilesFor");
     // That marker can be STALE, so the fallback asks for structured state rather than
     // parsing a failure message; bin/ocx.mjs is plain Node and cannot import
     // diagnoseService(), so it reads startup.serviceInstalled from `status --json`.
@@ -683,6 +690,12 @@ esac
         expect(result.exitCode).toBe(1);
         expect(output).toContain("Stopping the running proxy before updating");
         expect(output).toContain("restarting the previous version directly");
+        expect(output).toContain("'ocx status'");
+        expect(output).toContain("let any in-progress recovery finish");
+        expect(output).toContain("confirm it has stopped before installing");
+        expect(output).toContain("'ocx stop'");
+        expect(output).toContain("Then run: npm install -g");
+        expect(output.indexOf("'ocx stop'")).toBeLessThan(output.indexOf("Then run: npm install -g"));
         expect(output).toContain(`Attempting to restart the proxy on port ${port}.`);
         expect(await waitForProxy(port, lastProbe => {
           console.error(new Error([
@@ -783,13 +796,65 @@ esac
     // A pending-teardown receipt is a fourth reason to stop: after a parent crashed
     // mid-deferral the service, pid and runtime records can all be absent while shared
     // client config still points at a proxy that is gone (#3008).
-    expect(updateSource).toContain("if (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding())");
-    expect(launcherSource).toContain("if (serviceWasInstalled || hasRuntimeState || hasPendingTeardown)");
+    expect(updateSource).toContain("if (!homePolicy.packageOnly && runtimePlan.mayStopRuntime && (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding()))");
+    expect(launcherSource).toContain("const stopNeeded = !homePolicy.packageOnly && (serviceWasInstalled || hasRuntimeState || hasPendingTeardown)");
+    expect(launcherSource).toContain("if (stopNeeded && !runtimePlan.mayStopRuntime)");
+    expect(launcherSource).toContain("if (stopNeeded) {");
     // The rule now lives in the shared post-stop decision both lanes import (#3008): a
     // history-only stop proceeds, every other nonzero status and any surviving runtime
     // state aborts. Pinned by tests/update/update-stop-classification.test.ts.
     expect(launcherSource).toContain("decidePostStopUpdate({");
     expect(launcherSource).toContain("hasRuntimeState: stillHasRuntimeState");
+  });
+
+  test("the Node updater holds one authority from stop permission through replacement", () => {
+    const leaseAt = launcherSource.indexOf("let updateLease = acquireOwnershipMutationLease(");
+    const lockedPlanAt = launcherSource.indexOf("const lockedPlan = planUpdateRuntimeHandling(", leaseAt);
+    const stopAt = launcherSource.indexOf('[launcher, "stop"]', lockedPlanAt);
+    const replacementAt = launcherSource.indexOf("const replacementOwnership = readOwnership()", stopAt);
+    const releaseAt = launcherSource.indexOf("releaseUpdateLease()", replacementAt);
+    expect(leaseAt).toBeGreaterThan(-1);
+    expect(lockedPlanAt).toBeGreaterThan(leaseAt);
+    expect(stopAt).toBeGreaterThan(lockedPlanAt);
+    expect(replacementAt).toBeGreaterThan(stopAt);
+    expect(releaseAt).toBeGreaterThan(replacementAt);
+    const stopEnvAt = launcherSource.indexOf("env: mutationChildEnvironment()", stopAt);
+    expect(stopEnvAt).toBeGreaterThan(stopAt);
+    expect(stopEnvAt).toBeLessThan(replacementAt);
+    expect(launcherSource.slice(lockedPlanAt, stopAt)).toContain("!runtimePlan.mayStopRuntime");
+    const packageReplacement = launcherSource.slice(stopAt, launcherSource.indexOf("const postInstallPlan", stopAt));
+    expect(packageReplacement.match(/unprivilegedOwnershipMutationEnvironment/g)).toHaveLength(3); // Windows npm, POSIX npm, pnpm.
+  });
+
+  test("replacement refusal reaches owner-aware recovery before releasing authority", () => {
+    const refusalAt = launcherSource.indexOf("replacementOwnership.subjectToken !== initialOwnership.subjectToken");
+    const recoverAt = launcherSource.indexOf('recoverStoppedRuntimeAfterFailure("replacement was refused")', refusalAt);
+    const releaseAt = launcherSource.indexOf("releaseUpdateLease()", recoverAt);
+    expect(refusalAt).toBeGreaterThan(-1);
+    expect(recoverAt).toBeGreaterThan(refusalAt);
+    expect(releaseAt).toBeGreaterThan(recoverAt);
+    const recovery = launcherSource.slice(
+      launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure("),
+      launcherSource.indexOf("const hasPendingTeardown", launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure(")),
+    );
+    expect(recovery).toContain("planStoppedRuntimeRecovery");
+    expect(recovery).toContain("sameOwner:");
+    expect(recovery).toContain("currentPackageRuntimeLiveness()");
+  });
+
+  test("failed-update service recovery releases the update lease before the service starts (#5760)", () => {
+    // The service manager starts the proxy outside this process tree, so it cannot join the
+    // delegated lease; it has to take the lease itself while the repair waits for it.
+    const start = launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure(");
+    const recovery = launcherSource.slice(start, launcherSource.indexOf("const hasPendingTeardown", start));
+    const serviceAt = recovery.indexOf('recovery.action === "service"');
+    const releaseAt = recovery.indexOf("releaseUpdateLease()", serviceAt);
+    const replanAt = recovery.indexOf("planRecovery()", releaseAt);
+    const refreshAt = recovery.indexOf("refreshBackgroundServiceOrStartDirect()", replanAt);
+    expect(serviceAt).toBeGreaterThan(-1);
+    expect(releaseAt).toBeGreaterThan(serviceAt);
+    expect(replanAt).toBeGreaterThan(releaseAt);
+    expect(refreshAt).toBeGreaterThan(replanAt);
   });
 
   test("GUI worker update children use pipe stdio so background updates do not open consoles", () => {

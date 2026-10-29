@@ -15,6 +15,17 @@ This is useful when you want either:
 Combos sit in front of normal provider routing. Read [Model Routing](/guides/model-routing/) first
 if `provider/model` selectors are new to you.
 
+## Metered fallback consent
+
+Mark a pay-per-use combo target with `"metered": true` when it follows subscription targets. Omitted or false consent denies metered dispatch. Choose consent for your deployment:
+
+- **Local Claude Code or Codex:** on a loopback-only proxy, set `"allowMeteredTargets": true` on the combo, or run `ocx combo set <id> --allow-metered-targets on`. This explicitly permits local callers to use its marked targets. The default is false; `off` clears consent. Loopback authentication does not read API keys.
+- **Network or linked callers:** the caller's configured `apiKeys[]` entry must have `"allowMeteredComboTargets": true`. A proxy with a non-loopback listener ignores the combo flag, including on its secondary loopback listener. Linked callers also retain their configured-key consent requirement when the primary listener is loopback. The environment token never qualifies.
+
+Request headers cannot grant consent. Model/provider scopes still apply. This covers initial selection, failover and recovery across combo strategies, compaction, Messages, Chat Completions and WebSocket requests, and a subagent model fallback naming a combo alias. A collapsed fallback tries a usable unmetered target before refusing. Unmarked targets retain existing behavior; metering is declared by the operator rather than detected automatically.
+
+For example, a failover chain can target Anthropic OAuth, then Cursor, then `{ "provider": "anthropic-apikey", "model": "claude-opus-5-5", "metered": true }`. Without consent, exhaustion returns the last unmetered error, with one exception: an earlier 429 or 402 quota refusal takes precedence over a later 400, 401 or 403. If the subscription target returns 429 and Cursor then refuses with 401 or 403, the caller receives the subscription's 429, because the spent subscription explains the failure and Cursor's credential refusal does not. Dashboard saves retain omitted target metering and combo consent; explicitly setting either to false clears it. These consent fields are configured through the config file or API; the combo flag is also available through the CLI, while the dashboard does not expose it.
+
 ## 60-second quickstart
 
 This example creates `combo/main` with Anthropic first and OpenAI second. Both providers must
@@ -207,9 +218,454 @@ order. Weights and `stickyLimit` do not affect this strategy.
 
 This ranking and provider exclusion before dispatch require fresh model-inference limits that apply to the current single API key as a whole. OAuth/current-account summaries, caller-forward routes, multiple keys, and snapshots with changed credentials or destinations are display-only for this early decision. The same applies when `Authorization`, `x-api-key`, or `x-goog-api-key` headers override credentials; search-only and MCP-only windows are excluded. If no eligible target has an applicable reset, configuration order wins. Account selection and retries still enforce their normal limits.
 
+### Advisory quota signals for JEV
+
+Quota evidence is separately opt-in **per JEV Combo**, for all three decision methods:
+
+```bash
+ocx combo set coding --decision-quota-signals on --json
+ocx combo set coding --decision-quota-tiers '{"moderate":40}' --json
+```
+
+Only enable this on an existing `strategy: "jev"` Combo. `decisionQuotaSignals: true` adds
+subscription quota tiers to the decision request, not a hard eligibility rule. The decision
+backend is asked to prefer healthier quota among adequate options; it still chooses only from
+configured eligible targets and effort allowlists. Unknown is not exhausted, and ordinary
+fallback, cooldown, account selection and provider limits remain unchanged.
+
+Defaults are `limited: 70` and `nearlyExhausted: 90`, inclusive percentages used. There is no
+moderate tier unless you set it explicitly (for example, `moderate: 40`). Partial overrides merge
+with those defaults, then all thresholds must be finite, within 0–100 and strictly ascending.
+
+Evidence comes only from memory snapshots published by existing quota collectors, accepted
+response headers and credential/account owners, and only while at least one JEV Combo has this
+switch on: until then opencodex collects nothing for it, so evidence starts accumulating (and reads
+as unknown) from the moment you enable it. Reading advisory quota evidence never resolves
+credentials, loads auth stores or quota files, reads a keychain, probes upstream, or starts a
+refresher. Normal decision-backend credential resolution is unchanged. Cold, missing, stale (over
+30 minutes), future, invalid or reset-expired evidence is unknown. Each account uses its worst valid
+relevant five-hour, weekly, monthly or structurally model-scoped window. An enabled usable
+Anthropic/Codex pool uses its healthiest account tier; unknown ties healthy. A pool is nearly
+exhausted only if every usable account has known nearly-exhausted evidence. Reserve models
+without separately attributable bars remain unknown. Active-account summaries, multiple-key
+display reports, credits and API/Spark/USD meters are not quota evidence for this decision.
+The separate Anthropic · Pool 2 (`anthropic2`) account pool is not a source of this evidence, so its targets stay unknown.
+
+Antigravity contributes Gem/Cla five-hour and weekly buckets only after a fresh authenticated probe
+for its sole active, usable OAuth account, and only to the `google-antigravity` provider that signs in
+with that account. A renamed provider row reads unknown and never reuses that account's quota. Quota
+follows the resolved native `gemini-*` or `claude-*` model, not its display alias. Account, credential, project or destination
+changes withdraw the old observation. A display-only refresh can retain matching family counters
+only with their original timestamps; per-model and Argon rows never become decision evidence.
+
+:::caution[Additional decision data]
+Opting in sends quota tiers, and available used percentage/window/reset delay, to your selected
+decision backend, including hosted TypeSafe. No account ids, tokens or credential fingerprints
+are sent or logged by this feature. Local decision records retain only bounded tier counts and
+the selected tier. If quota would exceed the 64 KiB request cap, it is removed before retrying
+serialization; an ordinary oversized decision still fails open.
+:::
+
+`--decision-quota-signals off` disables evidence while retaining configured tiers; `-` clears
+the switch. `--decision-quota-tiers -` clears overrides, restoring defaults. API `null` clears;
+API `false` disables the switch. Omitted fields survive JEV updates, target replacement and
+rename, including saves through the existing editor. Switching away from JEV removes both
+quota settings. No new editor controls or background quota work are enabled.
+
+### Session pin for JEV
+
+A JEV Combo decides a target for every request, so consecutive turns of one conversation can move
+between providers, and each move starts with a cold provider prompt cache. `sessionPin` is an
+opt-in setting per JEV Combo, off by default, that keeps a client session on the target JEV chose
+for it while the session stays active:
+
+In the dashboard, open the JEV Combo editor's **Decision method** section and enable
+**Keep a session on its decided target**, then set **Idle window (ms)** and save. The range is
+60000–86400000 ms (1 minute–24 hours); newly enabled pins start at 60000 ms. Disable the checkbox
+and save to turn pinning off. Invalid or empty enabled windows block saving; failed saves keep
+your edits for retry. Older responses without this setting leave it omitted until you change it.
+
+```bash
+ocx combo set jev-auto --session-pin 20m --json
+```
+
+```json
+{ "strategy": "jev", "sessionPin": { "ttlMs": 1200000 } }
+```
+
+The first request of a session is decided normally. Once the target JEV applied for it completes a
+response, later requests of the same session reuse that target and effort without another decision
+call. `ttlMs` (1 minute to 24 hours) is an idle window: every completed turn on the pinned target,
+tool-call continuations included, starts it again, and a session that stays quiet longer is decided
+afresh.
+
+A session is identified by the client's own session headers (`thread-id`, `session_id` or
+`session-id`, `x-codex-parent-thread-id`, or a promoted `x-session-id`) together with the API key
+that admitted the request and the Combo. Requests without a session header are never pinned,
+`prompt_cache_key` is never used as a session identity, and two API keys never share a pin.
+
+JEV decides again, and the new decision replaces the pin, when:
+
+- the pinned target is not offered for this request: disabled, removed from the Combo, cooling
+  down after a 429 or another failure, out of cached quota, metered, or otherwise ineligible;
+- the pinned effort is no longer offered for that target;
+- `decisionQuotaSignals` is on and the target's quota evidence reads nearly exhausted;
+- any send of a pinned session fails (that request still fails over as usual);
+- the configuration has changed since the pin was written.
+
+A cancelled request keeps the pin. A fail-open decision (timeout, missing key, invalid answer)
+never creates one. Pins live in the proxy's memory, at most 512 sessions, and do not survive a
+restart.
+
+Usage records mark a reused turn with `jevDecision.pinned: true` and `pinReason: "session"`. A
+decision that replaced a released pin records why in `pinReason` (`expired`, `config_changed`,
+`target_unavailable`, `effort_unavailable` or `quota_nearly_exhausted`). `ocx combo stats`
+counts pinned requests apart from decisions; they still count toward successful requests, model
+fallbacks and per-model tokens.
+
+A pin makes provider cache reuse possible; whether the provider actually serves cached tokens still
+depends on the provider, the account and a stable prompt prefix. `--session-pin -` (API `null`)
+turns it off, switching away from JEV removes it, and saves from the dashboard editor keep it.
+
+### Decision method
+
+`strategy: "jev"` asks a decision backend to choose the first eligible target and a compatible
+reasoning effort for the current request. It is opt-in: create a JEV Combo and select that Combo
+to use it. Adding a decision credential does not change existing models, aliases, or defaults.
+
+| Method | Combo selection | Backend reported in stats |
+| --- | --- | --- |
+| TypeSafe (default) | Omit both selectors, or set `decisionProvider: "jev"`. | `typesafe` |
+| System One-compatible server | Set `decisionProvider` to a configured `jev-decision` row id other than `jev`. | `systemone` |
+| opencodex model | Set `decisionModel` to an ordinary opencodex route, such as `ollama/qwen3:4b`. | `model` |
+
+`decisionProvider` and `decisionModel` are mutually exclusive. The backend is derived from those
+fields; there is no stored `backend` setting. Every method uses the same eligible target and effort
+allowlist, bounded decision state, timeout, cancellation, and fail-open policy.
+
+#### TypeSafe default
+
+The quickest setup is:
+
+1. Open **Providers**, add **TypeSafe JEV**, enter the TypeSafe API key, and test the connection.
+2. From that provider's Overview, choose **Create JEV Auto**. You can also use the same action under
+   **Models → Combos**.
+3. Review the prefilled Astra → Sol → Luna targets. Add, remove, reorder, or replace them before
+   creating the Combo. The first currently eligible row is marked as the fail-open target, and each
+   known reasoning ladder is shown beside its row.
+
+The template creates id and alias `jev-auto`, uses adaptive reasoning capability, and remains an
+ordinary editable Combo. It does not become the default model. Its targets are the complete
+allowlist: JEV can never select a provider/model pair outside that list, and the original target
+models remain available in their normal picker groups.
+
+For headless setup, store the key explicitly or reference the TypeSafe environment variable:
+
+```bash
+ocx provider add jev --api-key "${TYPESAFE_API_KEY}"
+```
+
+When the provider has no saved key, the decision client also accepts `TYPESAFE_API_KEY` directly and
+the standard provider-derived alias `JEV_API_KEY` printed by `ocx provider add`.
+
+```json
+{
+  "providers": {
+    "jev": {
+      "adapter": "jev-decision",
+      "baseUrl": "https://api.typesafe.ai/v1/systemone",
+      "authMode": "key",
+      "apiKey": "${TYPESAFE_API_KEY}",
+      "liveModels": false
+    }
+  },
+  "combos": {
+    "jev-auto": {
+      "alias": "jev-auto",
+      "strategy": "jev",
+      "reasoningEffortMode": "adaptive",
+      "targets": [
+        { "provider": "openai", "model": "gpt-6-astra" },
+        { "provider": "openai", "model": "gpt-5.6-sol" },
+        { "provider": "openai", "model": "gpt-5.6-luna" }
+      ]
+    }
+  }
+}
+```
+
+With the default method, OpenCodex sends one bounded decision request to the fixed
+`https://api.typesafe.ai/v1/systemone` endpoint with model `jev-latest`. Only currently eligible
+configured targets are offered. JEV chooses the target and effort together; the effort is still
+constrained by that target's advertised ladder. JEV is not asked again if the selected target has a
+retryable failure—the existing Combo cooldown and fallback loop continues through the remaining
+configured targets.
+
+#### System One-compatible server
+
+A JEV Combo can ask a hosted or self-hosted server that implements the System One wire contract.
+For example, an Ollama server with System One support can serve `tev1` at
+`POST /v1/systemone` without an API key. Add a provider row with
+`adapter: "jev-decision"` whose `baseUrl` is the **full** decision endpoint, then name it in the
+Combo's `decisionProvider`:
+
+```json
+{
+  "providers": {
+    "ollama-tev1": {
+      "adapter": "jev-decision",
+      "baseUrl": "http://127.0.0.1:11434/v1/systemone",
+      "allowPrivateNetwork": true,
+      "defaultModel": "tev1:4b",
+      "liveModels": false
+    }
+  },
+  "combos": {
+    "jev-local": {
+      "strategy": "jev",
+      "decisionProvider": "ollama-tev1",
+      "decisionTimeoutMs": 60000,
+      "reasoningEffortMode": "adaptive",
+      "targets": [
+        { "provider": "openai", "model": "gpt-6-astra" },
+        { "provider": "openai", "model": "gpt-5.6-sol" },
+        { "provider": "openai", "model": "gpt-5.6-luna" }
+      ]
+    }
+  }
+}
+```
+
+- The row's `baseUrl` must be the full decision endpoint. HTTPS services may use any path,
+  such as `/v1/decisions`; plain HTTP endpoints must still end in `/systemone`.
+  Userinfo, query strings, and fragments are not accepted in decision URLs.
+  The decision model is `defaultModel`, else the first `models` entry; a row with neither is
+  treated as unusable and fails open without a request (`jev-latest` is TypeSafe's model and is
+  never sent to a self-hosted host). The row is a decision service only: it is never published as a
+  routable model and cannot be a Combo target.
+- A loopback or LAN endpoint needs `allowPrivateNetwork: true` set explicitly on that row. Use a
+  literal loopback, RFC 1918, or IPv6 ULA address for plain `http:`; every resolved address must stay
+  in the allowed set and no outbound proxy may apply (add the
+  host to `NO_PROXY`). Every other destination must use HTTPS. Redirects still fail open.
+- Only the row's own `apiKey` is sent, and only when it is set; a keyless row sends no
+  `Authorization` header. A row whose `apiKey` references `${TYPESAFE_API_KEY}`/`${JEV_API_KEY}` or
+  another provider's keychain entry is refused as unusable, so `TYPESAFE_API_KEY`, `JEV_API_KEY`, and
+  the `jev` row's key are never sent to a self-hosted endpoint. The `jev` id itself (explicit or
+  omitted) always means the TypeSafe endpoint with model `jev-latest`.
+- Self-hosted services receive each target/effort option as a plain description string (for
+  example `Target openai/gpt-5.6-sol (provider openai, model gpt-5.6-sol) with low reasoning
+  effort.`), because Ollama accepts only string or `null` option descriptions. TypeSafe keeps
+  receiving the structured option objects. When targeting Vercel AI Gateway (`ai-gateway.vercel.sh`),
+  route options include both `value` and detailed `description` fields. Other self-hosted endpoints,
+  including a custom `/decisions` path, keep the System One request format.
+- OpenCodex offers 2–26 options to a System One-compatible row (`SELF_HOSTED_MIN_OPTIONS = 2`, `SELF_HOSTED_MAX_OPTIONS = 26`).
+  Each target contributes one option per offered reasoning effort; use per-target `reasoningEfforts` to trim them.
+  Fewer than 2 or more than 26 options fail open without a request. For Vercel AI Gateway, whose
+  [OpenAI-compatible Decisions reference](https://vercel.com/docs/ai-gateway/sdks-and-apis/openai-decisions)
+  supports 1..255 choices, the upper bound expands to 255 options (`DECISIONS_MAX_OPTIONS = 255`); OpenCodex
+  enforces the 2-choice minimum as local routing policy to select among candidate targets.
+- Vercel AI Gateway endpoints (`https://ai-gateway.vercel.sh/v1`) automatically normalize to `/decisions`.
+  OpenCodex projects structured conversation context into a formatted plain-text `input` string
+  (`Task:`, `Signals:`, `Recent Assistant:`, `Recent Tool Call:`, and `Tool Output:`). Route answers are accepted
+  from object (`answers.route`) or choice-array formats, resolving from either `choice` or `value`. Probability
+  distributions are accepted as key-value maps or probability records; duplicate choice keys or invalid distributions
+  strictly fail open to the first eligible target.
+- A cold model load can take tens of seconds, and an aborted decision request makes Ollama abandon the
+  load. Pre-warm the model and keep it resident (`OLLAMA_KEEP_ALIVE=-1`, or `keep_alive`), and raise
+  `decisionTimeoutMs` (1000–120000 ms, default 4000) when the service is slower than four seconds.
+  Every timeout or error still fails open to the first eligible target.
+
+The provider's **Test connection** sends a bounded probe decision to its endpoint.
+**Create JEV Auto** on a System One provider (keyless rows included) prefills that row as the
+decision provider. Disabled rows, invalid decision URLs, and rows without a model
+are shown with a reason and cannot be picked.
+
+For an alternative hosted service with the same decision request/response contract, add a separate
+provider row and select it with the Combo's `decisionProvider`:
+
+```json
+{
+  "providers": {
+    "alternative-decider": {
+      "adapter": "jev-decision",
+      "baseUrl": "https://decisions.example/v1/decisions",
+      "apiKey": "${ALTERNATIVE_DECISION_KEY}",
+      "defaultModel": "decision-model-v1",
+      "liveModels": false
+    }
+  }
+}
+```
+
+Set `decisionProvider: "alternative-decider"` on the existing JEV Combo. Its own credential and
+model accompany the bounded decision state; TypeSafe environment credentials are never inherited.
+The `jev` id remains canonical. HTTPS/TLS, outbound destination restrictions, redirect refusal,
+request/response bounds, timeout, cancellation, and the eligible-choice allowlist still apply.
+
+[Laya MLX](https://github.com/mizorewww/laya-mlx) runs typed decisions on Apple Silicon. To use it
+with this method, expose it through a System One-compatible HTTP wrapper, then configure a row like
+`ollama-tev1` above with the wrapper's full `/systemone` URL and accepted model id as `defaultModel`.
+The MLX Python runtime alone is not an HTTP decision endpoint. For a loopback HTTP wrapper, keep
+`allowPrivateNetwork: true` and use its literal loopback address.
+
+For a hosted example, a contributor reported the following Zen System One endpoint working in
+[#6185](https://github.com/lidge-jun/opencodex/pull/6185). Configure it manually as an ordinary row;
+this is not an OpenCodex registry preset or a guarantee of current availability:
+
+```json
+{
+  "providers": {
+    "zen-decision": {
+      "adapter": "jev-decision",
+      "baseUrl": "https://opencode.ai/zen/v1/systemone",
+      "defaultModel": "jev-1.13-free",
+      "apiKey": "${ZEN_DECISION_API_KEY}",
+      "liveModels": false
+    }
+  },
+  "combos": {
+    "jev-zen": {
+      "strategy": "jev",
+      "decisionProvider": "zen-decision",
+      "targets": [
+        { "provider": "openai", "model": "gpt-6-astra" },
+        { "provider": "openai", "model": "gpt-5.6-luna" }
+      ]
+    }
+  }
+}
+```
+
+Use that endpoint's own key if authentication is required; omit `apiKey` only if the endpoint
+accepts keyless calls. Never reuse `TYPESAFE_API_KEY` or `JEV_API_KEY` for it.
+
+#### opencodex model
+
+An ordinary chat or Responses model can make the same routing choice without implementing
+`/systemone`. Configure its inference provider as usual and set `decisionModel` to its route:
+
+```json
+{
+  "combos": {
+    "jev-chat": {
+      "strategy": "jev",
+      "decisionModel": "ollama/qwen3:4b",
+      "decisionTimeoutMs": 60000,
+      "targets": [
+        { "provider": "openai", "model": "gpt-6-astra" },
+        { "provider": "openai", "model": "gpt-5.6-luna" }
+      ]
+    }
+  }
+}
+```
+
+Other examples are `deepseek/deepseek-v4-flash`, `openai/gpt-5.6-luna`, or
+`opencode-zen/<model>` for a configured Zen inference model. These are ordinary route strings,
+not decision-service presets; the provider and model must be available on your installation.
+For `openai/gpt-5.6-luna`, configure credentials the internal call can use, such as a stored Codex
+pool login. A caller-owned ChatGPT forward login is insufficient.
+
+The model receives fixed router instructions and one JSON prompt:
+
+```json
+{
+  "state": { "user_task": "Review the requested change" },
+  "options": { "<key>": "Target description and allowed reasoning effort" }
+}
+```
+
+`state` is the bounded evidence described below; `options` maps generated option keys to plain
+descriptions. The reply contract is `{"choice":"<key>"}`, naming exactly one offered option.
+The instructions treat state as evidence, prefer lower resource use among adequate options, and
+require JSON only. An invalid or unlisted choice, malformed response, or failed call fails open.
+
+The internal decision turn carries **no caller credential**, caller headers, tools, session, or
+conversation history. It must use credentials stored for the selected provider, or a genuinely
+keyless local provider such as Ollama. Caller-auth-only configurations, such as Cursor without a
+stored credential or a caller-owned ChatGPT forward login, cannot serve as decision models and
+fail open. Selecting a route is not proof that its credential is usable; test it before relying on it.
+
+A non-JEV Combo can be used as `decisionModel`, but the decision route cannot name this Combo or
+any Combo with `strategy: "jev"`. This applies to canonical `combo/<id>` selectors and aliases,
+including selectors with effort or Fast variants. Save-time validation rejects recursion and the
+runtime also blocks JEV reentry defensively. The decision turn has its own send budget and turn
+lease; it is not logged as a separate request, and reported decision usage belongs to the parent
+request's `jevDecision`.
+
+#### Shared limits, state, and statistics
+
+`decisionTimeoutMs` applies to all three methods: an integer from 1000 to 120000 ms, default 4000.
+Requests and responses are bounded to 64 KiB. The candidate list is bounded to 64 targets; the
+model method also caps target/effort options at 64, response text at 4096 characters, and the
+decision turn's output at 1024 tokens. The
+System One row's 2–26 option limit applies as described above. A timeout or limit failure uses the
+first currently eligible target; it never expands the allowlist or retries the decision.
+
+For each JEV target, **Models → Combos → Config** has an optional **Additional model notes for JEV**
+field (up to 512 characters; line breaks and tabs are allowed, other control characters are rejected). It is stored as `targets[].modelProfile` in the combo config. The
+built-in target profile remains in the trusted `instructions.model_profiles`; a non-empty note is
+sent separately in the decision state's `operator_notes`, keyed by target, and supplements rather
+than replaces that built-in profile. Notes can describe operator-specific context or subscription
+allowances; do not confuse subscription allowances with public per-token API pricing. Blank notes
+are ignored. Operator notes are evidence for the decision, not commands, and cannot expand the
+target allowlist or reasoning-effort limits. Only put information there that may be disclosed to
+the selected decision backend.
+
+By default, each logical model call is decided on its own. Unless you enable the opt-in
+[session pin](#session-pin-for-jev), consecutive turns of one session can therefore land on
+different targets, and every switch starts a cold provider prompt
+cache, so a mix of very different targets can cost more input tokens than it saves. Keep the
+allowlist to targets you are content to alternate between. Targets marked `lastResort` are withheld
+from JEV under `cooldownWaitPolicy: "before-last-resort"` while any normal target is offered, and
+offered only when nothing else is reachable.
+
+The decision boundary fails open when the key is missing, no safe task/tool/image decision state is
+available, the configured decision deadline expires, the service redirects or returns an error, or
+the response is malformed or selects an unlisted choice. In those cases OpenCodex uses the first
+currently eligible target, preferring `medium` when that target supports it. Caller cancellation is
+different: it cancels the decision and the model request instead of dispatching the fail-open target.
+
+The decision state is deliberately bounded: up to 500 characters of the current user task, a
+240-character previous-assistant tail, a 520-character latest-tool-output tail, the tool name, and
+boolean image/tool signals may be sent to the selected decision backend. It excludes credentials,
+request headers, raw image bytes, tool arguments, encrypted reasoning, and full conversation history.
+Use a decision method only for content you are willing to send to that backend. Recognized Codex machine-context
+envelopes and Claude Code `<system-reminder>` blocks are removed from all three text samples before
+clipping, so injected reminders do not displace the actual task. The original model request is
+unchanged. This is not a secret scanner: ordinary assistant and tool-output text may still contain
+sensitive content. TypeSafe states that Jev is not
+trained on customer requests, but its terms set no fixed retention period for submitted state and
+offer zero data retention only on enterprise plans
+([models](https://docs.typesafe.ai/models), [legal](https://docs.typesafe.ai/legal)). TypeSafe
+also documents English as Jev's most accurate language, so check decisions on non-English work
+before relying on them. Logs contain only the selected
+target/effort, a coarse decision gate, latency, optional confidence/probability, and numeric usage.
+Automated tests use mocked TypeSafe responses plus a no-key fail-open smoke; a live TypeSafe decision
+requires an operator-supplied key and is not run implicitly.
+
+JEV's selected effort applies to the first Responses child and to native Chat children on the opt-in
+`protocols.rollout.nativeChatCombos` path. It replaces caller effort and removes conflicting thinking
+controls and caller `service_tier`; an explicit no-effort choice removes effort even when the Combo has
+a forced default. Provider effort pins, caps and wire normalization still apply afterward.
+Request and attempt logs show a differing applied effort as `high->xhigh` or `high->low`, retaining later
+adjustments such as `high->xhigh->medium`. An unchanged effort or a no-effort choice keeps the existing
+label. Later fallback targets use ordinary Combo policy from the original request, without another JEV call.
+
+After the Combo has served requests, open **Models → Combos → jev-auto → Stats** to inspect JEV's
+picks without replacing the normal model picker or Usage page. The tab separates backend-reported decision
+tokens from tokens reported by physical model sends, and shows decision gates, fail-open picks,
+reasoning efforts, retries/fallbacks, cache tokens, latency, confidence, and per-model totals for 7
+days, 30 days, or all available history. Statistics come from the local append-only usage ledger;
+they contain the bounded decision metadata described above, not prompts or credentials. Backend
+rows show decision count, applied count, and average latency for `typesafe`, `systemone`, and
+`model`; older records without a backend are grouped as `unknown`.
+
 ## What happens when a target fails
 
 Combo failures are divided into **hop** failures and **terminal** failures.
+To make a combo fail with a clear `fallback_refused` error instead of hopping to another model or
+provider, see [Fallback off](/guides/fallback-off/).
 
 | Result | Behavior |
 | --- | --- |
@@ -217,21 +673,91 @@ Combo failures are divided into **hop** failures and **terminal** failures.
 | HTTP 410 with an explicit model end-of-life, retired, deprecated, sunset, decommissioned, or no-longer-available signal | Cool that target and hop. Unrelated 410 responses remain terminal. |
 | Classified authentication, subscription, quota, rate-limit, overload, or upstream-server error | Cool the target and hop, even when the status alone is not sufficient. |
 | Client cancellation (499), `origin_rejected`, cyber-policy refusal, context overflow, or other invalid request | Stop and return the error; another target would not make the request valid. |
-| Structured HTTP 400 rejecting optional `user`, an unsupported reasoning effort, or model-scoped image input | Hop before output commitment without cooling; see request-local target compatibility below. |
+| Exact HTTP 400 saying a model is not supported when using Codex with a ChatGPT account | Try the next declared target before output commitment. The message must be the whole refusal in `detail`, `error.message`, or bare text; competing `detail` and `error` envelopes stay terminal. This does not quarantine the account or cool every model on the provider. |
+| Structured HTTP 400 rejecting optional `user`, an unsupported reasoning effort, model-scoped image input, or input media the route cannot read (`unsupported_input_modality`) | Hop before output commitment without cooling; see request-local target compatibility below. |
+| First tool call of a Responses turn run by an in-process adapter (`runTurn`) that the current request did not declare, before any output or replay-unsafe side effect | Cool the target and hop with the same tool catalog. After visible output or a replay-unsafe side effect the refusal is final. Chat Completions and Anthropic Messages requests are unchanged. |
 | Any other unclassified error | Stop and return the error. |
 
+If the shared request send budget refuses the first target, the combo returns a local 429
+`request_send_budget_exhausted` without contacting a provider. If it refuses a later target,
+the combo returns the last real upstream failure without sending to that target.
+
 When `cooldownMs` is unset, a hopped target uses an upstream fallback: 5 seconds for request-rate
-429s with upstream code `1302` or `1305`, and 60 seconds otherwise. When it is set, `cooldownMs`
+429s with upstream code `1302` or `1305`, 10 minutes for a spent account usage window, and 60
+seconds otherwise. A usage window is recognised by upstream code (`usage_limit_exceeded`,
+`usage_limit_reached`, `1308`) or by quota exhaustion phrasing (such as `usage limit reached`,
+`token-plan ... quota has been exhausted`, or `weekly usage quota exceeded`)
+outside 400 and 422 responses, independent of HTTP status — the ChatGPT Codex backend reports a spent
+window as a 502 rather than the documented 429. A 400 or 422 response needs a structured code: a
+validation error that merely quotes quota wording (e.g. `quota exhausted`) does not hop. Codes
+inferred from that prose by the proxy's formatter do not count as upstream structured evidence.
+Devin's explicit weekly/monthly/daily or usage-window exhaustion becomes 429 and uses the
+10-minute target hold; per-minute/per-hour and MCP configuration `failed_precondition` trailers stay
+400 and stop. Raw Devin trailer text is redacted. A spent
+window cools only that target, so other accounts of the same provider stay eligible. Credential and
+billing failures that already black out the whole provider (`invalid_api_key`, `insufficient_quota`,
+`payment_required`, and the other provider-scoped codes) take the same 10-minute hold. When it is set, `cooldownMs`
 applies whenever no usable upstream `Retry-After` or Codex reset signal exists, including those
-request-rate 429s. Numeric `Retry-After` seconds and HTTP-date values are accepted, and every
-cooldown is capped at 10 minutes. The precedence is, from strongest to weakest, explicit
+request-rate 429s. Numeric `Retry-After` seconds and HTTP-date values are accepted. Explicit
+server delays are capped at 24 hours; reset-derived, configured, and fallback cooldowns are capped
+at 10 minutes. The precedence is, from strongest to weakest, explicit
 `Retry-After` → Codex reset headers (`x-codex-primary-reset-at`, `x-codex-secondary-reset-at`, or
-`x-codex-tertiary-reset-at`) → the combo's `cooldownMs` (when set) → the 5-second request-rate
-fallback for upstream rate-limit codes `1302`/`1305` → the 60-second default. A valid immediate
+`x-codex-tertiary-reset-at`) → the combo's `cooldownMs` (when set) → the
+10-minute hold for a spent usage window or a credential/billing failure → the 5-second request-rate fallback for upstream
+rate-limit codes `1302`/`1305` → the 60-second default. The usage-window hold is tested first, so a
+failure that carries a request-rate code *and* usage-limit prose is held for ten minutes rather than
+five seconds. A valid immediate
 `Retry-After: 0` remains an immediate upstream directive rather than being replaced by a configured
 cooldown.
 
-The current request never retries the same attempted target. Later requests skip a cooled target until its
+For an Anthropic OAuth or Codex pool, a 429 tied to one account that the pool has cooled does
+not cool the whole combo target. Other accounts behind that target remain available. A 429 with
+no identified, cooled pool account still cools the target, as do provider-wide failures.
+
+### Last-resort targets
+
+A brief cooldown on a preferred target otherwise routes straight to whatever
+comes next in the list — including a target you only ever wanted used in an
+emergency. Mark it, and tell the combo to wait first:
+
+```json
+{
+  "strategy": "failover",
+  "cooldownWaitPolicy": "before-last-resort",
+  "waitForCooldownMs": 10000,
+  "targets": [
+    { "provider": "provider-a", "model": "model-a" },
+    { "provider": "provider-b", "model": "model-b" },
+    { "provider": "provider-c", "model": "model-c", "lastResort": true }
+  ]
+}
+```
+
+With the policy set, selection tries the normal targets first. If they are only
+cooling and the earliest cooldown expires inside `waitForCooldownMs`, the
+request waits for that instead of dispatching the last-resort target. That
+deferral does not depend on the wait: a `lastResort` target is skipped whenever
+any normal target is available, for every strategy, and under `round-robin` or
+`random` it does not join the rotation at all. `waitForCooldownMs` only adds the
+wait for a cooling normal target, so at the default `0` nothing waits: the last
+resort is used as soon as no normal target is available. After a failed attempt,
+the next pick follows the same rule.
+
+**The policy only ever defers.** When no normal target can be reached — every
+one cooling past the budget, already attempted, or ruled out — the last-resort
+target is dispatched as usual. A policy that could withhold it would turn a
+fallback into an outage, which is worse than the premature routing it prevents.
+The same applies to a combo whose targets are *all* marked `lastResort`: it
+dispatches normally.
+
+`lastResort` is inert unless `cooldownWaitPolicy` is set, and both are omitted
+by default, so existing combos are unaffected. Only the exact string
+`before-last-resort` opts in.
+
+The current request never retries the same attempted target — with one exception: a single-target combo
+that sets `waitForCooldownMs` may retry its only target once that target's cooldown expires inside the
+same request, since there is no alternate to fail over to. Request-local compatibility rejections still
+return without any retry. Later requests skip a cooled target until its
 cooldown expires; request-local compatibility rejections do not cool the target. A `Retry-After` HTTP-date that is already in the past is also preserved as an
 immediate upstream directive, just like `Retry-After: 0`. Set `waitForCooldownMs` to allow a later
 request to wait for the earliest eligible target cooldown, up to that cap on each selection attempt,
@@ -247,12 +773,20 @@ used by native account routing.
 :::note
 Failover is intentionally bounded. It helps with target-specific availability, authentication,
 quota, and overload failures; it does not hide caller errors or policy refusals.
+On a non-combo Responses request, an allowlisted xAI policy 403 is rewritten to HTTP 200
+`incomplete/content_filter` before Codex retries it as a transport failure; see
+[xAI policy refusals](/reference/proxy-formats/#xai-policy-refusals). Combo hops still
+classify the original HTTP 403 as a hop.
 :::
 
 For streaming requests, the upstream HTTP status is not the final decision. OpenCodex buffers a
 bounded pre-output prefix of the selected child's Responses SSE. If the stream reports a retryable
 `response.failed` terminal before any text, reasoning, tool call, or other output event, the child
-is recorded as failed and the combo may try its next eligible target. Once any output event begins,
+is recorded as failed and the combo may try its next eligible target. A zero-output
+`response.incomplete` follows the same path when its reason is missing or is `adapter_eof`,
+`missing_terminal_event`, or `upstream_stall_timeout`. Explicit semantic reasons such as
+`max_output_tokens` and `content_filter` remain terminal, as does an explicit null reason.
+A reasonless final snapshot that already contains output items is also kept. Once any output event begins,
 the target is committed: a later stream failure is returned to the client and is never replayed on
 another provider, which prevents duplicate text and tool execution. If the pre-output buffer reaches
 its safety cap without a terminal or output boundary, OpenCodex also commits the current target
@@ -262,7 +796,23 @@ instead of growing memory without a bound.
 
 When routing Claude Code to the canonical ChatGPT Codex backend, OpenCodex removes the unsupported top-level `user` metadata field without changing the session/cache key, input messages, tool schemas, or safety identifiers. Public Responses API and noncanonical forward gateways keep that field.
 
-A combo can also advance after an intact HTTP 400 `invalid_request_error` that specifically rejects `user`, reports `unsupported_value` for `reasoning.effort`/`reasoning_effort`, or reports `param: input` with an exact model-scoped `does not support image inputs` rejection. This is a mismatch for that request, not evidence that the target is unhealthy, so it records no cooldown. This compatibility recovery does not silently change `none` into a different effort or broaden this exception to arbitrary invalid requests. Policy refusals, cancellation and already-committed output remain non-replayable. A single-target request still returns an unresolved upstream rejection.
+A combo can also advance after an intact HTTP 400 `invalid_request_error` that specifically rejects `user`, reports `unsupported_value` for `reasoning.effort`/`reasoning_effort`, or reports `param: input` with an exact model-scoped `does not support image inputs` rejection. A route that refuses the request's media with code `unsupported_input_modality`, such as image input sent to a CLI provider route without a verified multimodal contract, advances the same way. This is a mismatch for that request, not evidence that the target is unhealthy, so it records no cooldown. This compatibility recovery does not silently change `none` into a different effort or broaden this exception to arbitrary invalid requests. Policy refusals, cancellation and already-committed output remain non-replayable. A single-target request still returns an unresolved upstream rejection.
+
+## Tool calls stay on one target
+
+When a model asks your client to run a tool, the request that returns the tool result finishes the
+same assistant turn. OpenCodex sends that request to the target that issued the tool call, as long
+as the target is still enabled, still in the combo, and out of cooldown. This holds for every
+strategy, including JEV, which skips its decision for that request. The next user message chooses a
+target normally.
+
+Tracking uses the client's thread or session id, so a client that sends neither gets a normal pick.
+If the original target is unavailable or fails, the combo fails over as usual, and the new target
+receives the earlier tool calls in a form it accepts. DeepSeek thinking models get a one-space
+reasoning placeholder for a tool call that another model issued without reasoning. Gemini gets
+Google's documented signature placeholder. Anthropic gets a plain tool call and result. Earlier
+versions could send DeepSeek a bare tool call here and fail with `The reasoning_text in the
+thinking mode must be passed back to the API`.
 
 ## Default reasoning effort
 
@@ -314,6 +864,25 @@ even when every target supports images — the catalog drops `image` from `input
 image-bearing requests are rejected with HTTP 400 before any target is called. `"auto"` (or
 omitting the field) keeps the automatic intersection.
 
+In the dashboard, the **Image / multimodal** switch can be enabled whenever every target has
+known image or text input capabilities. Native image members stay unchanged; text-only members are
+automatically declared text-only on save (`modelCapabilities[model].inputModalities = ["text"]`)
+so the [Vision Sidecar](/guides/sidecars/) describes their images. The switch's hint names the
+members that will be enrolled. A member whose modalities are unknown or have no text input (for
+example an audio-only model) cannot be covered by the sidecar; it keeps the switch unavailable and
+is named in the hint. If the [Vision Sidecar](/guides/sidecars/) is disabled globally, enabling the
+switch shows a warning linking to the dashboard: enrollment still saves, but images are replaced
+with an omission note and requests continue without image descriptions until the sidecar is
+re-enabled. Turning the switch off disables image input for the combo
+but keeps those provider declarations, and `PUT /api/combos` accepts the same enrollment as an
+optional top-level `visionSidecarTargets` array of exact `{ provider, model }` targets
+(request-only; it is never stored on the combo and is rejected while `imageInput` is
+`"disabled"` when the enrollment list is non-empty). Entries that already accept image input or
+are declared without text are rejected with HTTP 400 rather than overwritten, entries the sidecar
+already covers are skipped, and a save refused before publication restores the combo and every declaration together.
+Removing a member from the combo does not remove its text-only declaration; clear it in the
+provider editor if you no longer want it.
+
 ## Encrypted v2 sub-agent tasks
 
 There is one important limitation for Codex v2 sub-agents ([issue #92](https://github.com/lidge-jun/opencodex/issues/92)).
@@ -351,7 +920,12 @@ task workflow.
 ### Dashboard
 
 Open the local dashboard and choose **Models → Combos**. The workspace creates, edits, renames, and removes
-combos, and its target picker excludes disabled models and nested combos.
+combos. Its model selectors include hidden models: catalog visibility only controls external model
+lists, not internal Combo selection, and selecting a hidden model does not make it visible externally.
+The target picker still excludes disabled providers, nested combos, and the credential-only JEV provider. **Create JEV Auto** opens the same Combo editor with an editable decision target template;
+an existing `jev-auto` id or alias is reported instead of creating a duplicate. A JEV Combo also shows
+**Decision service** (TypeSafe JEV or a configured `jev-decision` provider) and **Decision timeout
+(ms)**, and the Combos overview lists each JEV Combo's decision service, endpoint, and timeout.
 
 Each target also shows a live quota badge: **Available**, **Out of quota**, or **Quota unknown**. The editor blocks Save and Create for quota only when every usable target has a current server-confirmed exhausted inference limit for its configured credential. Display-only account, model, search and MCP quota, or missing or expired routing evidence, does not cause this block. The block expires at the applicable reset or freshness boundary and is rechecked when the page becomes active or visible; Refresh reloads both Combo data and quota. The dashboard
 editor does not yet expose `cooldownMs` or `waitForCooldownMs`; use the configuration file or management
@@ -369,8 +943,10 @@ ocx combo remove <id> --yes
 ```
 
 `set` also accepts `--strategy`, `--sticky`, `--effort`, `--alias`, `--native-alias`,
-`--display-name`, and `--rename-from`. Use `-` as the value of `--effort`, `--alias`, or
-`--display-name` to clear that field. `--native-alias` requires a currently supported bare native
+`--allow-metered-targets on|off`, `--display-name`, `--description`, `--decision-provider`, `--decision-timeout`, and `--rename-from`. Use `-` as the
+value of `--effort`, `--alias`, `--display-name`, `--description`, `--decision-provider`, or `--decision-timeout` to
+clear that field. The two decision flags apply only when the effective strategy is JEV: `--strategy jev`, or a stored JEV combo when `--strategy` is omitted. On an existing combo, `--targets` replaces only
+the target list: without `--strategy` the stored strategy and its JEV settings stay as they are. `--native-alias` requires a currently supported bare native
 model alias and a non-empty display name. `create` and `update` are aliases for `set`; `delete` is an alias for
 `remove`; and the same subcommands are available under `ocx route combo`.
 
@@ -385,6 +961,15 @@ value to change it. An explicit `cooldownMs` (even `60000`) is persisted as-is b
 the request-rate fallback. A stored `cooldownMs` can only be removed by editing the configuration file;
 `waitForCooldownMs` resets to its default when a `PUT` explicitly sends `0`, because the sparse
 serializer omits that default. Omission preserves both values and the dashboard does not expose them yet.
+Omitting `defaultEffortMode`, `reasoningEffortMode`, `imageInput`, or `cooldownWaitPolicy` likewise
+keeps the stored value. For a request that keeps `strategy: "jev"`, the decision method is kept
+only when both `decisionProvider` and `decisionModel` are omitted: sending either one replaces the
+stored method, so `decisionModel: null` without `decisionProvider` selects TypeSafe.
+`decisionTimeoutMs` is kept on its own whenever it is omitted. A different strategy drops all three,
+and a re-sent target without `lastResort` keeps that target's flag (matched by
+provider and model). The dashboard always sends `imageInput` and `reasoningEffortMode`, and for a JEV
+Combo `decisionProvider`, `decisionModel` and `decisionTimeoutMs` (`null` for the default), so switching them back to
+the default there still replaces the stored value.
 
 For the complete persisted configuration, see [Configuration](/reference/configuration/).
 
@@ -411,12 +996,14 @@ Combos are stored in the top-level `combos` object, keyed by combo id:
 
 | Field | Required | Default | Rules |
 | --- | --- | --- | --- |
-| `targets` | Yes | — | Non-empty ordered array of configured `{ provider, model, weight? }` targets. Duplicate provider/model pairs are rejected. |
-| `targets[].weight` | No | `1` | Integer from 1 to 10,000. Used by round-robin and random; ignored by failover, least-used, and reset-window. |
-| `strategy` | No | `"failover"` | `"failover"`, `"round-robin"`, `"random"`, `"least-used"`, or `"reset-window"`. |
+| `targets` | Yes | — | Non-empty ordered array of configured `{ provider, model, weight?, lastResort? }` targets. Duplicate provider/model pairs are rejected. |
+| `targets[].weight` | No | `1` | Integer from 1 to 10,000. Used by round-robin and random; ignored by failover, least-used, reset-window, and JEV. |
+| `targets[].lastResort` | No | `false` | Marks an emergency-only target. Inert unless `cooldownWaitPolicy` is set. Never makes a target permanently ineligible: when no normal target can be reached it is dispatched as usual. |
+| `strategy` | No | `"failover"` | `"failover"`, `"round-robin"`, `"random"`, `"least-used"`, `"reset-window"`, or `"jev"`. JEV decides only the initial eligible target and effort; ordinary Combo fallback owns later attempts. |
 | `stickyLimit` | No | `1` | Integer from 1 to 100 successful requests per round-robin selection. Applies only to round-robin. |
-| `cooldownMs` | No | unset → upstream fallback (5 s for request-rate 429 codes `1302`/`1305`, otherwise 60 s) | Integer from 1 to 600000. When set, applies as the per-target cooldown whenever no usable upstream `Retry-After` or Codex reset signal exists, including request-rate 429s; when unset, uses the upstream fallback. |
+| `cooldownMs` | No | unset → upstream fallback (5 s for request-rate 429 codes `1302`/`1305`, 10 min for a spent usage window or a credential/billing failure, otherwise 60 s) | Integer from 1 to 600000. When set, applies as the per-target cooldown whenever no usable upstream `Retry-After` or Codex reset signal exists, including request-rate 429s; when unset, uses the upstream fallback. |
 | `waitForCooldownMs` | No | `0` | Integer from 0 to 600000. Maximum time to wait for the earliest eligible cooling target before returning `combo_unavailable`; abort cancels the wait. |
+| `cooldownWaitPolicy` | No | unset | `"before-last-resort"` defers targets marked `lastResort`: they are used only when no normal target is available, for every strategy, and `waitForCooldownMs` only adds the wait for a cooling normal target, so at its `0` default nothing waits and the last resort is used as soon as no normal target is available. Only that exact string opts in. The deferral wait and the ordinary wait share one `waitForCooldownMs` budget per selection attempt. |
 | `defaultEffort` | No | `null` | `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; resolved against each target's advertised ladder. |
 | `defaultEffortMode` | No | `"fallback"` | `"fallback"` preserves explicit caller effort. `"force"` overrides valid caller effort, requires a valid non-null default, and can increase cost and latency. |
 | `reasoningEffortMode` | No | `"strict"` | `"strict"` intersects every known target ladder, so one target advertising no effort control empties the combo's picker. `"adaptive"` excludes those empty ladders from the published intersection. At dispatch, explicit empty or adaptive unknown ladders remove unsupported effort/thinking controls while preserving supported non-effort reasoning fields such as `reasoning.summary`; known non-empty targets keep existing effort resolution. |
@@ -424,6 +1011,9 @@ Combos are stored in the top-level `combos` object, keyed by combo id:
 | `alias` | No | none | Optional trimmed public model id; use the alias rules above. An empty value is stored as no alias. |
 | `nativeAlias` | No | `false` | Explicitly permit a currently supported bare native `alias` to take routing and catalog precedence. Never inferred from the alias. |
 | `displayName` | No | none | Bounded display-only catalog label. Required and non-empty when `nativeAlias` is true. |
+| `description` | No | none | Display-only catalog row description, bounded like `displayName` (at most 128 characters, no control characters). Unset keeps the generated `Routed via opencodex → combo (combo).` text. Management API writes that omit it keep the saved value; an empty string clears it. |
+| `decisionProvider` | No | `"jev"` | JEV only. Provider id of the decision service: `"jev"` (TypeSafe, valid without a provider row; the same as omission) or a configured `adapter: "jev-decision"` row with a full HTTPS decision URL or a local HTTP `/systemone` URL, such as a self-hosted Ollama `tev1`. |
+| `decisionTimeoutMs` | No | `4000` | JEV only. Integer from 1000 to 120000: the decision deadline before failing open to the first eligible target. |
 
 ## Troubleshooting
 
@@ -437,11 +1027,15 @@ running opencodex instance that receives model requests.
 
 Every target is currently ineligible: for example, its provider is disabled, it is cooling down,
 it has already been attempted for this request, or an encrypted v2 task excludes it. Check target
-provider state and recent upstream errors. For cooldowns, follow an observed `Retry-After` value first;
+provider state and recent upstream errors. When no target was attempted, the error message lists
+why each target was skipped, for example
+`No available targets for combo: fast (openai/gpt-6: quota exhausted; anthropic/claude-opus-5-5: cooldown 42s)`.
+For cooldowns, follow an observed `Retry-After` value first;
 Codex reset headers also take precedence over `cooldownMs`.
 If neither upstream signal is usable, the configured `cooldownMs` applies, or the upstream fallback applies
-when it is unset (5 seconds for request-rate codes `1302`/`1305`, otherwise 60 seconds); every cooldown is
-capped at 10 minutes.
+when it is unset (5 seconds for request-rate codes `1302`/`1305`, 10 minutes for a spent usage
+window or a credential/billing failure, otherwise 60 seconds). Explicit
+`Retry-After` delays are capped at 24 hours; the other cooldowns are capped at 10 minutes.
 
 ### Why was my alias rejected?
 
@@ -454,3 +1048,38 @@ validation message.
 
 The error was terminal rather than target-specific. Fix invalid input, reduce an oversized context,
 handle a policy refusal, or correct the rejected request origin. Combos do not hop for those cases.
+
+## Retry all-cooled targets (opt-in)
+
+Combo cooldown recovery is opt-in and disabled by default. To allow one new
+failover pass when every otherwise eligible target has a saved combo cooldown:
+
+```sh
+ocx combo set review --cooldown-reprobe on --cooldown-reprobe-interval 300000
+ocx combo set review --cooldown-reprobe off
+```
+
+The corresponding per-combo configuration is:
+
+```json
+{ "cooldownReprobe": { "enabled": true, "intervalMs": 300000 } }
+```
+
+The default interval is five minutes; accepted values are integer milliseconds
+from 1000 to 86400000. Setting the interval alone does not enable recovery.
+Recovery is demand-driven: the first eligible request can reserve a pass immediately,
+and later passes are separated by at least the configured interval. There is no timer
+or background traffic. Each target can be attempted once in the request's existing
+failover budget; failures record fresh cooldowns. Account quota checks, disabled
+providers, request compatibility, metered-spend permissions and cancellation remain
+enforced. Explicit provider Retry-After values may therefore be retried early only
+when the operator enables this option. Preview/list operations never clear cooldowns.
+The interval is tracked per combo in memory and resets on proxy restart or combo
+selection-state reset. Existing cooldown-wait behavior is unchanged when disabled.
+
+A recovery pass belongs only to the request that reserved it; other requests still
+observe the saved cooldowns. That reservation follows the request through cooldown
+waits and JEV selection. A target that becomes usable again during a wait can still
+be retried if its cooldown has not changed. A newer cooldown cancels that target's
+reservation. Success clears only the unchanged cooldown of the target that answered;
+untried targets and newer failures keep their cooldowns.

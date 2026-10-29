@@ -1,12 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claimOwnedServiceHome } from "../helpers/owned-service-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
+import { OCX_ROUTING_MARKER_LINE } from "../../src/codex/injected-marker";
 
 /**
  * Regression: `ocx start` + Ctrl-C must NOT orphan the Bun proxy.
@@ -45,18 +45,6 @@ afterAll(() => {
   }
 });
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.on("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const addr = srv.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      srv.close(() => (port ? resolve(port) : reject(new Error("no port"))));
-    });
-  });
-}
-
 async function healthy(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/healthz`, {
@@ -94,19 +82,25 @@ async function waitUntil(fn: () => Promise<boolean>, deadlineMs: number): Promis
 }
 
 describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) for (const approved of [false, true]) {
     test(
-      `${signal} to the launcher tears down the Bun proxy and restores Codex config (no orphan)`,
+      `${signal} to the launcher restores ${approved ? "approved" : "native"} Codex config (no orphan)`,
       async () => {
         const home = mkdtempSync(join(tmpdir(), "ocx-shutdown-"));
         tmpHomes.push(home);
-        const port = await freePort();
+        let port = 0;
         const identity = claimTempHome(home);
 
         // Seed a native Codex config so the proxy actually injects on start (injectCodexConfig
         // no-ops when no config.toml exists) — this lets us prove the config is RESTORED.
         const codexConfig = join(home, "config.toml");
-        writeFileSync(codexConfig, 'model = "gpt-5.1"\n');
+        const original = approved
+          ? 'model_provider = "chatgpt-http"\n[model_providers.chatgpt-http]\nbase_url = "https://chatgpt.com/backend-api/codex"\nwire_api = "responses"\nrequires_openai_auth = true\nsupports_websockets = false\n'
+          : 'model = "gpt-5.1"\n';
+        writeFileSync(codexConfig, original);
+        // Bind port 0 and discover the actual endpoint from this home's publication.
+        // Pin config too: the startup owner probe must not find a real proxy on 10100.
+        writeFileSync(join(home, "config.json"), JSON.stringify({ port }));
 
         // stdout/stderr are CAPTURED, not discarded.
         //
@@ -117,16 +111,26 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         // startup regression. Locally the same spawn is healthy in ~800ms, so a
         // 25x margin is already generous and the missing evidence was the actual
         // problem.
-        const child = spawn("node", [BIN_OCX, "start", "--port", String(port)], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: {
+        const childEnv = {
             ...process.env,
             HOME: identity.homeDir,
             USERPROFILE: identity.userProfile,
             OPENCODEX_HOME: home,
             CODEX_HOME: home,
+            // Inherited real state must not make the child a sibling of the host's proxy either
+            // (same pinning as tests/cli/sibling-home-client-sync.test.ts).
+            GROK_HOME: join(home, "grok"),
+            OCX_OWNER_REGISTRY_DIR: join(identity.homeDir, ".opencodex", "ocx-homes"),
             ...identity.serviceManagerEnv,
-          },
+          };
+        if (approved) {
+          const consent = spawnSync(process.execPath, ["--eval", 'import { allowCodexProviderRouting, previewCodexProviderConsent } from "./src/codex/provider-routing"; allowCodexProviderRouting("chatgpt-http", previewCodexProviderConsent("chatgpt-http"));'], {
+            cwd: repoPath(), env: childEnv, encoding: "utf8", timeout: STARTUP_BUDGET_MS,
+          });
+          expect(consent.status, consent.stderr).toBe(0);
+        }
+        const child = spawn("node", [BIN_OCX, "start"], {
+          stdio: ["ignore", "pipe", "pipe"], env: childEnv,
         });
         spawned.push(child);
 
@@ -141,20 +145,36 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         child.stderr?.on("data", chunk => { output += String(chunk); });
 
         // 1. Proxy comes up + injected the Codex config (Design B root override on loopback).
-        const up = await waitUntil(() => healthy(port), STARTUP_BUDGET_MS);
+        // The health listener may answer before the launcher completes injection.
+        let healthSeen = false;
+        const up = await waitUntil(async () => {
+          try {
+            const runtime = JSON.parse(readFileSync(join(home, "runtime-port.json"), "utf8"));
+            if (!Number.isInteger(runtime.port) || runtime.port <= 0) return false;
+            port = runtime.port;
+          } catch { return false; }
+          if (!(await healthy(port))) return false;
+          healthSeen = true;
+          return readFileSync(codexConfig, "utf8").includes(approved ? `http://127.0.0.1:${port}/v1` : OCX_ROUTING_MARKER_LINE);
+        }, STARTUP_BUDGET_MS);
         if (!up) {
           // Name what actually went wrong instead of asserting a bare boolean.
           const died = exited ? ` The launcher EXITED (code ${exitCode}, signal ${exitSignal}).` : " The launcher was still running.";
           throw new Error(
-            `The proxy never answered /healthz on port ${port} within ${STARTUP_BUDGET_MS}ms.${died}`
+            `The proxy ${healthSeen ? "answered /healthz but did not inject Codex config" : "never answered /healthz"} on port ${port} within ${STARTUP_BUDGET_MS}ms.${died}`
             + ` Launcher output:\n${output.trim() || "(none)"}`,
           );
         }
         expect(existsSync(join(home, "ocx.pid"))).toBe(true);
         const injected = readFileSync(codexConfig, "utf8");
-        expect(injected).toContain("# Auto-injected by opencodex");
-        expect(injected).toContain(`openai_base_url = "http://127.0.0.1:${port}/v1"`);
-        expect(injected).not.toContain("model_providers.opencodex");
+        if (approved) {
+          expect(injected).toContain(`base_url = "http://127.0.0.1:${port}/v1"`);
+          expect(injected).toContain('model_provider = "chatgpt-http"');
+        } else {
+          expect(injected).toContain(OCX_ROUTING_MARKER_LINE);
+          expect(injected).toContain(`openai_base_url = "http://127.0.0.1:${port}/v1"`);
+          expect(injected).not.toContain("model_providers.opencodex");
+        }
 
         // 2. Signal ONLY the launcher PID (the exact orphan trigger).
         child.kill(signal);
@@ -171,6 +191,7 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         expect(existsSync(join(home, "ocx.pid"))).toBe(false);
         expect(existsSync(join(home, "runtime-port.json"))).toBe(false);
         expect(readFileSync(codexConfig, "utf8")).not.toContain("opencodex");
+        if (approved) expect(readFileSync(codexConfig, "utf8")).toBe(original);
       },
       STARTUP_BUDGET_MS + 40_000,
     );

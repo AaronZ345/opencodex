@@ -10,10 +10,11 @@
  *
  * It does still depend on WHERE the run starts. Bun resolves bunfig.toml from the current
  * working directory, so a run launched outside the repository never loads this file: no
- * sandbox, no arming, and getConfigDir() resolves the real ~/.opencodex. On 2026-09-15 a
- * run of that shape deleted a live home. Nothing here can close that hole from inside, so
- * a test that needs a config directory pins its own OPENCODEX_HOME rather than inheriting
- * one, and tests/ci-workflows/test-home-guard.test.ts enforces it for destructive calls.
+ * sandbox, and getConfigDir() resolves the real ~/.opencodex. On 2026-09-15 a run of that
+ * shape deleted a live home. The write guard covers that run by arming from its test-file
+ * entry (#7407), which turns such writes into refusals, but nothing here can sandbox it, so a
+ * test that needs a config directory pins its own OPENCODEX_HOME rather than inheriting one,
+ * and tests/ci-workflows/test-home-guard.test.ts enforces it for destructive calls.
  * (devlog `_plan/260730_codex_rs_upstream_v2_live_handoff/070`.)
  *
  * Import order below is load-bearing: importing the guard captures the real home at
@@ -26,9 +27,9 @@
  * what HOME says. `assertLiveServiceManagerAllowed` in `src/service.ts` is the guard for
  * that, armed by the same flag set below.
  */
-import { afterAll } from "bun:test";
+import { afterAll, afterEach } from "bun:test";
 import { isTestHomeGuardArmed, protectedHomeForTests } from "../src/lib/test-home-guard";
-import { createIsolatedTestEnvironment } from "../scripts/test";
+import { createIsolatedTestEnvironment, LIVE_INSTALL_CREDENTIAL_ENV } from "../scripts/test";
 import {
   acquireTestRunLock,
   resolveBareTestRunIdentity,
@@ -47,6 +48,8 @@ const isolated = createIsolatedTestEnvironment();
 for (const [key, value] of Object.entries(isolated.env)) {
   if (value !== undefined) process.env[key] = value;
 }
+// The sandbox drops these from its env, but this process started with them, so remove them here.
+for (const name of LIVE_INSTALL_CREDENTIAL_ENV) delete process.env[name];
 
 // Arm the guard once the sandbox is in place, and BEFORE the run lock.
 //
@@ -72,6 +75,8 @@ for (const [key, value] of Object.entries(isolated.env)) {
 process.env.OCX_TEST_HOME_GUARD = "1";
 // Lets a test assert one preload per process rather than assuming Bun's scheduling.
 process.env.OCX_TEST_PRELOAD_PID = String(process.pid);
+process.env.OCX_DISABLE_UPDATE_CHECK = "1";
+process.env.OPENCODEX_KIRO_MODEL_DISCOVERY = "0";
 
 if (!isTestHomeGuardArmed() || !protectedHomeForTests()) {
   throw new Error("test home guard failed to arm; refusing to run tests unprotected");
@@ -117,16 +122,36 @@ if (process.platform === "win32" && lockPath && runLock.owner) {
 
 // Clean up only the root this preload created. The `bun run test` wrapper owns its own.
 // Bun test workers do not reliably run process `exit` handlers, so the test lifecycle hook
-// is primary; the process hook remains a best-effort fallback for setup failures.
-let cleanupComplete = false;
-const cleanupIsolatedRoot = () => {
-  if (cleanupComplete) return;
-  try {
-    isolated.cleanup();
-    cleanupComplete = true;
-  } catch {
-    // The wrapper contains this root, and a later bare run reclaims it after the grace period.
-  }
-};
-afterAll(cleanupIsolatedRoot);
-process.on("exit", cleanupIsolatedRoot);
+// is primary; the process hook retries only an already-drained root. Setup failures
+// leave an ownership-marked root for stale recovery rather than blocking on child handles.
+// Load cleanup dependencies only AFTER home isolation, guard arming, and run-lock admission.
+const { createTestSandboxCleanup } = await import("./helpers/test-sandbox-cleanup");
+const { flushWindowsSecretAclReapsBeforeRemoval, windowsSecretAclReapPendingAtOrBelow } =
+  await import("../src/lib/windows-secret-acl");
+// Resolve cleanup owners during protected setup, not for the first time inside a timed
+// afterAll hook. Cleanup must drain existing producers rather than initialize their graph.
+const { flushConfigDirHardeningForTests } = await import("../src/config/paths");
+const { flushNativeMainStartupReleases } = await import("../src/codex/native-profile-startup");
+const { settleBackgroundWork } = await import("../src/lib/background-work");
+const cleanup = createTestSandboxCleanup({
+  drainProducers: async () => {
+    // Bounded: a task that never settles must not hang the worker. Throwing skips removal,
+    // so the root stays for ownership-checked stale recovery and the labels are reported.
+    const { settled, pending } = await settleBackgroundWork({ timeoutMs: 15_000 });
+    if (!settled) throw new Error(`[test] background work never settled before final cleanup: ${pending.join(", ")}`);
+    await flushNativeMainStartupReleases();
+    await flushConfigDirHardeningForTests();
+  },
+  waitForReaps: () => flushWindowsSecretAclReapsBeforeRemoval(isolated.root),
+  hasPendingReaps: () => windowsSecretAclReapPendingAtOrBelow(isolated.root),
+  remove: () => isolated.cleanup(),
+});
+afterAll(cleanup.afterAll);
+process.on("exit", cleanup.onExit);
+// Work a case started without awaiting (a lazy quota prime) settles inside that case. Left
+// running, it writes the next case's state and holds files the next teardown has to remove.
+// Bounded and non-fatal: a case that leaks work pays at most this wait and is named.
+afterEach(async () => {
+  const { settled, pending } = await settleBackgroundWork({ timeoutMs: 2_000 });
+  if (!settled) console.warn(`[test] background work outlived its case: ${pending.join(", ")}`);
+});

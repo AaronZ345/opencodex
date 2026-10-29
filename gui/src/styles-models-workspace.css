@@ -52,6 +52,7 @@
 .models-workspace-root {
   display: grid;
   grid-template-columns: minmax(240px, 280px) minmax(0, 1fr);
+  align-items: start;
   gap: var(--space-4);
   width: 100%;
   max-width: 100%;
@@ -60,6 +61,11 @@
 
 /* ── Rail ─────────────────────────────────────────────── */
 
+/*
+  Pinned under the sticky quota bar while the document scrolls the model list.
+  QuotaSummaryBar publishes its measured height as the unitless --ocx-sticky-top-h;
+  without the bar the rail pins to the viewport top. The list fills the rest of the viewport.
+*/
 .models-workspace-rail {
   display: flex;
   flex-direction: column;
@@ -67,6 +73,9 @@
   border-right: 1px solid var(--border);
   padding-right: var(--space-3);
   min-width: 0;
+  position: sticky;
+  top: calc(var(--ocx-sticky-top-h, 0) * 1px + var(--space-3));
+  max-height: calc(100dvh - var(--ocx-sticky-top-h, 0) * 1px - var(--space-6));
 }
 
 .models-workspace-rail-header {
@@ -94,7 +103,7 @@
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
-  max-height: 640px;
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -152,28 +161,48 @@
   min-width: 0;
 }
 
-/* Controls row: shadow call on the left, sub-agent mode pinned right.
-   Right group does not move when the model name length changes. */
+/*
+  The settings panel is one stack of uniform rows: each row is a label on the
+  left and its control cluster on the right, so every switch and picker lines up
+  on the same right edge no matter how long a model name or hint is. Rows span
+  the full panel width rather than pairing into columns, which kept the two
+  model pickers at ragged widths and left the sub-agent chips floating.
+*/
 .models-control-top-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  column-gap: clamp(var(--space-3), 2vw, var(--space-6));
-  row-gap: var(--space-2);
+  row-gap: var(--space-1);
   margin-bottom: var(--space-3);
   min-width: 0;
 }
 
-.models-shadow-row {
+/* One labelled control: label group left, action group right, both vertically centered. */
+.models-control-row {
+  grid-column: 1 / -1;
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  min-width: 0;
+  min-height: 32px;
+}
+
+.models-row-label {
+  display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
-  flex-wrap: nowrap;
 }
 
-.models-shadow-label {
-  white-space: nowrap;
+.models-row-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .models-shadow-warning {
@@ -206,16 +235,49 @@
   white-space: nowrap;
 }
 
-.models-v2-mode-row {
+/* ── Shadow-call source toggles (Dashboard + Models) ───── */
+.shadow-source-toggles {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex: 0 0 auto;
+  flex-direction: column;
+  gap: var(--space-1);
   min-width: 0;
-  flex-wrap: nowrap;
-  justify-self: end;
-  /* Keep the Sub-agent chip row on the same cap-height as Shadow Call controls. */
-  min-height: 28px;
+  margin-top: var(--space-2);
+}
+
+.shadow-source-toggle-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.shadow-source-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 2px 6px 2px 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+}
+
+.shadow-source-toggle.on {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+
+.shadow-source-toggle .switch { flex: 0 0 auto; }
+.shadow-source-id { font-size: 11.5px; white-space: nowrap; }
+.shadow-source-role { white-space: nowrap; }
+.shadow-source-reason { white-space: normal; line-height: 1.2; }
+.shadow-source-hint { display: block; line-height: 1.4; }
+.models-shadow-sources { grid-column: 1 / -1; margin: 0 0 var(--space-3); }
+.dash-shadow-sources { margin-top: var(--space-2); }
+
+@media (max-width: 560px) {
+  .shadow-source-toggle-list { gap: var(--space-1); }
+  .shadow-source-toggle { padding-right: 4px; }
 }
 
 .models-v2-detail-row {
@@ -225,20 +287,14 @@
   align-items: center;
 }
 
-/*
-  "Keep ChatGPT on v1" is a sub-setting of the Sub-agent surface control, not a
-  peer of it. It sits in the right-hand grid column directly under the v1/base/v2
-  chips and stays right-aligned with them, so it reads as a qualifier on the
-  selected mode instead of floating in the empty space beside Shadow Call.
-*/
+/* The v2 qualifier stays under the Sub-agent controls; the other settings rows
+   still span the panel so their labels and controls retain the shared edges. */
 .models-v2-keep-native-row {
   grid-column: 2;
   justify-self: end;
   display: flex;
   justify-content: flex-end;
   min-width: 0;
-  /* Pull up against the mode row's own min-height so the pair reads as one block. */
-  margin-top: calc(var(--space-1) * -1);
 }
 
 .models-v2-keep-native {
@@ -567,9 +623,14 @@
     grid-template-columns: 1fr;
   }
 
-  .models-shadow-row {
-    flex: 1 1 100%;
-    flex-wrap: wrap;
+  .models-v2-keep-native-row {
+    grid-column: 1;
+    justify-self: start;
+    justify-content: flex-start;
+  }
+
+  .models-v2-keep-native-label {
+    white-space: normal;
   }
 
   .models-shadow-model-slot {
@@ -577,22 +638,6 @@
     width: auto;
     min-width: min(100%, 10rem);
     max-width: 100%;
-  }
-
-  .models-v2-mode-row {
-    flex-wrap: wrap;
-    justify-self: start;
-  }
-
-  .models-v2-keep-native-row {
-    grid-column: 1;
-    justify-self: start;
-    justify-content: flex-start;
-    margin-top: 0;
-  }
-
-  .models-v2-keep-native {
-    white-space: normal;
   }
 }
 
@@ -611,6 +656,8 @@
     border-bottom: 1px solid var(--border);
     padding-right: 0;
     padding-bottom: var(--space-3);
+    position: static;
+    max-height: none;
   }
 
   .models-workspace-rail-list {
@@ -635,6 +682,8 @@
     border-bottom: 1px solid var(--border);
     padding-right: 0;
     padding-bottom: var(--space-3);
+    position: static;
+    max-height: none;
   }
 
   .models-workspace-rail-list {
@@ -655,3 +704,112 @@
 .picker-order-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .picker-order-actions { display: inline-flex; flex-shrink: 0; gap: 2px; }
 .picker-order-row .cwi-target-grip:disabled { cursor: default; opacity: 0.5; }
+
+/*
+  Catalog delivery process, folded to one line under the Models subtitle.
+  Summary marker follows .startup-recovery-details; focus uses the global :focus-visible rule.
+*/
+.models-delivery { margin: -14px 0 18px; max-width: var(--prose-measure); font-size: var(--text-control); color: var(--muted); }
+.models-delivery > summary { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 0; cursor: pointer; list-style: none; }
+.models-delivery > summary::-webkit-details-marker { display: none; }
+.models-delivery > summary::before { content: ""; flex: 0 0 auto; width: 0; height: 0; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform var(--motion-fast); }
+.models-delivery[open] > summary::before { transform: rotate(90deg); }
+.models-delivery-title { flex: 0 0 auto; color: var(--text); font-weight: var(--weight-semibold); }
+.models-delivery-flow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.models-delivery-steps { margin: 8px 0 0; padding: 0 0 0 26px; display: flex; flex-direction: column; gap: 10px; line-height: var(--leading-body); }
+.models-delivery-steps > li { padding-left: 2px; }
+.models-delivery-steps > li::marker { color: var(--muted); font-weight: var(--weight-semibold); }
+.models-delivery-steps strong { display: block; color: var(--text); font-weight: var(--weight-semibold); }
+.models-delivery-steps p { margin: 2px 0 0; }
+.models-delivery-hint { margin: 10px 0 0 13px; padding: 8px 12px; border-left: 2px solid var(--border); line-height: var(--leading-body); }
+:lang(ko) .models-delivery { word-break: keep-all; overflow-wrap: anywhere; }
+
+/*
+  Model settings panel: every global catalog control, folded into one card above the
+  rail/list workspace. The summary line states each folded value so folding never hides
+  behaviour; the chevron rotation is the only motion.
+*/
+.models-settings {
+  margin: 0 0 var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface);
+  min-width: 0;
+}
+.models-settings > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: 10px var(--space-4);
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--text-control);
+}
+.models-settings > summary::-webkit-details-marker { display: none; }
+.models-settings > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform var(--motion-fast);
+}
+.models-settings[open] > summary::before { transform: rotate(90deg); }
+.models-settings[open] > summary { border-bottom: 1px solid var(--border); }
+.models-settings-title {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+.models-settings-warn {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--amber, #d99a1e);
+}
+.models-settings-state {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.models-settings-kv + .models-settings-kv::before {
+  content: "·";
+  margin: 0 var(--space-2);
+  color: var(--faint);
+}
+.models-settings-v {
+  margin-left: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+}
+.models-settings-body {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-4);
+  min-width: 0;
+}
+.models-settings-body > .models-control-top-row { margin-bottom: var(--space-3); }
+.models-settings-body .models-cap-row { margin-bottom: var(--space-3); }
+/* The two cap rows put their controls on the same right edge as the rows above. */
+.models-settings-body .models-cap-row > .muted:first-child { margin-right: auto; }
+.models-settings-body > .models-aliases-card { margin: var(--space-2) 0 0; }
+
+.models-info-hint {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  cursor: help;
+  border-radius: var(--radius-pill);
+}
+
+/* List toolbar: collapse/expand, the order hint, and the custom-model count on one row. */
+.models-collapse-controls { align-items: center; flex-wrap: wrap; }
+.models-collapse-controls > .models-custom-summary { margin: 0 0 0 auto; }

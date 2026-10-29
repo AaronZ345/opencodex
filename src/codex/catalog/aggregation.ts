@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { collapseAntigravityPublicModels } from "../../providers/antigravity-effort-families";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -194,6 +195,7 @@ export function deriveComboCatalogModel(
     ...(combo.alias ? { alias: combo.alias } : {}),
     ...(combo.nativeAlias ? { nativeAlias: true } : {}),
     ...(combo.displayName ? { displayName: combo.displayName } : {}),
+    ...(combo.description ? { description: combo.description } : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(members.every(member => member.parallelToolCalls === true)
       ? { parallelToolCalls: true }
@@ -400,6 +402,20 @@ export function exactComboCatalogSlugs(
   }));
 }
 
+/** Current combo row descriptions by public catalog slug, for retained-row re-projection (#7229). */
+export function comboCatalogDescriptions(
+  config: Pick<OcxConfig, "combos" | "disabledModels">,
+): Map<string, string> {
+  const current = exactComboCatalogSlugs(config);
+  return new Map(listComboIds(config).flatMap(id => {
+    const raw = config.combos?.[id];
+    const alias = typeof raw?.alias === "string" ? raw.alias.trim() : "";
+    const publicSlug = alias || comboModelId(id);
+    const description = typeof raw?.description === "string" ? raw.description.trim() : "";
+    return description && current.has(publicSlug) ? [[publicSlug, description] as const] : [];
+  }));
+}
+
 export function normalizedOpenAiApiSignature(model: CatalogModel): string {
   const normalized = {
     provider: model.provider,
@@ -504,6 +520,7 @@ export function resolveSlugAliasCollisions(goModels: CatalogModel[]): Set<Catalo
 }
 
 export function uniqueCatalogModelsForPublicList(goModels: CatalogModel[]): CatalogModel[] {
+  goModels = collapseAntigravityPublicModels(goModels);
   const collisionSkipped = resolveSlugAliasCollisions(goModels);
   const comboPublicSlugs = new Set(goModels
     .filter(model => model.provider === COMBO_NAMESPACE)
@@ -525,6 +542,7 @@ export function uniqueCatalogModelsForPublicList(goModels: CatalogModel[]): Cata
 }
 
 export function uniqueCatalogModelsForRawPublicList(goModels: CatalogModel[]): CatalogModel[] {
+  goModels = collapseAntigravityPublicModels(goModels);
   const publicId = (model: CatalogModel): string => model.alias ?? `${model.provider}/${model.id}`;
   const comboPublicIds = new Set(goModels
     .filter(model => model.provider === COMBO_NAMESPACE)

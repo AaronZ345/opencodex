@@ -17,6 +17,7 @@ import { Database } from "bun:sqlite";
 
 import { getConfigDir } from "../config";
 import { catalogHasRoutedEntries, parseCatalogJson } from "./catalog/parsing";
+import { hasOcxRoutedAuthorship } from "./catalog/ownership";
 import { codexHistoryBackupId, legacyCodexHistoryBackupId, validateCodexHistoryBackupManifest } from "./history-manifest";
 import {
   hasInjectedCodexRouting,
@@ -79,9 +80,11 @@ const PROFILE_FILE_NAME = basename(CODEX_PROFILE_PATH);
 const CATALOG_FILE_NAME = basename(DEFAULT_CATALOG_PATH);
 const MODELS_CACHE_FILE_NAME = basename(CODEX_MODELS_CACHE_PATH);
 const JOURNAL_FILE_NAME = "opencodex-journal.json";
-const ROUTED_CATALOG_DESCRIPTION_PREFIX = "Routed via opencodex → ";
 const MAX_ROLLOUT_INSPECTION_BYTES = 64 * 1024 * 1024;
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
+// Bound one observation across every referenced rollout, not just each file.
+const MAX_TOTAL_ROLLOUT_INSPECTION_BYTES = 64 * 1024 * 1024;
+type RolloutInspectionBudget = { remainingBytes: number };
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -336,8 +339,7 @@ function classifyProfile(path: string): NativeRoutedResidueResult {
 }
 
 function isOcxRoutedCatalogEntry(entry: Record<string, unknown>): boolean {
-  return typeof entry.description === "string"
-    && entry.description.startsWith(ROUTED_CATALOG_DESCRIPTION_PREFIX);
+  return hasOcxRoutedAuthorship(entry);
 }
 
 function classifyCatalogLike(
@@ -424,6 +426,7 @@ function classifyPartialWrites(targetPaths: string[]): NativeRoutedResidueResult
 function classifyReferencedRollout(
   surface: "history" | "history-backup",
   reference: RolloutReference,
+  budget: RolloutInspectionBudget,
 ): NativeRoutedResidueResult {
   const resolved = resolveRegularFile(reference.path);
   if (resolved.kind === "absent") {
@@ -451,6 +454,14 @@ function classifyReferencedRollout(
         `referenced rollout exceeds the ${MAX_ROLLOUT_INSPECTION_BYTES} byte inspection limit`,
       );
     }
+    if (opened.size > budget.remainingBytes) {
+      return indeterminate(
+        surface,
+        resolved.path,
+        `referenced rollouts exceed the ${MAX_TOTAL_ROLLOUT_INSPECTION_BYTES} byte aggregate inspection limit`,
+      );
+    }
+    budget.remainingBytes -= opened.size;
     const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
     const buffer = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
     while (totalRead < opened.size) {
@@ -528,15 +539,16 @@ function classifyReferencedRollout(
 function classifyReferencedRollouts(
   surface: "history" | "history-backup",
   references: RolloutReference[],
+  budget: RolloutInspectionBudget,
 ): NativeRoutedResidueResult {
   for (const reference of references) {
-    const result = classifyReferencedRollout(surface, reference);
+    const result = classifyReferencedRollout(surface, reference, budget);
     if (result.kind !== "clean") return result;
   }
   return { kind: "clean" };
 }
 
-function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
+function classifyHistoryDatabase(path: string, budget: RolloutInspectionBudget): NativeRoutedResidueResult {
   const resolved = resolveRegularFile(path);
   if (resolved.kind === "absent") {
     for (const suffix of ["-wal", "-shm"]) {
@@ -576,6 +588,7 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
       rows
         .filter(row => row.model_provider !== "opencodex")
         .map(row => ({ id: row.id, path: row.rollout_path })),
+      budget,
     );
     if (rollouts.kind !== "clean") return rollouts;
     const after = statSync(resolved.path);
@@ -600,7 +613,7 @@ function historyBackupPath(stateDatabasePath: string): string {
   return legacy !== canonical && existsSync(legacy) ? legacy : canonical;
 }
 
-function classifyHistoryBackup(path: string, stateDatabasePath: string): NativeRoutedResidueResult {
+function classifyHistoryBackup(path: string, stateDatabasePath: string, budget: RolloutInspectionBudget): NativeRoutedResidueResult {
   const read = readRegularFile(path);
   if (read.kind === "absent") return { kind: "clean" };
   if (read.kind === "indeterminate") return indeterminate("history-backup", path, read.reason);
@@ -630,7 +643,7 @@ function classifyHistoryBackup(path: string, stateDatabasePath: string): NativeR
   for (const entry of Object.values(validated.manifest.entries)) {
     references.push({ id: entry.id, path: entry.rolloutPath });
   }
-  const rollouts = classifyReferencedRollouts("history-backup", references);
+  const rollouts = classifyReferencedRollouts("history-backup", references, budget);
   if (rollouts.kind !== "clean") return rollouts;
   return entries.length > 0
     ? { kind: "residue", surface: "history-backup", path: read.path }
@@ -672,6 +685,7 @@ export function classifyNativeRoutedResidue(): NativeRoutedResidueResult {
     journalPath,
     ...config.catalogTargets.map(target => target.path),
   ];
+  const budget = { remainingBytes: MAX_TOTAL_ROLLOUT_INSPECTION_BYTES };
   const classifiers = [
     () => classifyPartialWrites(atomicWriteTargets),
     () => config.classification,
@@ -679,11 +693,14 @@ export function classifyNativeRoutedResidue(): NativeRoutedResidueResult {
     ...config.catalogTargets.map(target => () => classifyCatalogLike("catalog", target.path, target.configured)),
     () => classifyCatalogLike("models-cache", modelsCachePath),
     () => classifyJournal(journalPath),
-    () => classifyHistoryDatabase(stateDatabasePath),
-    () => classifyHistoryBackup(historyBackupPath(stateDatabasePath), stateDatabasePath),
+    () => classifyHistoryDatabase(stateDatabasePath, budget),
+    () => classifyHistoryBackup(historyBackupPath(stateDatabasePath), stateDatabasePath, budget),
   ];
-  const results = classifiers.map(classify => classify());
-  return results.find(result => result.kind === "indeterminate")
-    ?? results.find(result => result.kind === "residue")
-    ?? { kind: "clean" };
+  let firstResidue: NativeRoutedResidueResult = { kind: "clean" };
+  for (const classify of classifiers) {
+    const result = classify();
+    if (result.kind === "indeterminate") return result;
+    if (result.kind === "residue" && firstResidue.kind === "clean") firstResidue = result;
+  }
+  return firstResidue;
 }

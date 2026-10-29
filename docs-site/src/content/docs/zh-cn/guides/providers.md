@@ -52,7 +52,9 @@ shipped v1 配置自动迁移到 marker 2 的单一选项行。原配置只保�
 
 [`retryOn429`](/zh-cn/reference/configuration/)（同 key 的 429 重试）仅适用于 API-key 提供商
 （`authMode: "key"`）。OAuth、forward 与本地预设均被排除——同一 token 绝不可重放，本地运行时
-也没有需要保留的远程 key。仅在配置后启用，默认关闭；配置了对象即启用，除非 `enabled: false`。
+也没有需要保留的远程 key。除文档中说明的特定目标默认值外，此功能需手动启用。规范的 Mistral Chat 在现有的按请求发送额度内使用耐心重试策略（6 次重放，10 秒回退间隔）。显式的 `retryOn429` 设置（包括 `enabled: false`）优先。Mistral 预设还会默认转发传入的 prompt 缓存 key；`promptCacheKey: false` 可关闭转发。缓存亲和性会提高复用几率，但不保证命中缓存，也不会消除 token 吞吐量限制。
+
+Mistral 的 Studio 和 Vibe 密钥共用同一个 API-key 提供商。密钥类型和套餐额度见 [Mistral 的 API 密钥文档](https://docs.mistral.ai/admin/identity-access/api-keys)；代理不会根据密钥推断订阅等级。对所有模型，上游显式给出的 `Retry-After` 截止时间会在同一凭据与模型的调用之间共享。没有重试时间的 429，在有效的每分钟计数器显示容量已耗尽，或被拒查询的实测成本超过剩余 token 但仍在公布的完整额度内时，可能触发保守的 60 秒恢复等待。这是本地恢复策略，并非对服务端重置时间的精确预测。正常流量下从不预测下一次查询的缓存或成本。等待结束后发送一次恢复探测；成功即恢复正常流量。缺失、格式错误、零授权、月度额度已耗尽或超过完整额度的依据，不会凭空推断重置，也不会压缩历史。`requestPacing: { "enabled": false }` 或 `retryOn429: { "respectRetryAfter": false }` 可关闭共享节流。对于同一密钥的重放，若 Mistral 的重试时间超过 `retryOn429.maxIntervalMs`，代理会返回 429 及重试提示，而不会提前重放。启用轮询（round-robin）密钥选择时，排队的请求会重新检查密钥冷却并为替代密钥获取节流容量；输出前的密钥拒绝可以在该请求现有的发送上限内切换到健康的密钥恢复。上下文窗口和按模型的压缩偏好保持独立。
 
 ## 1. ChatGPT 登录（forward / 透传）
 
@@ -92,7 +94,8 @@ ocx login cursor       # 独立的 Cursor PKCE 登录
 ocx login command-code # Command Code 浏览器 OAuth（或导入 ~/.commandcode/auth.json）
 ocx login orcarouter-oauth # OrcaRouter 浏览器授权 + PKCE
 ocx login devin       # Cognition/Devin：优先导入 Devin CLI 凭据，否则走 Auth0 浏览器登录
-ocx login github-copilot  # GitHub 设备流 → Copilot 令牌（Copilot Pro/Business）
+ocx login dsh-account # DeepSeek Harness Desktop（导入 ~/.dsh/.credentials.yaml 授权）
+ocx login github-copilot  # GitHub 设备流 → Copilot 令牌（Copilot 账户）
 ocx login codex        # Codex 账号池（别名：chatgpt、openai；需要代理正在运行）
 ocx logout <provider>
 ```
@@ -101,13 +104,15 @@ ocx logout <provider>
 | --- | --- | --- | --- |
 | `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth 使用独立的 Grok CLI 订阅网关。API 密钥覆盖模式使用 `https://api.x.ai/v1`，并可能注入 Priority Processing。优先使用实时 Grok 目录；回退默认模型为 `grok-4.5`。 |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude 模型；实时模型列表从 `/v1/models` 获取。 |
-| `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 编程模型。 |
+| `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi Code Plan 编程模型。默认使用稳定的 `kimi-for-coding` 别名（当前指向 K2.8 Preview）：100 万 token 上下文、可调 `low`/`high`/`max` 思考档（默认 `max`）、支持文本 + 图片输入。已下架的 `kimi-k2.x` 选择会在升级时自动迁移到该别名。进阶：添加 `kimi-responses` 预设可让同一 Kimi 账号登录走 OpenAI Responses 协议（思考内容在服务端保持加密，工具调用保持可见；Chat 预设保留明文推理）。 |
+| `kimi-responses` | `openai-responses` | `https://api.kimi.com/coding/v1` | 同一 Kimi 账号登录（复用 `kimi` 的 OAuth 凭据）走 OpenAI Responses 协议。模型名单与能力与 `kimi` 相同；思考内容在服务端保持加密，工具调用与结果保持可见。 |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research 订阅网关（与 Hermes Agent 使用同一后端）。通过设备授权登录 `portal.nousresearch.com`；access 令牌是每个请求的 inference JWT。付费 + `:free` 模型混合目录（`tencent/hy3:free`、`stepfun/step-3.7-flash:free` 等）会从已登录账户实时发现。Refresh 令牌是单次使用，每次刷新都会轮换。 |
 | `kiro` | `kiro` | `https://runtime.us-east-1.kiro.dev` | 首次登录会导入已安装并已登录的 Kiro CLI 会话（Unix 使用 `curl -fsSL https://cli.kiro.dev/install` &#124; `bash`；Windows PowerShell 使用 `irm 'https://cli.kiro.dev/install.ps1'` &#124; `iex`；然后运行 `kiro-cli login`）。**添加账户**会先退出 `kiro-cli`，再启动新的浏览器登录，从而切换 `kiro-cli` 自身使用的账户，并保存账户范围的配置文件元数据。现有 OpenCodex 账户会保留；如果取消或失败，则恢复之前的 `kiro-cli` 会话。 |
 | `google-antigravity` | `google` | `https://daily-cloudcode-pa.googleapis.com` | 通过 Cloud Code Assist 协议使用 Google OAuth。实时发现调用已认证的 CCA `v1internal:fetchAvailableModels` 端点，并仅发布当前登录账户可用的 agent 模型；维护中的目录仍作为回退。 |
 | `cursor` | `cursor` | `https://api2.cursor.sh` | 实验性 PKCE 登录、带可选 HTTP/1.1 兼容路径的 HTTP/2 传输，以及按账号筛选的模型发现。 |
 | `orcarouter-oauth` | `openai-chat` | `https://api.orcarouter.ai/v1` | 浏览器授权与密钥交换走 `https://www.orcarouter.ai` + S256 PKCE。交换结果是用户自己的普通 `sk-orca-…` API key，保存在现有凭据库中并持续复用，直到被撤销。 |
 | `devin` | `devin` | `https://server.codeium.com` | 实验性的非官方 Cognition/Devin 桥接。登录会先导入已安装 Devin CLI 已持有的凭据（`devin auth login` 会把 `devin-session-token` 写入它自己的 `credentials.toml`）；没有则打开 Auth0 浏览器页面，再用 `RegisterUser` 把粘贴的令牌换成长期 API 密钥。`ocx login devin-cli` 仍作为已弃用别名可用。模型列表按账号通过 `GetCascadeModelConfigs` 实时获取，流式仅走 Connect-RPC 上的 `runTurn` 路径。默认不在仪表盘预设中，需要手动启用。 |
+| `dsh-account` | `dsh-account` | `https://api.deepseek.com/anthropic` | 实验性优先导入账户提供商，复用已安装并登录的 DeepSeek Harness (DSH) Desktop 账户。在用户显式导入时严格以只读方式读取 `~/.dsh/.credentials.yaml` 中的凭据。独立于 DeepSeek API Key 计费。 |
 | `github-copilot` | `openai-chat` | `https://api.githubcopilot.com` | 实验性。GitHub 设备流 + `copilot_internal` 交换（VS Code OAuth 客户端）。需要有效的 Copilot 订阅；不是官方第三方 API。 |
 
 Google Antigravity 账户和提供方的配额查询（包括模型列表回退）使用固定的 Google 计量端点。这些目标支持透明 Fake-IP DNS，同时保留 TLS 验证、重定向拒绝和私有地址检查。自定义 base URL 仅改变模型请求，不改变配额目标；`NO_PROXY` 仍使用直连策略。
@@ -130,10 +135,22 @@ Vertex 或 Cloud Code Assist 修复会输出同样不含内容的 `google-tool-s
 Nous refresh 发生终止性失败后，请运行 `ocx login nous` 重新认证。
 
 对于规范的 Kimi Coding Plan 预设（`kimi` 账号登录和 `kimi-code` API key），opencodex
-只会把调用方提供的稳定 `prompt_cache_key` 转发到 Chat Completions 请求，绝不自行生成。Kimi
+只会把调用方提供的稳定 `prompt_cache_key` 转发到 Chat Completions 请求（Responses 协议接受同名字段，但 opencodex 目前不在 Responses 发送它），绝不自行生成。Kimi
 文档要求使用稳定的会话/任务 key 来提高 Code Plan 缓存命中率；没有 key 的请求仍保持不带 key。
 若已 opt-in 的上游拒绝该字段，opencodex 不会删除字段后重试，也不会改动已保存配置；其他
 provider 仍保持 deny-by-default。
+
+Kimi Code 原生 Responses 路由会省略明确正文为空的 assistant 历史消息，避免
+`assistant must not be empty` 拒绝。非空文本、空白字符、拒绝内容、推理与工具调用/结果
+保持原样；不会改写客户端存储的历史。被同一输入中的 `item_reference` 引用的空消息也会保留，
+避免留下悬空引用。
+
+`kimi`、`kimi-code` 和 `kimi-responses` 中 `k3`、`k3[1m]`、`k3-256k` 的费用是 **API 参考价格估算**，
+采用已公布的默认 5 分钟缓存写入价格，不代表 Code Plan 的实际账单或额度消耗：K3 的 1M 版本消耗
+约为 `k3-256k` 两倍的额度。`kimi-for-coding` 已切换为 K2.8 Preview，因此不再使用旧 K2.7 价格；
+除非用户配置 `modelCosts`，否则其估算保持未知。要求已知价格的路由策略或拒绝未知估算的费用上限
+可能会排除此别名。参见 [Kimi 模型配置](https://www.kimi.com/code/docs/en/kimi-code/models.html) 和
+[API 价格](https://platform.kimi.ai/docs/pricing/chat)。
 
 你也可以从 [web 仪表盘](/zh-cn/guides/web-dashboard/) 启动 OAuth。
 
@@ -171,9 +188,37 @@ Kiro 登录需要 Kiro CLI：Unix 使用 `curl -fsSL https://cli.kiro.dev/instal
 
 由于回滚依赖快照，当会话存储已存在但无法捕获时（文件不可读、架构不匹配、令牌选择有歧义），当 `KIROCLI_DB_PATH` / `KIRO_CLI_DB_FILE` 将导入路径指向与活动 CLI 存储不同的位置时，或当主 CLI 数据库没有可识别的令牌行时，**添加账户**会拒绝将 `kiro-cli` 登出。请修复或删除常规 `kiro-cli` 数据路径下的损坏数据库，并取消仅用于导入的选择器后重试。对于完全没有现有 `kiro-cli` 会话的机器，不受影响。
 
+### WorkBuddy AI 订阅
+
+`workbuddy-ai` 将国际版 WorkBuddy AI 订阅作为 OpenCodex 的模型来源。在 Providers 中选择
+**WorkBuddy AI** 并登录，或运行 `ocx login workbuddy-ai`，然后完成浏览器授权。
+授权最多等待五分钟；令牌保存在 OpenCodex 中并按需刷新。无需安装 WorkBuddy 客户端，
+也不会读取或修改客户端凭据。多个账户及其团队身份由现有 OAuth 账户管理流程隔离。
+
+登录后从账号实时模型目录选择 `workbuddy-ai/<model-id>`。模型发现不可用时可使用
+`workbuddy-ai/default-model`。支持流式输出、工具调用和非流式客户端；概览和账户页显示剩余积分、已用/总量、基础及赠送积分，
+并在可查询时显示下一批非每日积分的到期时间。刷新读取当前账户的账单汇总；查询失败不会
+显示为零。积分仅用于展示，不会因付费积分耗尽而禁用仍可用的免费模型。
+
+这是参考 [Magpie WorkBuddy 插件](https://github.com/magpie-community/plugins/tree/e7f65641df820dfd715c0d2241f99f2092e4efb1/packages/workbuddy)
+实现的非官方订阅协议。上游的客户端通道或账号限制会原样拒绝请求，不会改写代理身份提示词
+绕过限制。实际可用性取决于账号、地区、模型权限和上游 API。本功能独立于 CodeBuddy CLI
+API Key 提供商，也不负责让 WorkBuddy 桌面客户端使用 OpenCodex 模型。
+
+### DeepSeek Account (DSH)
+
+`dsh-account` 是一个实验性的、优先导入已有凭据的账户提供商，用于复用已安装并登录的 DeepSeek Harness (DSH) Desktop 应用程序的认证凭据。
+
+- **独立于 DeepSeek API Key**：`dsh-account` 使用用户的 DeepSeek 认证会话配额（普通/赠送钱包余额与总消费），而 `deepseek` 提供商按平台的 API Key 余额扣费。这两个凭据体系和路由严格隔离，互不回退。
+- **仅显式导入**：OpenCodeX 会检测是否已安装 DeepSeek Harness 且已登录（`~/.dsh/.credentials.yaml`），但绝不会在没有用户明确操作（`ocx login dsh-account` 或在 Web 仪表盘点击导入）的情况下自动复制、导入或使用该令牌。
+- **对 DSH 凭据库只读**：OpenCodeX 将 `~/.dsh/.credentials.yaml` 视为严格只读。OpenCodeX 绝不写入、修改、删除或更改任何属于 DeepSeek Harness 的文件权限。
+- **隔离的凭据副本与登出**：导入后，OpenCodeX 会通过 DeepSeek 权威身份端点（`/auth-api/v0/users/current`）校验令牌，并在 OpenCodeX 认证库中保存独立副本。在 OpenCodeX 中登出或删除该账户仅会删除 OpenCodeX 本地副本，绝不会触发上游远程会话登出，也不会退出 DeepSeek Harness Desktop。
+- **无后台令牌自动刷新与 401 重新导入**：DSH 会话授权不支持自动后台刷新端点。若上游返回 HTTP 401（`ACCOUNT_TOKEN_INVALID`），OpenCodeX 将该账户标记为 `needsReauth` 并停止路由。要恢复访问，用户必须通过 `ocx login dsh-account` 显式重新导入。
+- **第三方免责声明**：OpenCodeX 不主张 DeepSeek 官方对于第三方客户端复用会话授权提供背书或支持。
+
 ## 3. API 密钥目录
 
-opencodex 内置 95 个预设：79 个密钥预设、12 个 OAuth 预设、3 个本地预设，以及 1 个默认的
+opencodex 内置 106 个预设：85 个密钥预设、17 个 OAuth 预设、3 个本地预设，以及 1 个默认的
 ChatGPT 转发预设。仪表盘的 **Add provider** 选择器会打开密钥提供商的控制台，验证并保存密钥。
 验证因提供商而异。主要条目包括：
 
@@ -203,6 +248,7 @@ Cline IDE/CLI 中提供，不能通过 API 使用；`minimax/minimax-m2.5` 是�
 | Umans AI · Neuralwatt | `https://api.code.umans.ai` · `https://api.neuralwatt.com/v1` |
 | Mistral | `https://api.mistral.ai/v1` |
 | MiniMax · MiniMax (CN) | `https://api.minimax.io/v1` · `https://api.minimaxi.com/v1` |
+
 | DeepSeek | `https://api.deepseek.com` |
 | Cerebras | `https://api.cerebras.ai/v1` |
 | Chutes | `https://llm.chutes.ai/v1` |
@@ -227,25 +273,49 @@ Cline IDE/CLI 中提供，不能通过 API 使用；`minimax/minimax-m2.5` 是�
 | Z.AI (GLM Coding) | `https://api.z.ai/api/coding/paas/v4` |
 | 智谱 AI (BigModel) | `https://open.bigmodel.cn/api/paas/v4` |
 | [BigModel Coding Plan — Responses (静态模型列表)](/guides/providers/#bigmodel-coding-plan-over-responses) | `https://open.bigmodel.cn/api/v1` |
-| Qwen Cloud | Token plan（默认）: `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` · 按量付费: `https://dashscope.aliyuncs.com/compatible-mode/v1` · 或自定义 |
+| Qwen Cloud | Token plan（默认）: `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1` · 按量付费: `https://dashscope.aliyuncs.com/compatible-mode/v1` · 或自定义 |
 | 腾讯云 Coding Plan | `https://api.lkeap.cloud.tencent.com/coding/v3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` |
 | 火山方舟 · Coding Plan · Agent Plan | `https://ark.cn-beijing.volces.com/api/v3` · `https://ark.cn-beijing.volces.com/api/coding/v3` · `https://ark.cn-beijing.volces.com/api/plan/v3` |
 | Xiaomi MiMo | `https://api.xiaomimimo.com/anthropic` |
 | Xiaomi MiMo (OpenAI Chat) | `https://api.xiaomimimo.com/v1` |
 | Kilo | `https://api.kilo.ai/api/gateway` |
+| OpenGateway | `https://apis.opengateway.ai/v1` |
 | GitLab Duo | `https://cloud.gitlab.com/ai/v1/proxy/openai/v1` |
 | Cloudflare AI Gateway | `https://gateway.ai.cloudflare.com/v1/{account-id}/{gateway}/anthropic` |
 | ……以及更多 | opencode zen、Vercel AI Gateway、Venice、NanoGPT、Synthetic、Qianfan、Alibaba、Parallel、ZenMux、LiteLLM |
 
-**OpenCode Zen**（`opencode-zen`）与免密钥的 **OpenCode Free** 预设共用
-`https://opencode.ai/zen/v1`。该网关上的免费模型常会触发约每分钟 15–20 次请求的短窗口限流（社区观测；OpenCode 未公布 RPM）。Zen 可能返回不带 `Retry-After` / `X-RateLimit-*` 的通用 429。这与免密钥桌面配额（`opencode-free` 上约每 5 小时 200 次 Big Pickle/免费模型请求）是分开的。当这类 429 省略 `Retry-After` 时，opencodex 会在客户端错误中补充说明并附带合成的 `Retry-After`；若上游已提供 `Retry-After`，则仍以它为准。同密钥等待重试仍可通过 [`retryOn429`](/zh-cn/reference/configuration/) 选择开启。
+**OpenGateway** 是 Sionic AI 运营的 OpenAI 兼容网关，base URL 为
+`https://apis.opengateway.ai/v1`。公开目录包含约 80 个活跃模型（2026-10-02 核实）。
+预设通过公开 `GET /v1/models` 自动刷新列表，仅保留活跃的 Chat Completions 模型（以及仅支持 Responses、并固定走 Responses 的 `openai/o3-pro`）。
+Sionic 提供的 `deepseek/deepseek-v4.1-flash-ultrafast` 和
+`z-ai/glm-5.3-flash-ultrafast` 排在最前。请在
+[OpenGateway 控制台](https://opengateway.ai/api-keys)创建密钥，再运行
+`ocx provider add opengateway` 或在控制台选择 **OpenGateway**。Chat 请求使用配置的
+Bearer 密钥；公开模型列表不能验证密钥有效性。
+在 Responses 协议中，OpenGateway 拒绝重放原生自定义工具调用，因此预设会在发送前将代码模式的 `exec` 等 Codex 自定义工具转换为函数工具。
+工具结果内容数组以文本发送，图像保留在配对的工具结果组之后。不支持的结果部分（包括拒绝和不透明内容）会在发送前以明确的客户端输入错误拒绝。
+图像细节 `original` 映射为网关接受的 `high`；图像字节保持不变。
+原生 Responses 路由还会在将纯文本空补全作为成功返回之前进行检查。
+输出预算耗尽时返回带 `max_output_tokens` 的 `incomplete`；代理不会增加请求的预算。仍有预算且可安全重放的空补全，可在现有发送上限内重试一次。显式设置 `emptyCompletionRetry: false` 或 `OCX_EMPTY_COMPLETION_RETRY=0` 可关闭该重试。出现文本、拒绝、工具活动或未知流事件时不会重放，并保留原始流。此保护不改变其他提供商及其重试默认值。
+重放要求显式 `store: false`、完整输入且仅含客户端执行的工具；声明了 `web_search` 等托管工具时，即使未观察到工具事件也不会自动重放。
 
-**免密钥的 `opencode-free` 层级目前对第三方客户端关闭。** Zen 会拒绝任何不带 `x-opencode-session` 头的请求，返回错误类型 `MissingSessionID` 和消息 "OpenCode's free tier can only be used in OpenCode"。这道关卡只检查该头是否存在，因此代理完全可以编一个值蒙混过去，但 opencodex 不这么做。伪造会话标识并附上带版本号的 `opencode/<version>` User-Agent，等于声称自己就是 OpenCode 客户端，而 OpenCode 并未公布这一免密钥层级的第三方集成约定；用这种方式换来的 HTTP 200 是绕过了准入检查，而不是获得了许可。因此 opencodex 选择如实报告限制：发往 `opencode-free` 的请求会返回一条解释上游关卡的错误。
+MiniMax 和 MiniMax (CN) 的提供商卡片也会在配置的密钥有有效 Coding Plan 时显示用量。
+仪表盘读取 5 小时窗口，以及套餐提供时的每周窗口；这些仅用于展示，不会改变模型路由。
 
-通往同一批模型的受支持路径，是使用 [opencode.ai/auth](https://opencode.ai/auth) 获取的 OpenCode Zen API 密钥、走带密钥的 **`opencode-zen`** 预设。若 OpenCode 之后公布了免密钥层级的第三方接入方式，opencodex 可以跟进；在此之前，这个预设的作用是记录该限制。上游条款：[opencode.ai/docs/zen](https://opencode.ai/docs/zen/)。
+**OpenCode Zen**（`opencode-zen`）使用 [opencode.ai/auth](https://opencode.ai/auth) 签发的 API 密钥访问 `https://opencode.ai/zen/v1`。免费模型可能触发每分钟约 15–20 次请求的短窗口限流（社区观测；OpenCode 未公布 RPM）。限流 429 缺少 `Retry-After` 时，opencodex 会添加说明和合成的 `Retry-After`；有效的上游头优先。同密钥重试仍须通过 [`retryOn429`](/zh-cn/reference/configuration/) 启用。
 
-大多数使用带 bearer 密钥的 `openai-chat` adapter；少数仅暴露 Anthropic 兼容端点的提供商（例如 **Xiaomi MiMo**）使用 `anthropic` adapter（`x-api-key`）。
+在规范 `opencode-zen` 提供商中，使用 API 密钥认证和官方路由 `https://opencode.ai/zen/v1` 或 `https://opencode.ai/inference/v1` 时，Gemini 会在默认 `googleMode: ai-studio` 下自动使用 Google 原生 API。Zen 模型 ID 保持不变，包括没有 `-tiered` 后缀的 Flash ID。Claude 使用 Anthropic Messages，不受 `googleMode` 影响。加载已保存的配置时，仅忽略这些原生模型符合条件的旧 Chat/Responses 覆盖设置，以及符合条件的 Responses 专用 `image_generation` 托管工具偏好。自定义提供商、非密钥认证路由及其他偏好保持不变。
+
+**已移除 `opencode-free` 支持。** OpenCode 的上游免费层级门槛导致所有模型均返回 `403 permission_denied`（[#7255](https://github.com/lidge-jun/opencodex/issues/7255)）。加载现有配置时，会在内存中禁用相关条目和依赖的模型引用，每个进程仅警告一次，加载时不修改文件。下次保存配置时，这些条目及引用将从 config.json 中移除。保存前，原始文件会自动保留到同目录的 `config.json.pre-opencode-free-removal.bak`；如果该名称已被占用，则使用唯一的同级文件名。字节完全相同的独立副本仅在能够验证其仅限所有者访问时才会复用，否则会在旁边写入新的受保护副本。已有文件不会覆盖。首次加载重叠时，可能留下多个相同的受保护副本。警告会显示恢复副本的路径。如需恢复（例如降级后），请将该副本复制回 config.json 并覆盖。如果自动复制失败，警告会提示立即复制 config.json。如果它原来是默认提供商，将改用标准 OpenAI OAuth 路径作为默认值。请使用 `opencode-go`、需要密钥的 `opencode-zen` 或其他提供商。[OpenCode Zen 条款](https://opencode.ai/docs/zen/)。 被动读取仅应用内存中的禁用，不创建副本或显示警告。
+
+保留正常的 Claude Desktop 分配和默认值。源模型允许列表变空的规则会被禁用；注入模型被移除时，原生子代理同步也会被禁用。后续保存配置时不会恢复已移除的引用，并会保留正常的并发编辑。
+
+大多数使用带 bearer 密钥的 `openai-chat` adapter；**Xiaomi MiMo**（`xiaomi`）等 Anthropic 兼容预设
+使用 `anthropic` adapter（`x-api-key`）。小米还提供 OpenAI Chat 预设 `xiaomi-mimo` 和 token plan 预设
+`mimo`。三个预设默认都使用 MiMo V2.6（`mimo-v2.6-pro`；`xiaomi-mimo` 使用 `mimo-v2.6-flash`）。
+小米将在 2026-10-21 停用 `mimo-v2.5` 和 `mimo-v2.5-pro`，且不会重定向；若已将 V2.5 保存为默认模型，
+请在此日期前手动切换，opencodex 不会替你改写配置。
 火山方舟 Coding Plan 和 Agent Plan 都通过 `openai-responses` adapter 使用原生 Responses 端点。在已验证的 Ark Coding Plan 工具调用 continuation 中，回放上一次 Responses 返回的 `reasoning` item 会触发 `400 InvalidParameter`，因此 Coding Plan 预设会在转发 continuation input 前移除这类 replayed reasoning item；这会丢失该轮的 reasoning 状态，可用 `dropResponsesReasoningItems: false` 关闭。已经保存为 `openai-chat` 的 Coding Plan 配置不会被改写，仍按 Chat 走；如需切换，请手动把 `adapter` 改为 `openai-responses` 并把 `responsesPath` 设为 `/responses`，或删除后重新添加该预设。显式的逐模型 `openai-chat` override 仍可使用。
 内置 DeepSeek preset 同样会让 `deepseek-v4-flash` 使用原生 Responses 端点，并保留上游 SSE
 流式输出。如果该模型已经完成全部输出项却缺少最终 Responses 事件，opencodex 会应用模型级
@@ -287,10 +357,17 @@ agent-tool 证据。Nscale service token 可在 [Nscale Console](https://console
 inference key 可从 [Vultr Console](https://my.vultr.com) 的订阅概览复制。
 
 **Command Code 发现：**该预设从固定的 Provider API 主机读取 Command Code 的
-`/provider/v1/models` 列表，保留含 `/` 的原生模型 id，并将实时发现限制为 256 KiB 和 256 条原始记录。
+`/provider/v1/models` 列表，保留提供商原生模型 id，并将实时发现限制为 256 KiB 和 256 条原始记录。
 `ocx login command-code` 支持通过浏览器进行 OAuth 登录（现有 Command Code CLI 用户还可选择从
 `~/.commandcode/auth.json` 导入本地 CLI 凭据）；模型目录按账户隔离，并在登录后从经过认证的发现
-端点获取。聊天请求使用已配置的 bearer 密钥。密钥可在 [Command Code Studio](https://commandcode.ai/studio/) 创建。
+端点获取。Provider API 预设（`commandcode`）使用当前配置的密钥：大多数模型 id 通过带 Bearer 头的
+Chat Completions 请求调用；`claude-*` 模型 id 则通过带 `x-api-key` 的 Anthropic Messages 请求调用，
+因为 Command Code 只在 `/provider/v1/messages` 上提供这些模型。若其他提供商复用 `commandcode` 名称
+但使用不同端点，它仍保持自己的请求协议。OAuth 预设（`command-code`）使用已保存的账户 bearer 令牌
+进行认证后的模型发现，并从 `/alpha/generate` 以 NDJSON 流式生成。若网关将 MiMo 工具调用标记作为文本
+回显，而实际工具调用已存在，则会移除重复标记。对于 MiMo 模型，只有在响应正常结束后，才会将没有
+对应原生调用的完整声明工具调用恢复为实际调用；中断或被过滤的轮次会保留文本形式的标记。
+Provider API 密钥可在 [Command Code Studio](https://commandcode.ai/studio/) 创建。
 
 **OrcaRouter 认证与模型发现：**可用 `ocx login orcarouter-oauth` 走浏览器一键授权，
 也可用 `ocx login orcarouter` 粘贴已有 API key。PKCE 流程会先监听本机回环端口，为每次登录
@@ -414,7 +491,7 @@ Bearer key。公开模型列表只保留同时报告 `model_type: chat` 和 `cha
 
 无需打开仪表盘，即可使用 `ocx account list`、`ocx account current` 和 `ocx account use` 查看或
 切换同一组 Codex、OAuth 和 API-key pool。完整命令、JSON 输出和新 session 生效规则请参阅
-[CLI 参考](/zh-cn/reference/cli/#ocx-account-subcommand)。
+[CLI 参考](/zh-cn/reference/cli/providers-accounts/#ocx-account-subcommand)。
 
 ### GPT-5.6 预览路径
 
@@ -426,6 +503,9 @@ GPT-5.6 Sol/Terra/Luna 会预置在提供商的回退列表中，因此即使实
 | Codex 登录（Pool 或 Direct） | `gpt-5.6-*` | 922,000 |
 | OpenAI (API key) | `openai-apikey/gpt-5.6-*` 和 `*-pro` | 922,000（max input 922,000） |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`、`openrouter/openai/gpt-5.6-terra`、`openrouter/openai/gpt-5.6-luna` | 922,000 |
+| Codex | `gpt-6.1-terra` | 500,000 / 872,000 |
+| OpenAI API | `openai-apikey/gpt-6.1-terra` | 1,050,000 (128,000 max output) |
+| OpenRouter | `openrouter/openai/gpt-6.1-terra` | 1,050,000 |
 | Cursor | `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna` | 1,000,000 |
 
 原生 GPT-5.6 条目保留固定的上游 reasoning 档位，例如 Luna 有 `max`，但没有 `ultra`。路由条目
@@ -443,8 +523,22 @@ GPT-5.6 Sol/Terra/Luna 会预置在提供商的回退列表中，因此即使实
 使用 Bearer **订阅令牌**（而非普通 API 密钥）进行认证。
 **Cloudflare AI Gateway** 需要将 account 和 gateway id 填入 URL。
 
-Copilot 提供混合 wire 目录：其模型（`gpt-5.3-codex`、`gpt-5.4`、
-`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）会拒绝面向
+Copilot 仅在非空账户目录的每个有效条目都明确禁止手动选择时自动使用 Auto。
+权限缺失或格式无效时保留具名路由；模型列表仅过滤明确禁止选择的条目。Auto-only 发现目录提供
+`github-copilot/auto`，实际模型由 GitHub 为每次请求选择，不会扩大订阅权限。
+Auto 的可见性也受普通模型白名单、待确认/禁用状态和新模型策略约束；若保存的选择或策略隐藏了
+Auto，请先选择或启用该条目。已有手动模型偏好保持保存。仅将模型命名为 `auto` 不会覆盖账户权限判断。
+
+Auto 使用公开的
+[VS Code Copilot Chat 实现](https://github.com/microsoft/vscode-copilot-chat/blob/7b70532a4cbdfa61c2b30fe4ccffda3d89336a4d/src/platform/endpoint/node/automodeService.ts)
+中的会话与意图选择协议。这是实验性客户端集成，尚无面向第三方的公开 API 契约；
+GitHub 可能改变协议或账户权限。Auto 每次请求使用选中模型声明的端点。意图路由仅发送最新用户文本，
+本地上限为 32,768 个 UTF-16 码元；实际推理保留完整输入。协商采用本地防御预算：目录/模型池/候选列表各最多
+512 项，每个成功响应最多 1 MiB，每次调用最多八秒（含排队节流与响应读取）。这些是 OpenCodex 防护，
+不是已公布的 GitHub 限制；过大的目录、缓慢的协商或意图文本截断都可能影响兼容性。
+
+具名选择时，Copilot 提供混合 wire 目录：其模型（`gpt-5.3-codex`、`gpt-5.4`、
+`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、 `gpt-6.1-sol`、 `gpt-6.1-terra`、 `gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）会拒绝面向
 agent 流量的 `/chat/completions`，因此 opencodex 默认将这些模型路由到 Responses API，而其他
 Copilot 模型仍走 chat completions。优先级为：硬 wire 固定 → 显式
 [`modelAdapters`](/zh-cn/reference/configuration/providers/) 条目 → 注册表默认值 → 提供商级
@@ -456,17 +550,18 @@ Cursor 作为单独的实验性 adapter 进行跟踪。`adapter: "cursor"` 会�
 Cursor access token 后，opencodex 会使用 Cursor live HTTP/2 transport。代理要求 Cursor 的
 HTTP/1.1 兼容路径时，可设置 `upstreamHttpVersion: "http1.1"`；该设置同时覆盖推理与实时模型发现，
 并可在 **Providers → Cursor → 设置 → Cursor 传输协议** 中选择。内置回退列表包含上下文为
-1M 的 `gpt-5.6-sol` / `terra` / `luna`、上下文为 500K 的 Grok 4.5/4.6 普通与 Fast 条目，以及上下文为
-262K 的 `kimi-k3`；最终显示哪些模型由账号的实时发现结果决定。Grok 4.6 的两种形式均提供
-`low` / `medium` / `high` / `xhigh`，而 4.5 最高为 `high`。Fast 请求会发送对应的 Grok 基础模型，
-并通过独立的 `effort` 与 `fast=true` `requested_model` 参数指定模式；扁平化的
-`cursor-grok-{version}-{effort}-fast` id 仅用于发现和 picker 标识。Cursor 只以带 effort 后缀的 wire id
+1M 的 `gpt-5.6-sol` / `terra` / `luna`、上下文为 500K 的 Grok 4.5/4.6/4.7 普通与 Fast 条目，以及上下文为
+262K 的 `kimi-k3`；最终显示哪些模型由账号的实时发现结果决定。Grok 4.6 和 4.7 的两种形式均提供
+`low` / `medium` / `high` / `xhigh`，而 4.5 最高为 `high`。Grok 4.5 和 4.6 的 Fast 请求会发送对应的基础模型，
+并通过独立的 `effort` 与 `fast=true` `requested_model` 参数指定模式；这两个版本的扁平化
+`cursor-grok-{version}-{effort}-fast` id 仅用于发现和 picker 标识。Grok 4.7 在列表中没有 `cursor-` 前缀，
+直接发送 `grok-4.7-{effort}-fast`。Cursor 只以带 effort 后缀的 wire id
 提供 Kimi K3，因此 `cursor/kimi-k3` 暴露 `low` / `high` / `max` 阶梯，默认值为 `max`，与该模型
 文档中的 API 默认值一致。Cursor 服务器直接发起的
 native read/write/delete/ls/grep/shell/fetch 执行默认禁用，因为它会绕过 Codex 的 approval 和
 sandbox 路径；只有在可信本地实验中，才应在 `~/.opencodex/config.json` 的 `providers.cursor`
 对象上设置 `unsafeAllowNativeLocalExec: true`，也可以在仪表盘的 **Providers → Cursor → Edit JSON**
-中设置。完整示例参见 [配置参考](/zh-cn/reference/configuration/#cursor-provider-adapter-cursor)。MCP、屏幕录制和 computer-use
+中设置。完整示例参见 [配置参考](/zh-cn/reference/configuration/providers/#cursor-提供者adapter-cursor)。MCP、屏幕录制和 computer-use
 通过 executor hook 暴露；没有配置本地 executor 时，opencodex 会返回 typed no-executor 结果。
 Cursor OAuth 和 live model discovery 已在这个实验性 adapter 中启用；Cursor 仍不会出现在 key-login
 列表中。

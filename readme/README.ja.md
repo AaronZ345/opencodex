@@ -1,6 +1,10 @@
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>OpenAI Codex、Claude Code、Claude Desktop、Grok Build のための汎用プロバイダープロキシ</b><br>
-コマンド 2 つで、そのすべてが好きな LLM で動きます。</p>
+<p align="center">
+  <img src="../assets/banner.png" alt="opencodex — Codex、Claude Code、Claude Desktop、Grok Build などのための一つのローカルゲートウェイ" width="100%">
+</p>
+
+<h3 align="center">AI コーディングツールとモデルをつなぐ、一つのローカルゲートウェイ。</h3>
+<p align="center"><b>Codex、Claude Code、Claude Desktop、Grok Build で好きなモデルを使い、<br>管理対象の設定で OpenCode、Pi、Qoder、WorkBuddy、Kilo、Cline、T3 Code などを接続できます。</b><br>
+<a href="https://opencodex.me/ja/reference/client-support/">対応ツールをすべて見る →</a></p>
 
 <p align="center">
   <a href="https://x.com/claudeebum"><img src="https://img.shields.io/badge/%40claudeebum-000000?logo=x&logoColor=white" alt="X で @claudeebum をフォロー"></a>
@@ -13,6 +17,13 @@
 npm install -g @bitkyc08/opencodex
 ocx start
 ```
+
+<p align="center">
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/macOS-.dmg-24292f?logo=apple&logoColor=white" alt="macOS 版をダウンロード (.dmg)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Windows-.msi-24292f?logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0zIDNoOC41djguNUgzem05LjUgMEgyMXY4LjVoLTguNXpNMyAxMi41aDguNVYyMUgzem05LjUgMEgyMVYyMWgtOC41eiIvPjwvc3ZnPg==" alt="Windows 版をダウンロード (.msi)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.AppImage-24292f?logo=linux&logoColor=white" alt="Linux 版をダウンロード (.AppImage)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.deb-24292f?logo=debian&logoColor=white" alt="Linux 版をダウンロード (.deb)"></a>
+</p>
 
 <table>
 <tr>
@@ -69,16 +80,11 @@ Sol がセッションを進め、Kimi K3 のサブエージェントを呼び�
   <a href="../README.md">English</a> · <a href="README.fr.md">Français</a> · <a href="README.ko.md">한국어</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ru.md">Русский</a> · <b>日本語</b> · <a href="README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/ja/"><b>完全なドキュメント →</b></a>
 </p>
 
-opencodex は、Codex の Responses API をプロバイダーが話すプロトコルへ変換する軽量なローカルプロキシ
-です。ストリーミング、ツール呼び出し、reasoning トークン、画像を双方向で扱います。Claude、Gemini、
-Grok、GLM、DeepSeek、Kimi、Qwen、Ollama をはじめとするどの LLM でも、Codex、Claude Code、Claude
-Desktop、Grok Build から使えます。Codex 認証用の **ChatGPT アカウントプール**も管理できます。アカウント
-を追加し、ダッシュボードでクォータを更新すれば、新しいセッションは使用量が最も少ない健全なアカウント
-へ自動的に振り分けられ、既存のスレッドは開始したアカウントに固定されたままになります。
+opencodex は、コーディングツールとモデルプロバイダーをつなぐ軽量なローカルゲートウェイです。Responses、Chat Completions、Anthropic Messages API のリクエストを受け取り、プロバイダーのプロトコルに変換します。クライアント、モデル、プロバイダーが対応する場合は、ストリーミング、ツール呼び出し、推論、画像を中継します。Claude、Gemini、Grok、GLM、DeepSeek、Kimi、Qwen、Ollama などのプロバイダーを、Codex、Claude Code、Claude Desktop、Grok Build や[クライアント対応ページ](https://opencodex.me/ja/reference/client-support/)に記載のツールで使えます。Codex 認証用の **ChatGPT アカウントプール**も管理できます。アカウントを追加し、ダッシュボードでクォータを更新すると、新規セッションは使用量が最も少ない正常なアカウントに自動振り分けされ、既存のスレッドは開始時のアカウントに固定されます。
 
 ## クイックスタート
 
-### 個人向けインストール
+### 個人向けインストール（CLI）
 
 ```bash
 npm install -g @bitkyc08/opencodex   # Node 18 以上。Bun ランタイムは自動で同梱されます
@@ -90,14 +96,57 @@ ocx start                         # プロキシとダッシュボードが loca
 **http://localhost:10100** を開き、Web ダッシュボードですべて設定します。プロバイダーの追加（40 以上の
 組み込み、または任意の OpenAI 互換エンドポイント）、モデルの選択、アカウントの管理はここで行います。
 `ocx gui` でいつでもダッシュボードを開き直せます。
-Codex 認証用の **ChatGPT アカウントプール**も管理できます。ChatGPT / Codex のアカウントを複数追加し、
-5 時間 / 週間 / 30 日のクォータをダッシュボードで更新します。クォータルーティングでは、新しいセッション
-が使用量の最も少ない健全なアカウントを使えます。ラウンドロビンと fill-first はそれぞれの方針に従います。
-既存の Codex スレッドは通常、開始したアカウントとの affinity を保つので、長い SSH・tmux・モバイル接続
-のセッションが会話の途中でアカウントを乗り換えることはありません。ただしクォータの再評価、failover、
-アカウントの除外、affinity の失効、401/403 や 429 からの復帰では再バインドされることがあります。ふだん
-は使わず他が尽きたときだけ回したいアカウント（多くは Codex Desktop のログイン）があるなら、アカウント
-に選択順を指定してください。
+
+### ツールを接続する
+
+いま使っているツールを接続します。
+
+| ツール | 接続方法 |
+|---|---|
+| Codex | ダッシュボードの **Connect** ページで Codex スイッチをオンにし、通常どおり `codex` を実行します。ローカルリスナーでは Codex の組み込みプロバイダーがプロキシを指すようになります。ターミナルからは、ダッシュボードでプロバイダーを追加する前に `ocx init` を実行し、Codex の確認に同意します。 |
+| Claude Code | `claude` CLI をインストールした状態で `ocx claude` を実行します。必要に応じてプロキシを起動し、そこを経由して Claude Code を起動します。 |
+| Claude Desktop | `ocx claude desktop` を実行します。新規インストールではアプリ全体にゲートウェイプロファイルを設定します。既存の first-party 設定は維持され、`ocx claude desktop apply --gateway` で明示的に切り替えられます。[Claude Code ガイド](https://opencodex.me/ja/guides/claude-code/)を参照してください。 切り替えた後は Claude Desktop を完全に終了してから開き直してください。 |
+| Grok Build | ローカルリスナーで Grok 連携が有効かつ `~/.grok` が存在する場合、`ocx start` がモデルを登録します。Grok Build で `ocx-*` モデルを選択してください。リモート設定は [Grok Build ガイド](https://opencodex.me/ja/guides/grok-build/)を参照してください。プロバイダーを追加した後は、プロキシを再起動する（または Codex 自動起動が有効なら `ocx ensure` を実行する）と一覧を更新できます。 |
+| 管理対象の統合があるツール | ダッシュボードの **Connect** ページか `ocx integration client enable --client <id>` を使います。 |
+| その他のツール | カスタムの OpenAI 互換ベース URL に `http://localhost:10100/v1` を、または Anthropic ベース URL に `http://localhost:10100` を設定します。 |
+
+各ツールの接続方法と対応プロトコルは[クライアント対応ページ](https://opencodex.me/ja/reference/client-support/)に記載しています。
+
+<details>
+<summary><b>デスクトップアプリ（ベータ版）</b></summary>
+
+デスクトップアプリは、同じプロキシとダッシュボードをネイティブウィンドウに収め、トレイと同梱の `ocx` を備えたものです。
+すでに起動しているプロキシに接続するか、同梱のプロキシを起動します。ダッシュボードはプロキシの
+ポートで開きます（別のポートを設定していなければ **http://localhost:10100**）。
+[最新リリース](https://github.com/lidge-jun/opencodex/releases/latest)から、お使いのプラットフォーム向けのファイルを選んでください。
+
+| プラットフォーム | ファイル | 備考 |
+|---|---|---|
+| macOS 13 以降（Apple Silicon と Intel） | `OpenCodex-<version>-macos.dmg` | ユニバーサルビルド。Developer ID で署名・公証済み |
+| Windows（x64） | `OpenCodex-<version>-windows-x64.msi` | SignPath Foundation によるコード署名を導入中（[コード署名ポリシー](https://opencodex.me/ja/reference/code-signing/)）。署名前のリリースでは SmartScreen が一度だけ確認するので、**詳細情報 → 実行**を選択 |
+| Linux（x86_64） | `OpenCodex-<version>-linux-x86_64.AppImage` または `-linux-amd64.deb` | トレイには AppIndicator 対応のデスクトップが必要 |
+
+リリースページでは各ファイルの横に `.sha256` があります。macOS 14 以降では、プロキシの状態、
+今日の使用量、プロバイダーのクォータを表示する WidgetKit 拡張も付属します。表示に使う
+スナップショットモデルは [`app/`](../app)（`MenuBarCore`）にあります。アプリを自分でビルドするには、
+リポジトリのルートで `bun install && bun run build:gui` を実行し、
+`desktop/` で macOS なら `bun install && bun run prepare-sidecar && bun run prepare-widget && bun run build:local`、Windows と Linux なら `bun install && bun run prepare-sidecar && bun run build:local` を実行します（ウィジェットの手順は macOS 専用です）。
+[デスクトップアプリガイド](https://opencodex.me/ja/guides/desktop-app/)と
+[macOS メニューバーアプリガイド](https://opencodex.me/ja/guides/macos-menu-bar/)で初回起動について説明しています。
+[`AGENTS_INSTALL.md`](../AGENTS_INSTALL.md#where-things-are-installed) にはディスクに書き込まれるすべてのものをまとめています。
+
+</details>
+
+### ChatGPT アカウントプール
+
+opencodex では、Codex 認証用の **ChatGPT アカウントプール**も管理できます。ChatGPT / Codex のアカウントを
+複数追加し、5 時間 / 週間 / 30 日のクォータをダッシュボードで更新します。クォータルーティングでは、新しい
+セッションが使用量の最も少ない健全なアカウントを使えます。ラウンドロビンと fill-first はそれぞれの方針に
+従います。既存の Codex スレッドは通常、開始したアカウントとの affinity を保つので、長い SSH・tmux・
+モバイル接続のセッションが会話の途中でアカウントを乗り換えることはありません。ただしクォータの再評価、
+failover、アカウントの除外、affinity の失効、401/403 や 429 からの復帰では再バインドされることがあります。
+ふだんは使わず他が尽きたときだけ回したいアカウント（多くは Codex Desktop のログイン）があるなら、
+アカウントに選択順を指定してください。
 
 ### スポンサー
 
@@ -114,8 +163,8 @@ Codex 認証用の **ChatGPT アカウントプール**も管理できます。C
 <td>このプロジェクトを支援してくださる <a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme">OrcaRouter</a> に感謝します。OrcaRouter は本番の AI 向けに作られた OpenAI 互換の AI ゲートウェイです。すべてのプロンプトを採点して基準を満たすモデルへ送る適応型ルーティング、自動 failover、コードとして書けるルーティングルール、プロンプトキャッシュ付きのマークアップなしプロバイダー価格、そして 200 以上のモデルへのすべての呼び出しに付くガードレール・エージェントファイアウォール・リクエストログを備えています。Add provider ピッカーで <code>OrcaRouter</code> を選ぶか <code>ocx provider add orcarouter</code> を実行してください。適応型ルーターは <code>orcarouter/auto</code> です。</td>
 </tr>
 <tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="../assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
-<td>このプロジェクトを支援してくださる <a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a> に感謝します。PackyCode は安定した高性能の API リレープロバイダーで、Claude Code、Codex、Gemini などのリレーを提供しています。自動 failover、スマートルーティング、無制限の同時実行によって、AI を実際の生産性ツールに変えます。<a href="https://www.packyapi.com/register?aff=k5KT">このリンクから登録</a>してすぐに始めてください。Add provider ピッカーで <code>PackyCode</code> を選ぶか <code>ocx provider add packycode</code> を実行してください。<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
+<td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/sponsors/tokenlab-dark.png"><img src="../assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
+<td>このプロジェクトを支援してくださる <a href="https://tokenlab.sh/r/OPENCODEX">TokenLab</a> に感謝します。TokenLab はコーディングエージェントに主要モデル向けの API キーを 1 つだけ提供し、OpenAI Responses と Chat Completions、Anthropic Messages、Gemini ネイティブ API の各形式に、ストリーミングとツール呼び出し込みで対応しています。MCP サーバーとエージェント Skills も用意されており、簡単に組み込めます。配信モードを選び、使った分だけ支払えます。Add provider ピッカーで <code>TokenLab</code> を選ぶか <code>ocx provider add tokenlab</code> を実行してください。<br><sub>TokenLab 为编程智能体提供统一的多模型 API，一枚 API Key 即可接入主流模型，支持 OpenAI Responses、Chat Completions、Anthropic Messages 和 Gemini 原生 API 格式，以及流式输出和工具调用。同时提供 MCP 服务器和 Agent Skills，方便接入现有工作流；交付模式可选，按量付费。</sub></td>
 </tr>
 </tbody>
 </table>
@@ -182,8 +231,9 @@ services:
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex && ~/.bun/bin/bun install
+~/.bun/bin/bun run build:gui
 ~/.bun/bin/bun run src/cli/index.ts start
 ```
 
@@ -191,8 +241,9 @@ cd opencodex && ~/.bun/bin/bun install
 
 ```powershell
 irm bun.sh/install.ps1 | iex
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex; bun install
+bun run build:gui
 bun run src/cli/index.ts start
 ```
 
@@ -224,13 +275,13 @@ ocx init      # 対話式セットアップ: ~/.opencodex/config.json を書き�
 
 ## 対応プラットフォーム
 
-| OS | 状態 | サービスマネージャー |
-|---|---|---|
-| macOS (arm64 / x64) | 完全対応 | launchd |
-| Linux (x64 / arm64) | 完全対応 | systemd (user unit) |
-| Windows (x64) | 完全対応 | タスクスケジューラ（非表示）/ 任意のネイティブサービス（`--native`、WinSW） |
+| OS | 状態 | サービスマネージャー | デスクトップアプリ（ベータ版） |
+|---|---|---|---|
+| macOS (arm64 / x64) | 完全対応 | launchd | ユニバーサル `.dmg` |
+| Linux (x64 / arm64) | 完全対応 | systemd (user unit) | x86_64 `.AppImage` / `.deb` |
+| Windows (x64) | 完全対応 | タスクスケジューラ（非表示）/ 任意のネイティブサービス（`--native`、WinSW） | x64 `.msi` |
 
-[Node](https://nodejs.org) 18 以上が必要です。Bun ランタイムは `npm install` で同梱されるので、Bun を
+CLI インストールには [Node](https://nodejs.org) 18 以上が必要です。デスクトップアプリには Node も Bun も不要です。Bun ランタイムは `npm install` で同梱されるので、Bun を
 別途入れる必要も、Windows で WSL を使う必要もありません。npm が同梱ランタイムのインストールスクリプト
 をブロックした場合は[インストールドキュメント](https://opencodex.me/ja/getting-started/installation/)を
 参照してください。
@@ -268,14 +319,15 @@ ocx init      # 対話式セットアップ: ~/.opencodex/config.json を書き�
 <details>
 <summary>メモリ所有権の詳細</summary>
 
-OpenCodex はプロセスが保持する状態を 36 種類に分けて追跡し、それぞれに文書化された上限があります:
+OpenCodex はプロセスが保持する状態を以下のカテゴリで追跡し、それぞれに文書化された上限があります:
 
-- **保持ストア 12 個**（リクエストログ、デバッグリング、画像キャッシュ、モデルキャッシュ、ビジョンの
+- **保持ストア 14 個**（リクエストログ、デバッグリング、画像キャッシュ、モデルキャッシュ、ビジョンの
   説明、カーソル blob、responses の継続など）はバイト単位で集計され、アプリが持つメモリ予算
-  （既定 256 MiB）によって退避されます。
+  （既定 256 MiB）によって退避されます。ただしネイティブ制御のリプレイ用ストアは固定され、
+  退避されません。
 - **観測バッファ 4 個**（トランスレーターのアキュムレーター、画像・OAuth・Grok の tail）は処理中の
   バイト圧力を監視するだけで、退避はしません。
-- **state-store の登録 24 個**が期限切れの掃除（60 秒間隔）と config 世代の reconciliation を担い、
+- **state-store の登録 31 個**が期限切れの掃除（60 秒間隔）と config 世代の reconciliation を担い、
   古いプロバイダー／アカウントのキーを取り除きます。
 - **パスとフィンガープリントのメモ**（ワークスペースのメタデータ、hardened identity、インストール
   salt、mode-hint の capability）は挿入順の LRU 上限（8〜128 件）を使います。
@@ -304,12 +356,30 @@ codex -m "ollama/llama3" "この関数をリファクタリングして"
 のままの完全形も引き続き使えます。詳細は
 [モデルルーティングのドキュメント](https://opencodex.me/ja/guides/model-routing/)を参照してください。
 
+### JEV Auto ルーティング（任意）
+
+TypeSafe JEV は、明示的に有効にした Combo の最初のモデルと推論エフォートを選べます。通常のモデル
+ピッカーと直接ルートは変わりません。認証情報は `ocx login jev`、**Providers → TypeSafe JEV → Add API key**、
+または `TYPESAFE_API_KEY`/`JEV_API_KEY` で追加します。次に **Models → Combos → Create JEV Auto** を開き、
+許可するターゲットモデルを選んで、ターゲットごとに JEV が選べるエフォートをチェックします。
+エフォート設定に触れていないターゲットは、そのモデルが現在公開しているすべてのエフォートを許可します。
+
+JEV は `jev-auto` でのみ、論理的なモデル呼び出しごとに一度だけ使われます。認証情報がない場合、
+ネットワーク障害、または不正な判定のときは、現在利用可能な最初のターゲットへフェイルオープンします。
+呼び出し元のキャンセルは引き続きリクエストをキャンセルします。自動テストは TypeSafe のモック
+エンドポイントを使い、実際の JEV アカウントは検証しません。
+
+JEV Combo は、キー不要の Ollama `tev1` のようなセルフホストの判断モデルを代わりに使うこともできます。
+`baseUrl` が完全な `/v1/systemone` エンドポイントである `jev-decision` プロバイダーを追加し、Combo の
+`decisionProvider` に指定します。TypeSafe の認証情報がそこへ送られることはありません。詳しくは
+[セルフホストの判断モデル](https://opencodex.me/ja/guides/combos/)を参照してください。
+
 ## プロバイダーとアダプター
 
 <!-- sponsors:main-first-mention -->
 OpenAI（ChatGPT ログインまたは API キー）、Anthropic、Google Gemini、xAI、Kimi、Azure OpenAI、Ollama
 （ローカル + Cloud）、Cursor（実験的）、そしてあらゆる OpenAI 互換エンドポイント。さらに DeepSeek、
-Groq、OpenRouter、Together、Fireworks、Cerebras、Mistral、Hugging Face、NVIDIA NIM、MiniMax、
+Groq、OpenRouter、OpenGateway、Together、Fireworks、Cerebras、Mistral、Hugging Face、NVIDIA NIM、MiniMax、
 Qwen Cloud、Qoder Global と CN（公式 PAT + CLI）、SiliconFlow などがあります。全一覧は `ocx init` か
 [プロバイダーのドキュメント](https://opencodex.me/ja/guides/providers/)で確認できます。
 
@@ -396,8 +466,8 @@ opencodex は既定で `127.0.0.1` にバインドし、追加の認証を必要
 
 ## 開発
 
-ソース開発には `PATH` に `bun` CLI が必要です。これは公開 npm パッケージが同梱する Bun ランタイム
-とは別物で、同梱ランタイムはインストール済みの `ocx` コマンドだけが使います。
+ソース開発には `PATH` に `bun` CLI が必要です。公開 npm パッケージはインストール済みの `ocx`
+コマンド用に Bun ランタイムを同梱し、パッケージのスクリプトもこの同梱依存関係から Bun を解決することがあります。
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
@@ -411,6 +481,16 @@ bun run test
 
 メンテナーが代わりに取り込んだり作り直したりして入ったものの、コミットに原作者が記されていない
 コントリビューターの作業は **[CREDITS.md](../CREDITS.md)** に記録しています。
+
+## コード署名ポリシー (Code signing policy)
+
+Windows 向けバイナリは Authenticode 署名へ移行中です（[#7207](https://github.com/lidge-jun/opencodex/issues/7207)）。移行状況、署名の確認方法、ポリシー全文は [Windows コード署名ガイド](https://opencodex.me/ja/reference/code-signing/) を参照してください。
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [lidge-jun](https://github.com/lidge-jun)
+- Approvers: [lidge-jun](https://github.com/lidge-jun)
+- Privacy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## 免責事項
 

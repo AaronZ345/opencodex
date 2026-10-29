@@ -2,7 +2,7 @@
 import type { ExportModel, ExportContext, ManagedContribution } from "./contracts";
 import type { OcxConfig } from "../../types";
 import { providerCodexAccountMode } from "../../providers/registry";
-import { normalizeExportModels, authoritativeContextWindow, exportModelLabel, singleFragment } from "./model-metadata";
+import { normalizeExportModels, authoritativeContextWindow, exportModelLabel, knownOutputBudget, singleFragment } from "./model-metadata";
 import { OPENCODE_PROVIDER_ID } from "./constants";
 
 
@@ -26,6 +26,11 @@ export interface DshModelEntry {
   name: string;
   input: string[];
   contextWindow?: number;
+  /**
+   * Output ceiling DSH should treat as the model's real `max_tokens`. DSH falls back to its
+   * own 32768 default when this is absent, so a limit it does not know stays undeclared.
+   */
+  maxTokens?: number;
   reasoningEfforts?: Partial<Record<DshReasoningEffort, DshWireReasoningEffort>>;
 }
 
@@ -97,12 +102,14 @@ export function buildDshClientConfig(ctx: ExportContext): DshGeneratedConfig {
     const input = dshInputModalities(model.inputModalities);
     if (input === null) continue;
     const contextWindow = authoritativeContextWindow(model.contextWindow);
+    const maxTokens = contextWindow === undefined ? undefined : knownOutputBudget(contextWindow, model);
     const reasoningEfforts = dshReasoningEfforts(model);
     models.push({
       id: model.namespaced,
       name: exportModelLabel(model),
       input,
       ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...(reasoningEfforts ? { reasoningEfforts } : {}),
     });
   }
@@ -129,4 +136,25 @@ export function summarizeDsh(document: unknown): { modelCount: number; modelsWit
 export function buildDshContribution(ctx: ExportContext): ManagedContribution {
   const doc = buildDshClientConfig(ctx);
   return singleFragment("dsh", ["llm-pi-ai", "providers", OPENCODE_PROVIDER_ID], doc["llm-pi-ai"].providers[OPENCODE_PROVIDER_ID]);
+}
+
+/**
+ * Where DSH 0.1.7+ reads provider routes: the `llm-pi-ai` row of a profile
+ * patch, a top-level YAML list of loader rows. `$DSH_HOME/settings.yaml` is
+ * imported into the first profile that boots and renamed, so a write there
+ * reaches DSH once at most. The Desktop app runs the `desktop` profile and
+ * owns it alone, and DSH hot reloads that file when it changes.
+ */
+export const DSH_DESKTOP_PROFILE = "desktop";
+export const DSH_PROFILE_PROVIDER_PATH = ["[id=llm-pi-ai]", "config", "providers", OPENCODE_PROVIDER_ID] as const;
+
+/** A profile patch DSH itself would load: a list whose every row is a mapping. */
+export function dshProfilePatchEstablished(parsed: unknown): boolean {
+  return Array.isArray(parsed)
+    && parsed.every(row => typeof row === "object" && row !== null && !Array.isArray(row));
+}
+
+export function buildDshProfilePatchContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildDshClientConfig(ctx);
+  return singleFragment("dsh", DSH_PROFILE_PROVIDER_PATH, doc["llm-pi-ai"].providers[OPENCODE_PROVIDER_ID]);
 }

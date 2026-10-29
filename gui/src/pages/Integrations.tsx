@@ -1,22 +1,30 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { navigateHash, normalizeHashPath } from "../hash-routing";
+import { navigateHash } from "../hash-routing";
+import { canonicalHashPath } from "../app-routing";
 import { useT } from "../i18n/shared";
 import ClientMark from "../components/ClientMark";
 import { INTEGRATION_MARKS } from "../components/integration-marks";
 import ApiKeys from "./ApiKeys";
 import Claude from "./Claude";
+import ClaudeDesktop from "./ClaudeDesktop";
 import Grok from "./Grok";
 import CursorIntegrationPage from "./integrations/CursorIntegrationPage";
 import IntegrationsOverview from "./integrations/IntegrationsOverview";
 import AsideProfilesPage from "./integrations/AsideProfilesPage";
+import HermesProfilesPage from "./integrations/HermesProfilesPage";
+import LazyCodexRoleModels from "./integrations/LazyCodexRoleModels";
 import FileIntegrationPage, {
   type FileIntegrationClientId,
 } from "./integrations/FileIntegrationPage";
 import { FILE_CLIENTS, TABS, type IntegrationTab } from "./integrations/integration-tabs";
 
 function readIntegrationTab(hash = window.location.hash): IntegrationTab {
-  const raw = normalizeHashPath(hash);
-  if (raw === "integrations/claude/desktop") return "claude";
+  // Read the destination, not a legacy spelling the route hook is about to replace.
+  const raw = canonicalHashPath(hash);
+  // Claude Desktop keeps #claude/desktop; the rest of #claude/* is the Claude tab, whose
+  // sub-tab is Claude's own business.
+  if (raw === "claude/desktop") return "claudeDesktop";
+  if (raw === "claude" || raw.startsWith("claude/")) return "claude";
   const match = TABS.find(tab => tab.hash === raw);
   return match?.id ?? "overview";
 }
@@ -129,7 +137,7 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
   return (
     <section className="integrations-page">
       <div className="page-head">
-        <h2>{t("nav.integrations")}</h2>
+        <h2>{t("nav.connect")}</h2>
       </div>
       <p className="page-sub">{t("integrations.subtitle")}</p>
       {connected && (
@@ -158,7 +166,7 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
             onClick={() => selectTab(definition.id, true)}
             onKeyDown={handleTabKeyDown}
           >
-            {tabMark(definition.id) && (
+            {definition.id !== "overview" && definition.id !== "keys" && (
               <ClientMark src={tabMark(definition.id)} label={t(definition.labelKey)} size={14} />
             )}
             {t(definition.labelKey)}
@@ -194,16 +202,25 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
                 </button>
               </section>
             )}
-            {definition.id === "claude" && <Claude apiBase={apiBase} active={active} />}
             {definition.id === "grok" && <Grok apiBase={apiBase} active={active} />}
+            {definition.id === "claude" && <Claude apiBase={apiBase} active={active} embedded />}
+            {definition.id === "claudeDesktop" && (
+              // claude-page scopes Desktop's status-bar styles; embedded drops the page head.
+              <div className="claude-page claude-page--embedded">
+                <ClaudeDesktop key={apiBase} apiBase={apiBase} active={active} />
+              </div>
+            )}
             {definition.id === "cursor" && <CursorIntegrationPage apiBase={apiBase} active={active} />}
             {FILE_CLIENTS.has(definition.id as FileIntegrationClientId) && (
-              definition.id === "aside" ? <AsideProfilesPage apiBase={apiBase} active={active} /> : <FileIntegrationPage
+              definition.id === "aside" ? <AsideProfilesPage apiBase={apiBase} active={active} />
+              : definition.id === "hermes" ? <HermesProfilesPage apiBase={apiBase} active={active} /> : <FileIntegrationPage
                 apiBase={apiBase}
                 client={definition.id as FileIntegrationClientId}
                 active={active}
               />
             )}
+            {/* Shown only when LazyCodex is detected, so a Pi-based omo install sees nothing new here. */}
+            {definition.id === "omo" && <LazyCodexRoleModels apiBase={apiBase} active={active} />}
           </div>
         );
       })}

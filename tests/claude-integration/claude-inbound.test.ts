@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { AnthropicRequestError as LeafAnthropicRequestError } from "../../src/claude/inbound-records";
 import { repoPath } from "../helpers/repo-root";
 import { AnthropicRequestError, anthropicToResponsesBody, anthropicToResponsesTranslation, effortForThinkingBudget, extractOcxEffortDirective, resolveInboundModel } from "../../src/claude/inbound";
 import { parseRequest } from "../../src/responses/parser";
+import { inlineDocumentMarker } from "../../src/responses/inline-document";
 import { responsesRequestSchema } from "../../src/responses/schema";
 import { createResponsesPassthroughAdapter } from "../../src/adapters/openai-responses";
+import { satisfiesOpenAiStrictSchema } from "../../src/adapters/anthropic-output-schema";
 import { withTestTranslatorBudget } from "../helpers/translator-budget";
 import type { OcxProviderConfig } from "../../src/types";
 
@@ -93,7 +96,7 @@ describe("claude inbound translation", () => {
     expect(body.stream).toBe(true);
     expect(body.parallel_tool_calls).toBe(false);
     expect(body.tool_choice).toBe("auto");
-    expect(body.reasoning).toEqual({ summary: "auto", effort: "medium" });
+    expect(body.reasoning).toEqual({ summary: "auto", effort: "medium", enabled: true });
 
     const tools = body.tools as Record<string, any>[];
     expect(tools).toHaveLength(2);
@@ -180,7 +183,7 @@ describe("claude inbound translation", () => {
             { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content }] },
           ],
       });
-      const marker = [{ type: "input_text", text: "[document: report.pdf]" }];
+      const marker = [{ type: "input_text", text: inlineDocumentMarker("report.pdf") }];
       expect(body.input).toEqual(carrier === "user"
         ? [{ type: "message", role: "user", content: marker }]
         : [
@@ -209,10 +212,13 @@ describe("claude inbound translation", () => {
 
   test("thinking variants", () => {
     const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const enabled = parseRequest(anthropicToResponsesBody({ ...base, thinking: { type: "enabled" } }));
+    expect(enabled.options.thinkingEnabled).toBe(true);
+    expect(enabled.options.reasoning).toBeUndefined();
     expect((anthropicToResponsesBody({ ...base, thinking: { type: "adaptive" } }) as any).reasoning).toEqual({ summary: "auto" });
     // "disabled" and omitted must NOT collapse to the same state: for a model that thinks by
     // default, omission means thinking is ON and shares the caller's max_tokens (#545).
-    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none" }); // justified: sibling assertions in this test use the same cast
+    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none", enabled: false }); // justified: sibling assertions in this test use the same cast
     expect((anthropicToResponsesBody(base) as any).reasoning).toBeUndefined();
     expect(effortForThinkingBudget(1024)).toBe("low");
     expect(effortForThinkingBudget(8192)).toBe("medium");
@@ -227,7 +233,7 @@ describe("claude inbound translation", () => {
       ...base,
       thinking: { type: "adaptive", display: "omitted" },
       output_config: { effort: "high" },
-    }))).toEqual({ summary: "auto", effort: "high" });
+    }))).toEqual({ summary: "none", effort: "high" });
     // effort passes through the whole known ladder
     for (const effort of ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
       expect(reasoningOf(anthropicToResponsesBody({
@@ -243,14 +249,14 @@ describe("claude inbound translation", () => {
       ...base,
       thinking: { type: "enabled", budget_tokens: 1024 },
       output_config: { effort: "xhigh" },
-    }))).toEqual({ summary: "auto", effort: "xhigh" });
+    }))).toEqual({ summary: "auto", effort: "xhigh", enabled: true });
     // disabled thinking suppresses effort entirely (subagent wire, claude-code#65863).
     // Still suppressed — "high" never reaches the wire — but now stated explicitly as the
     // "none" disable sentinel instead of by absence, so a default-on model is told to stop
     // rather than left to think anyway (#545).
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "disabled" }, output_config: { effort: "high" },
-    }))).toEqual({ effort: "none" });
+    }))).toEqual({ effort: "none", enabled: false });
     // unknown effort strings are dropped so downstream defaults win
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "adaptive" }, output_config: { effort: "turbo" },
@@ -271,8 +277,111 @@ describe("claude inbound translation", () => {
       output_config: { format: { type: "json_schema", schema } },
     });
 
-    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema } });
-    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema });
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema, strict: true } });
+    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema, strict: true });
+  });
+
+  test("an optional property drops the strict claim instead of rewriting required", () => {
+    const optional = {
+      type: "object",
+      properties: { answer: { type: "string" }, note: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: optional } },
+    });
+
+    // OpenAI strict mode 400s on a schema whose `required` omits any property; Anthropic allows
+    // it. Say strict: false rather than leave the destination's default to decide -- and leave
+    // `required` exactly as the caller wrote it.
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: optional, strict: false } });
+    expect((body.text as { format: { schema: { required: string[] } } }).format.schema.required).toEqual(["answer"]);
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("strict schema property membership does not repeatedly scan required", () => {
+    const required = ["answer"];
+    for (const name of ["includes", "indexOf", "lastIndexOf"] as const) {
+      Object.defineProperty(required, name, {
+        value: () => { throw new Error(`linear membership scan via ${name}`); },
+      });
+    }
+
+    expect(satisfiesOpenAiStrictSchema({
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required,
+      additionalProperties: false,
+    })).toBe(true);
+  });
+
+  test("an open object drops the strict claim even when every property is required", () => {
+    // `isAnthropicOutputSchema` normalizes a CLONE, so an object that never stated
+    // `additionalProperties: false` is forwarded verbatim and refused by strict mode however
+    // complete its `required` is.
+    const open = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: open } },
+    });
+
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: open, strict: false } });
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("allOf drops the strict claim; strict Structured Outputs does not support it", () => {
+    const composed = {
+      type: "object",
+      properties: {
+        answer: { allOf: [{ type: "string" }, { type: "string", minLength: 1 }] },
+      },
+      required: ["answer"],
+      additionalProperties: false,
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: composed } },
+    });
+
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: composed, strict: false } });
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("an object with no required array drops the strict claim", () => {
+    // Strict mode requires `required` to be supplied, even for an empty property map.
+    const bare = { type: "object", properties: {}, additionalProperties: false };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: bare } },
+    });
+
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("a root union drops the strict claim; strict mode needs an object root", () => {
+    const union = { anyOf: [{ type: "object", properties: {}, required: [], additionalProperties: false }] };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: union } },
+    });
+
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
   });
 
   test("structured output rejects unsupported schemas and preserves root references", () => {
@@ -298,7 +407,7 @@ describe("claude inbound translation", () => {
 
     expect(invalid.text).toBeUndefined();
     expect(referenced.text).toEqual({
-      format: { type: "json_schema", name: "response", schema: refSchema },
+      format: { type: "json_schema", name: "response", schema: refSchema, strict: false },
     });
   });
 
@@ -322,7 +431,7 @@ describe("claude inbound translation", () => {
 
     expect(body.tools).toEqual([{ type: "web_search" }]);
     expect(body.tool_choice).toEqual({ type: "web_search" });
-    expect(body.reasoning).toEqual({ effort: "none" });
+    expect(body.reasoning).toEqual({ effort: "none", enabled: false });
     expect(() => responsesRequestSchema.parse(body)).not.toThrow();
     expect(() => parseRequest(body)).not.toThrow();
   });
@@ -437,11 +546,11 @@ describe("claude inbound translation", () => {
     }) as any;
     expect(body.input[1].output).toEqual([
       { type: "input_text", text: "3 pages" },
-      { type: "input_text", text: "[document: report.pdf]" },
+      { type: "input_text", text: inlineDocumentMarker("report.pdf") },
     ]);
     // An untitled document still leaves a marker rather than the empty output that
     // read as "the tool returned nothing".
-    expect(body.input[3].output).toEqual([{ type: "input_text", text: "[document]" }]);
+    expect(body.input[3].output).toEqual([{ type: "input_text", text: inlineDocumentMarker(undefined) }]);
     expect(() => parseRequest(body)).not.toThrow();
   });
 
@@ -518,6 +627,31 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
     expect(body.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
   });
 
+  test("metadata.user_id longer than 64 chars is hashed into user (OpenAI/Azure limit)", () => {
+    const userId = JSON.stringify({ device_id: "d".repeat(64), account_uuid: "", session_id: "s".repeat(36) });
+    const { body } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: userId },
+    });
+    expect(body.user).toBe(createHash("sha256").update(userId).digest("hex"));
+    expect(body.prompt_cache_key).toBe(createHash("sha256").update(userId).digest("hex").slice(0, 32));
+  });
+
+  test("metadata.user_id boundary: exactly 64 chars forwarded, 65 chars hashed", () => {
+    const atLimit = "u".repeat(64);
+    const overLimit = "u".repeat(65);
+    const { body: forwarded } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: atLimit },
+    });
+    expect(forwarded.user).toBe(atLimit);
+    const { body: hashed } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: overLimit },
+    });
+    expect(hashed.user).toBe(createHash("sha256").update(overLimit).digest("hex"));
+  });
+
   test("no metadata + system present: fallback key from system hash, source=system", () => {
     const a = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: "be nice" });
     const b = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: "be nice" });
@@ -527,6 +661,37 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
     // Stable per system prompt, distinct across different system prompts.
     expect(a.body.prompt_cache_key).toBe(b.body.prompt_cache_key as string);
     expect(a.body.prompt_cache_key).not.toBe(c.body.prompt_cache_key as string);
+  });
+
+  test("Claude Code's rotating billing line never reaches instructions or the fallback key (#6627)", () => {
+    const billing = (cch: string) => `x-anthropic-billing-header: cc_version=2.1.286; cc_entrypoint=claude-desktop; cch=${cch};`;
+    // String system: the leading line goes, the rest is byte-identical, and the cohort key
+    // no longer rotates with cch.
+    const a = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: `${billing("aaa")}\nYou are Claude Code.` });
+    const b = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: `${billing("bbb")}\nYou are Claude Code.` });
+    expect(a.body.instructions).toBe("You are Claude Code.");
+    expect(b.body.instructions).toBe("You are Claude Code.");
+    expect(a.body.prompt_cache_key).toBe(b.body.prompt_cache_key as string);
+    // Array system: a header-only first block is dropped, later blocks are untouched.
+    const arr = translatedBody({
+      model: "m", max_tokens: 1, messages,
+      system: [
+        { type: "text", text: billing("ccc") },
+        { type: "text", text: "You are Claude Code." },
+        { type: "text", text: "Never quote x-anthropic-billing-header: lines." },
+      ],
+    });
+    expect(arr.instructions).toBe("You are Claude Code.\n\nNever quote x-anthropic-billing-header: lines.");
+    // A first block carrying header plus text keeps the text.
+    const mixed = translatedBody({ model: "m", max_tokens: 1, messages, system: [{ type: "text", text: `${billing("ddd")}\n\nYou are Claude Code.` }] });
+    expect(mixed.instructions).toBe("You are Claude Code.");
+    // Only the prompt start is matched: a later mention and leading whitespace survive.
+    const later = translatedBody({ model: "m", max_tokens: 1, messages, system: `  keep\n${billing("eee")}` });
+    expect(later.instructions).toBe(`  keep\n${billing("eee")}`);
+    // A header-only system leaves no instructions and no system-derived key.
+    const only = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: billing("fff") });
+    expect(only.body.instructions).toBeUndefined();
+    expect(only.cacheKeySource).toBeNull();
   });
 
   test("no metadata + no system: no key at all, source=null", () => {
@@ -673,6 +838,40 @@ describe("bundled-skill elision for routed models (devlog 260712 060)", () => {
   test("text-block carrier: drive-relative dir (no separator) stays pass-through", () => {
     const texts = userTexts(requestWithSkillTextBlock("claude-api", 500_000, undefined, "C:claude-api"));
     expect(texts.some(t => t.length > 400_000)).toBe(true);
+  });
+
+  test("text-block carrier: oversized marker paths pass through without unbounded parsing", () => {
+    const oversizedDir = `/${"/".repeat(10_000)}claude-api`;
+    const texts = userTexts(requestWithSkillTextBlock("claude-api", 20_000, undefined, oversizedDir));
+    expect(texts.some(t => t.startsWith(`Base directory for this skill: ${oversizedDir}`))).toBe(true);
+  });
+
+  for (const [prefix, separator] of [["/", "/"], ["C:\\", "\\"]] as const) {
+    for (const pathLength of [4_096, 4_097]) {
+      test(`text-block carrier: ${prefix} marker path at ${pathLength} characters`, () => {
+        const suffix = `${separator}claude-api${separator}`;
+        const dir = prefix + "a".repeat(pathLength - prefix.length - suffix.length) + suffix;
+        const texts = userTexts(requestWithSkillTextBlock("claude-api", 20_000, undefined, dir));
+        const bundle = `Base directory for this skill: ${dir}\n\n` + "DOCS ".repeat(4_000);
+        expect(dir.length).toBe(pathLength);
+        if (pathLength === 4_096) {
+          expect(texts.some(text => text.includes("'claude-api'") && text.includes("elided"))).toBe(true);
+          expect(texts.every(text => text.length < 10_000)).toBe(true);
+        } else {
+          expect(texts).toContain(bundle);
+        }
+      });
+    }
+  }
+
+  test("text-block carrier: an oversized first line without a newline stays byte-for-byte intact", () => {
+    const text = "Base directory for this skill: /" + "a/".repeat(10_000) + "claude-api";
+    const body = anthropicToResponsesTranslation({
+      model: "gemini/gemini-3-pro",
+      max_tokens: 100,
+      messages: [{ role: "user", content: [{ type: "text", text }] }],
+    }).body;
+    expect(userTexts(body)).toContain(text);
   });
 });
 

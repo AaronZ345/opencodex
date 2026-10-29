@@ -107,9 +107,13 @@ Yönlendirilen model sağlayıcısının `noVisionModels` listesinde yer aldığ
 bu model için `modelInputModalities` ile salt metin olarak bildirildiğinde ve bir
 istek görsel taşıdığında, opencodex kullanılabilir bir vision sidecar planı varsa
 ana çağrıdan **önce** her görseli açıklar ve onu metinle değiştirir. Kullanılabilir
-bir plan yoksa ham görsel salt metin arka ucuna iletilmek yerine kaldırılır. Model
-kataloğu sidecar kapsamında olan her model için görsel girdisini bildirir. Kombolar,
-her üye görselleri yerel olarak veya bir sidecar üzerinden kabul ettiğinde ve kombonun
+bir plan yoksa ham görsel salt metin arka ucuna iletilmek yerine kaldırılır.
+`visionSidecar.enabled: false` olduğunda model kataloğu, özel kayıtlar ve kombo üyeleri
+dahil salt metin modellere sidecar destekli görsel girdisi eklemez. Yerel görsel desteği
+ve açıkça yapılandırılmış görsel modaliteleri korunur. `enabled` belirtilmezse sidecar
+destekli görsel girdisinin bildirilmesi açık kalır; katalogda görünmesi, sidecar kimlik
+bilgilerinin veya kapasitesinin kullanılabilir olduğunu doğrulamaz. Kombolar,
+her üye görselleri yerel olarak veya etkinleştirilmiş bir sidecar üzerinden kabul ettiğinde ve kombonun
 `imageInput` ayarı devre dışı olmadığında görsel girdisini bildirir; böylece Codex
 uygulaması gibi istemciler, sidecar çalışmadan önce ekleri engellemek yerine kabul eder.
 `visionSidecar.model` olmadığında veya boş
@@ -196,10 +200,21 @@ akıl yürütmeyi, zaman aşımını ve sınırı korur.
 atlanan anahtarları değiştirmeden bırakır. `timeoutMs` çalışma zamanı tamsayı
 sınırlarını kullanır (1–2147483647 ms).
 
+Vizyon'un geçerli açma/kapatma durumunu `PUT /api/sidecar-settings` üzerinden değiştirmek, kayıttan sonra yönetilen kataloğu ve önbelleği yeniler; `catalogRefreshPending=true`, yenilemenin tamamlanmadığını bildirir ve istemci onayı anlamına gelmez.
+
+Web arama sidecar kartı aynı denetim yapısını taşır: model seçicisinin ilk satırı **Kapalı (Off)**'dır.
+Kapatmak OpenCodex'in `web_search` yakalamasını durdurur ve Codex entegrasyonu
+`~/.codex/config.toml` dosyasına `web_search = "disabled"` yazar; çünkü Codex kendi
+modu aksini söyleyene kadar yerleşik barındırılan `web_search` aracını bildirmeye devam eder ve
+tek arama yolu bir MCP arama sunucusu olacaksa bu gerekir. Yeniden açmak bu satırı kaldırır ve Codex
+günlüğüne kaydedilmiş operatörün kendi kök `web_search` satırını geri getirir. Yazma işlemi
+yönetilen bir `~/.codex/config.toml` (`ocx sync`) gerektirir; gerçekleşmezse kontrol
+paneli kartı uyarır ve `ocx agent sidecar web --enabled off` sonucu bildirir.
+
 Dosyayı doğrudan düzenlemeyi tercih ediyorsanız `config.json` içinde yine de
 `enabled: false` ayarlayabilirsiniz. Anthropic-OAuth araması ve görsel
 açıklaması mevcut Claude Code OAuth parmak izi emsalini yeniden kullanır, ancak
 hedeflenen hesap ve iş yükü ile kapsamlı bir şekilde test edilmelidir.
 
-Her alan için [Yapılandırma referansı](/tr/reference/configuration/#sidecars)
+Her alan için [Yapılandırma referansı](/tr/reference/configuration/server/#sidecarlar)
 bölümüne bakın.

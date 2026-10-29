@@ -1,0 +1,970 @@
+import { createLinkRelaySessions } from "../../src/server/index/link-relay-sessions";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Server } from "bun";
+import {
+  forwardLinkRequestHeaders,
+  HOME_INITIATED_LINK_TUNNEL,
+  LINK_RELAY_BODY_MAX_BYTES,
+  LINK_RELAY_HEADER_TIMEOUT_MS,
+  LINK_RELAY_HOLD_MS,
+  LINK_RELAY_SSE_IDLE_TIMEOUT_MS,
+  relayLinkDataRequest as relayLinkDataRequestImpl,
+  sanitizeLinkResponseHeaders,
+  type LinkRelayClock,
+  type LinkTunnelGate,
+  type LinkAdmissionResult,
+} from "../../src/client/link-relay";
+import { LinkRelayAuthenticationError, LinkRelayAuthTimeoutError } from "../../src/client/link-relay-transport";
+import type { LinkDiagnosticRecord } from "../../src/link/diagnostics";
+import { LINK_RELAY_AUTH_PATH } from "../../src/link/relay-auth";
+import { HUB_RELAY_REQUEST_BODY_MAX_BYTES } from "../../src/client/hub-relay";
+import { HOME_UNREACHABLE_MESSAGE } from "../../src/client/home-unreachable";
+import { startMachineListener } from "../../src/client/machine-listener";
+import { serviceApiTokenFingerprint } from "../../src/lib/service-secrets";
+import type { OcxClientConnectionConfig } from "../../src/types";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+const LINK_KEY = `ocx_data_${"d".repeat(40)}`;
+const target = { tunnelPort: 12000, admissionKey: LINK_KEY };
+const connectedTunnel: LinkTunnelGate = { connected: () => ({ kind: "match" }), pending: () => false, waitForConnected: async () => true };
+// Payload and framing cases provide a proven tunnel; admission cases call the implementation directly.
+function relayLinkDataRequest(
+  req: Request,
+  destination: Parameters<typeof relayLinkDataRequestImpl>[1],
+  deps: Parameters<typeof relayLinkDataRequestImpl>[2] = {},
+): Promise<Response> {
+  return relayLinkDataRequestImpl(req, destination, { tunnel: connectedTunnel, ...deps });
+}
+let servers: Server<unknown>[] = [];
+let root = "";
+let previousHome: string | undefined;
+
+function linkConnection(tunnelPort: number): OcxClientConnectionConfig {
+  return {
+    serverUrl: `http://127.0.0.1:${tunnelPort}`,
+    managementUrl: `http://127.0.0.1:${tunnelPort}`,
+    managementTransport: "direct",
+    transport: "link",
+    link: { tunnelPort, linkId: `lnk_${"a".repeat(16)}` },
+    selectedClients: ["codex"],
+    tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+    apiKeyId: "ocx_data_fixture",
+    tokenFingerprint: serviceApiTokenFingerprint(LINK_KEY),
+    protocolVersion: 1,
+    connectedAt: "2026-09-25T00:00:00.000Z",
+    catalogSyncedAt: "2026-09-25T00:00:01.000Z",
+  };
+}
+
+/** A real Home socket implementing the same connection-bound admission as production. */
+function authenticatedHome(dispatch: (req: Request) => Promise<Response>) {
+  const sessions = createLinkRelaySessions({ fingerprints: (keyId, linkId) =>
+    keyId === "ocx_data_fixture" && linkId === `lnk_${"a".repeat(16)}` ? [serviceApiTokenFingerprint(LINK_KEY)] : [] });
+  return Bun.serve({ hostname: "127.0.0.1", port: 0,
+    fetch: (req, server) => sessions.dispatch(req, server, dispatch) });
+}
+
+function relayRequest(init: RequestInit = {}): Request {
+  return new Request("http://127.0.0.1:10100/v1/responses?trace=1", init);
+}
+
+/** A clock whose timers fire only when the test advances it. */
+function manualClock() {
+  let now = 0;
+  const timers = new Map<number, { at: number; callback: () => void; ms: number }>();
+  let next = 1;
+  const clock: LinkRelayClock = {
+    setTimeout: ((callback: () => void, ms: number) => {
+      const id = next++;
+      timers.set(id, { at: now + ms, callback, ms });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout,
+    clearTimeout: ((id: number) => { timers.delete(id); }) as typeof clearTimeout,
+  };
+  return {
+    clock,
+    delays: () => [...timers.values()].map(timer => timer.ms),
+    advance(ms: number) {
+      now += ms;
+      for (const [id, timer] of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    },
+  };
+}
+
+beforeEach(() => {
+  previousHome = process.env.OPENCODEX_HOME;
+  root = mkdtempSync(join(tmpdir(), "ocx-link-relay-"));
+  process.env.OPENCODEX_HOME = root;
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, "config.json"), JSON.stringify({
+    port: 0, hostname: "127.0.0.1", providers: {}, defaultProvider: "openai",
+  }));
+});
+
+afterEach(async () => {
+  for (const server of servers.splice(0)) await server.stop(true);
+  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousHome;
+  if (root) removeTreeWithRetry(root);
+});
+
+describe("client link HTTP relay", () => {
+  test("replaces every caller credential with the link key and filters hop-by-hop headers", () => {
+    const caller = new Headers({
+      Authorization: "Bearer caller-chatgpt-oauth",
+      "Api-Key": "azure-caller",
+      "X-OpenCodex-API-Key": "ocx_data_caller",
+      "X-Api-Key": "sk-ant-caller",
+      "X-Goog-Api-Key": "google-caller",
+      "ChatGPT-Account-Id": "acct-caller",
+      Cookie: "session=caller",
+      "Idempotency-Key": "idem-1",
+      "X-Trace": "trace-1",
+      Connection: "keep-alive, X-Remove",
+      "X-Remove": "secret",
+      Host: "caller.example.test",
+      "Content-Length": "2",
+    });
+    const forwarded = forwardLinkRequestHeaders(caller, LINK_KEY, "/v1/responses");
+    expect(forwarded.get("authorization")).toBe(`Bearer ${LINK_KEY}`);
+    expect(forwarded.get("idempotency-key")).toBe("idem-1");
+    expect(forwarded.get("x-trace")).toBe("trace-1");
+    for (const name of ["api-key", "x-opencodex-api-key", "x-api-key", "x-goog-api-key", "chatgpt-account-id", "cookie", "connection", "keep-alive", "x-remove", "host", "content-length"]) {
+      expect(forwarded.get(name)).toBeNull();
+    }
+    // /v1/usage admits only the dedicated header on the Home.
+    const usage = forwardLinkRequestHeaders(caller, LINK_KEY, "/v1/usage");
+    expect(usage.get("x-opencodex-api-key")).toBe(LINK_KEY);
+    expect(usage.get("authorization")).toBeNull();
+    expect(usage.get("api-key")).toBeNull();
+    expect(usage.get("x-api-key")).toBeNull();
+    expect(usage.get("x-goog-api-key")).toBeNull();
+
+    const response = sanitizeLinkResponseHeaders(new Headers({
+      Connection: "X-Response-Secret",
+      "X-Response-Secret": "secret",
+      "Content-Type": "application/json",
+      "Content-Length": "2",
+      "Content-Encoding": "gzip",
+    }));
+    expect(response.get("content-type")).toBe("application/json");
+    for (const name of ["connection", "x-response-secret", "content-length", "content-encoding"]) {
+      expect(response.get(name)).toBeNull();
+    }
+  });
+
+  test("sends the link key, not the caller's credential, to the Home", async () => {
+    const sent: Headers[] = [];
+    const fetchImpl = (async (_input, init) => { sent.push(new Headers(init?.headers)); return Response.json({ ok: true }); }) as typeof fetch;
+    const response = await relayLinkDataRequest(relayRequest({
+      method: "POST",
+      headers: {
+        Authorization: "Bearer caller-chatgpt-oauth",
+        "Api-Key": "azure-caller",
+        "X-Goog-Api-Key": "google-caller",
+        "ChatGPT-Account-Id": "acct-caller",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    }), target, { fetchImpl });
+    expect(response.status).toBe(200);
+    expect(sent[0]?.get("authorization")).toBe(`Bearer ${LINK_KEY}`);
+    expect(sent[0]?.get("api-key")).toBeNull();
+    expect(sent[0]?.get("x-goog-api-key")).toBeNull();
+    expect(sent[0]?.get("chatgpt-account-id")).toBeNull();
+    const usage = await relayLinkDataRequest(new Request("http://127.0.0.1:10100/v1/usage", {
+      headers: {
+        Authorization: "Bearer caller-chatgpt-oauth",
+        "Api-Key": "azure-caller",
+        "X-Goog-Api-Key": "google-caller",
+      },
+    }), target, { fetchImpl });
+    expect(usage.status).toBe(200);
+    expect(sent[1]?.get("x-opencodex-api-key")).toBe(LINK_KEY);
+    expect(sent[1]?.get("authorization")).toBeNull();
+    expect(sent[1]?.get("api-key")).toBeNull();
+    expect(sent[1]?.get("x-goog-api-key")).toBeNull();
+  });
+
+  test("rejects TE/CL ambiguity and oversized requests before outbound I/O", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => { calls += 1; return new Response(); }) as typeof fetch;
+    const ambiguous = new Request("http://127.0.0.1:10100/v1/responses", {
+      method: "POST",
+      headers: { "Content-Length": "2", "Transfer-Encoding": "chunked" },
+      body: "{}",
+    });
+    expect((await relayLinkDataRequest(ambiguous, target, { fetchImpl })).status).toBe(400);
+    for (const [limit, declared] of [[undefined, LINK_RELAY_BODY_MAX_BYTES + 1], [1024, 1025]] as const) {
+      const oversized = new Request("http://127.0.0.1:10100/v1/responses", {
+        method: "POST",
+        headers: { "Content-Length": String(declared) },
+        body: "{}",
+      });
+      expect((await relayLinkDataRequest(oversized, target, { fetchImpl, bodyLimitBytes: limit })).status).toBe(413);
+    }
+    expect(calls).toBe(0);
+  });
+
+  test("streams a body larger than the management relay cap without buffering it", async () => {
+    const size = 5 * 1024 * 1024;
+    expect(size).toBeGreaterThan(HUB_RELAY_REQUEST_BODY_MAX_BYTES);
+    let streamed = false;
+    let received = 0;
+    let length: string | null = null;
+    const response = await relayLinkDataRequest(relayRequest({
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": String(size) },
+      body: new Uint8Array(size).fill(0x61),
+    }), target, {
+      fetchImpl: (async (_input, init) => {
+        streamed = init?.body instanceof ReadableStream;
+        length = new Headers(init?.headers).get("content-length");
+        received = (await new Response(init!.body).arrayBuffer()).byteLength;
+        return Response.json({ received });
+      }) as typeof fetch,
+    });
+    expect(response.status).toBe(200);
+    expect(streamed).toBe(true);
+    expect(length).toBe(String(size));
+    expect(received).toBe(size);
+  });
+
+  test("admits a lone chunked upload as a standalone does and refuses any other Transfer-Encoding", async () => {
+    const chunkedBody = () => new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"input":'));
+        controller.enqueue(new TextEncoder().encode('"hello"}'));
+        controller.close();
+      },
+    });
+    let sentHeaders: Headers | undefined;
+    let sentBody = "";
+    const fetchImpl = (async (_input, init) => {
+      sentHeaders = new Headers(init?.headers);
+      sentBody = await new Response(init!.body).text();
+      return Response.json({ relayed: true });
+    }) as typeof fetch;
+    const response = await relayLinkDataRequest(relayRequest({
+      method: "POST", headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" }, body: chunkedBody(), duplex: "half",
+    } as RequestInit), target, { fetchImpl });
+    expect(response.status).toBe(200);
+    expect(sentBody).toBe('{"input":"hello"}');
+    // The framing is the fetch's own: neither the caller's Transfer-Encoding nor a Content-Length is copied.
+    expect(sentHeaders?.get("transfer-encoding")).toBeNull();
+    expect(sentHeaders?.get("content-length")).toBeNull();
+    expect(sentHeaders?.get("authorization")).toBe(`Bearer ${LINK_KEY}`);
+
+    let calls = 0;
+    const counted = (async () => { calls += 1; return new Response(); }) as typeof fetch;
+    for (const encoding of ["gzip, chunked", "chunked, chunked", "identity"]) {
+      const refused = await relayLinkDataRequest(relayRequest({
+        method: "POST", headers: { "Transfer-Encoding": encoding }, body: chunkedBody(), duplex: "half",
+      } as RequestInit), target, { fetchImpl: counted });
+      expect(refused.status).toBe(400);
+    }
+    expect(calls).toBe(0);
+
+    const oversized = await relayLinkDataRequest(relayRequest({
+      method: "POST", headers: { "Transfer-Encoding": "chunked" }, body: chunkedBody(), duplex: "half",
+    } as RequestInit), target, {
+      bodyLimitBytes: 8,
+      fetchImpl: (async (_input, init) => {
+        await new Response(init!.body).arrayBuffer();
+        return Response.json({ unreachable: true });
+      }) as typeof fetch,
+    });
+    expect(oversized.status).toBe(413);
+  });
+
+  test("fails a streamed body that grows past the cap with 413", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(600));
+        controller.enqueue(new Uint8Array(600));
+        controller.close();
+      },
+    });
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST", body, duplex: "half" } as RequestInit), target, {
+      bodyLimitBytes: 1024,
+      fetchImpl: (async (_input, init) => {
+        await new Response(init!.body).arrayBuffer();
+        return Response.json({ unreachable: true });
+      }) as typeof fetch,
+    });
+    expect(response.status).toBe(413);
+  });
+
+  test("waits up to 300 seconds for the Home's response headers", async () => {
+    const manual = manualClock();
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST", body: "{}" }), target, {
+      clock: manual.clock,
+      fetchImpl: (async (_input, init) => {
+        // A Home that answers after 20 s: past the management relay's 15 s deadline.
+        manual.advance(20_000);
+        if (init?.signal?.aborted) throw init.signal.reason;
+        return Response.json({ late: true });
+      }) as typeof fetch,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ late: true });
+    expect(manual.delays()).toEqual([]);
+
+    const stalled = manualClock();
+    const refused = await relayLinkDataRequest(relayRequest({ method: "POST", body: "{}" }), target, {
+      clock: stalled.clock,
+      fetchImpl: (async (_input, init) => {
+        expect(stalled.delays()).toEqual([LINK_RELAY_HEADER_TIMEOUT_MS]);
+        stalled.advance(LINK_RELAY_HEADER_TIMEOUT_MS);
+        if (init?.signal?.aborted) throw init.signal.reason;
+        return Response.json({ unreachable: true });
+      }) as typeof fetch,
+    });
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get("retry-after")).toBe("1");
+  });
+
+  test("returns a retryable JSON 503 when the tunnel is refused, without echoing the key", async () => {
+    const response = await relayLinkDataRequest(relayRequest({
+      method: "POST",
+      headers: { "X-OpenCodex-API-Key": "ocx_data_caller", "Content-Type": "application/json" },
+      body: JSON.stringify({ input: "private" }),
+    }), target, {
+      fetchImpl: (async () => { throw new Error(`connection refused ${LINK_KEY}`); }) as typeof fetch,
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    const body = await response.text();
+    expect(body).not.toContain(LINK_KEY);
+    expect(body).not.toContain("ocx_data_caller");
+    expect(body).not.toContain("private");
+  });
+
+  test("applies the response byte cap to non-SSE responses", async () => {
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST" }), target, {
+      bodyLimitBytes: 1024,
+      fetchImpl: (async () => new Response("too large", {
+        headers: { "Content-Length": "1025" },
+      })) as typeof fetch,
+    });
+    expect(response.status).toBe(502);
+  });
+
+  test("propagates caller abort to the upstream SSE and cancels its body", async () => {
+    const caller = new AbortController();
+    const upstream = new AbortController();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode("data: ready\n\n")); },
+      cancel() { cancelled = true; },
+    });
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST", signal: caller.signal }), target, {
+      fetchImpl: (async (_input, init) => {
+        init!.signal!.addEventListener("abort", () => upstream.abort(), { once: true });
+        return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+      }) as typeof fetch,
+    });
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("ready");
+    const pending = reader.read();
+    caller.abort();
+    await pending;
+    expect(upstream.signal.aborted).toBe(true);
+    expect(cancelled).toBe(true);
+  });
+
+  test("closes an idle SSE after the injectable 300 second no-byte deadline", async () => {
+    let fireIdle!: () => void;
+    let upstreamSignal!: AbortSignal;
+    let cancelled = false;
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST" }), target, {
+      clock: {
+        setTimeout: ((callback, ms) => {
+          // The header deadline is armed first and cleared once headers arrive.
+          if (ms === LINK_RELAY_SSE_IDLE_TIMEOUT_MS) fireIdle = callback;
+          return 1 as unknown as ReturnType<typeof setTimeout>;
+        }) as typeof setTimeout,
+        clearTimeout: (() => {}) as typeof clearTimeout,
+      },
+      fetchImpl: (async (_input, init) => {
+        upstreamSignal = init!.signal!;
+        return new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }), {
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }) as typeof fetch,
+    });
+    const reader = response.body!.getReader();
+    const pending = reader.read();
+    fireIdle();
+    expect((await pending).done).toBe(true);
+    expect(upstreamSignal.aborted).toBe(true);
+    expect(cancelled).toBe(true);
+  });
+
+  test("relays POST /v1/responses through a real machine listener socket with the stored key", async () => {
+    writeFileSync(join(root, "service-api-token"), `${LINK_KEY}\n`, { mode: 0o600 });
+    let received: Record<string, string | null> | undefined;
+    const hub = authenticatedHome(async req => {
+        received = {
+          method: req.method,
+          path: new URL(req.url).pathname + new URL(req.url).search,
+          host: req.headers.get("host"),
+          authorization: req.headers.get("authorization"),
+          apiKey: req.headers.get("api-key"),
+          googleApiKey: req.headers.get("x-goog-api-key"),
+          dedicated: req.headers.get("x-opencodex-api-key"),
+          contentLength: req.headers.get("content-length"),
+          transferEncoding: req.headers.get("transfer-encoding"),
+          body: await req.text(),
+        };
+        return Response.json({ relayed: true });
+    });
+    servers.push(hub);
+    const machine = startMachineListener(0, { state: linkConnection(hub.port!), linkTunnel: connectedTunnel });
+    servers.push(machine);
+    const body = JSON.stringify({ input: "hello" });
+    const response = await fetch(new URL("/v1/responses?trace=1", machine.url), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer caller-chatgpt-oauth",
+        "Api-Key": "azure-caller",
+        "X-Goog-Api-Key": "google-caller",
+        "X-OpenCodex-API-Key": "ocx_data_caller",
+      },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ relayed: true });
+    expect(received).toEqual({
+      method: "POST", path: "/v1/responses?trace=1", host: `127.0.0.1:${hub.port}`,
+      authorization: `Bearer ${LINK_KEY}`, apiKey: null, googleApiKey: null, dedicated: null,
+      contentLength: String(body.length), transferEncoding: null, body,
+    });
+    expect((await fetch(new URL("/v1/unknown", machine.url))).status).toBe(404);
+    // #6957: the management relay exists on a link Child, but only for a Child dashboard session.
+    expect((await fetch(new URL("/api/machine/hub-relay/api/config", machine.url))).status).toBe(401);
+
+    // A chunked upload (a streamed body with no Content-Length) passes through as on a standalone.
+    const encoder = new TextEncoder();
+    const chunked = await fetch(new URL("/v1/responses", machine.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('{"input":'));
+          controller.enqueue(encoder.encode('"chunked"}'));
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    } as RequestInit);
+    expect(chunked.status).toBe(200);
+    expect(received).toMatchObject({ authorization: `Bearer ${LINK_KEY}`, contentLength: null, transferEncoding: "chunked", body: '{"input":"chunked"}' });
+  });
+});
+
+/** A tunnel gate the test opens by hand. */
+function manualGate(initiallyPending = true) {
+  const waits: number[] = [];
+  const state = { pending: initiallyPending, connected: !initiallyPending };
+  let open: (connected: boolean) => void = () => {};
+  const tunnel: LinkTunnelGate = {
+    connected: () => ({ kind: state.connected ? "match" : "unavailable" }),
+    pending: () => state.pending,
+    waitForConnected: timeoutMs => {
+      waits.push(timeoutMs);
+      return new Promise<boolean>(resolve => { open = resolve; });
+    },
+  };
+  return {
+    tunnel,
+    waits,
+    state,
+    release(connected: boolean) {
+      state.pending = false;
+      state.connected = connected;
+      open(connected);
+    },
+  };
+}
+
+describe("client link relay while the tunnel reconnects", () => {
+  for (const state of ["missing", "failed", "stopped"] as const) {
+    test(`does not send the committed key or fetch while supervision is ${state}`, async () => {
+      const forwarded: string[] = [];
+      const unavailable = { pending: () => false, connected: () => ({ kind: "unavailable" as const }), waitForConnected: async () => false };
+      const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "{}" }), target, {
+        ...(state === "missing" ? {} : { tunnel: unavailable }),
+        fetchImpl: (async (_input, init) => {
+          forwarded.push(new Headers(init?.headers).get("authorization") ?? "");
+          return Response.json({ forwarded: true });
+        }) as typeof fetch,
+      });
+      expect(response.status).toBe(503);
+      expect(forwarded).toEqual([]);
+    });
+  }
+
+  test("a Home-initiated link forwards like 2.67.0 and never holds a refused request", async () => {
+    // The Home owns the `ssh -R` forward, so this Child has no supervisor to prove it. The explicit
+    // Home-initiated gate forwards (a missing gate above still refuses); a refused connection is
+    // answered at once with a retryable 503 instead of waiting for a reconnect nobody drives.
+    let sends = 0;
+    const ok = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "{}" }), target, {
+      tunnel: HOME_INITIATED_LINK_TUNNEL,
+      fetchImpl: (async () => { sends += 1; return Response.json({ forwarded: true }); }) as typeof fetch,
+    });
+    expect(ok.status).toBe(200);
+    expect(sends).toBe(1);
+    const refused = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "{}" }), target, {
+      tunnel: HOME_INITIATED_LINK_TUNNEL,
+      fetchImpl: (async () => { sends += 1; throw new Error("connection refused"); }) as typeof fetch,
+    });
+    expect(refused.status).toBe(503);
+    expect(sends).toBe(2);
+  });
+
+  test("rechecks connected state before retrying a refused fetch", async () => {
+    let connected = true;
+    let pending = false;
+    let calls = 0;
+    const response = await relayLinkDataRequestImpl(new Request("http://127.0.0.1:10100/v1/models"), target, {
+      tunnel: {
+        connected: () => ({ kind: connected ? "match" : "unavailable" }),
+        pending: () => pending,
+        waitForConnected: async () => { pending = false; connected = false; return true; },
+      },
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1) {
+          pending = true;
+          throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+        }
+        return Response.json({ leaked: true });
+      }) as typeof fetch,
+    });
+    expect(response.status).toBe(503);
+    expect(calls).toBe(1);
+  });
+
+  test("holds a request while the tunnel reconnects and forwards it once when it connects", async () => {
+    const gate = manualGate();
+    const sent: string[] = [];
+    let clock = 0;
+    const pending = relayLinkDataRequest(relayRequest({
+      method: "POST", headers: { "Content-Type": "application/json" }, body: '{"input":"held"}',
+    }), target, {
+      tunnel: gate.tunnel,
+      now: () => clock++,
+      fetchImpl: (async (_input, init) => {
+        sent.push(await new Response(init!.body).text());
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+    });
+    await Bun.sleep(5);
+    expect(sent).toEqual([]);
+    expect(gate.waits).toEqual([LINK_RELAY_HOLD_MS]);
+    expect(clock).toBe(1);
+    gate.release(true);
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(sent).toEqual(['{"input":"held"}']);
+  });
+
+  test("answers 503 with Retry-After when the hold ends without a tunnel", async () => {
+    const gate = manualGate();
+    let calls = 0;
+    const pending = relayLinkDataRequest(relayRequest({ method: "POST", body: "{}" }), target, {
+      tunnel: gate.tunnel,
+      fetchImpl: (async () => { calls += 1; return new Response(); }) as typeof fetch,
+    });
+    await Bun.sleep(1);
+    gate.release(false);
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    // OCX-11: the legacy `error` string stays; `code` and `message` are the stable contract.
+    expect(await response.json()).toEqual({
+      error: "link tunnel unavailable",
+      code: "home_unreachable",
+      message: HOME_UNREACHABLE_MESSAGE,
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("a connected tunnel adds no wait or routine diagnostic", async () => {
+    let waited = 0;
+    const records: LinkDiagnosticRecord[] = [];
+    const tunnel: LinkTunnelGate = { connected: () => ({ kind: "match" }), pending: () => false, waitForConnected: async () => { waited += 1; return true; } };
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST", body: "{}" }), target, {
+      tunnel,
+      diagnostic: row => { records.push(row); },
+      fetchImpl: (async () => Response.json({ ok: true })) as typeof fetch,
+    });
+    expect(response.status).toBe(200);
+    expect(waited).toBe(0);
+    expect(records).toEqual([]);
+  });
+
+  test("never replays a request after a reset, even while the tunnel reconnects", async () => {
+    let pending = false;
+    let calls = 0;
+    let waited = 0;
+    const tunnel: LinkTunnelGate = { connected: () => ({ kind: pending ? "unavailable" : "match" }), pending: () => pending, waitForConnected: async () => { waited += 1; return true; } };
+    const response = await relayLinkDataRequest(relayRequest({ method: "POST", body: '{"input":"once"}' }), target, {
+      tunnel,
+      fetchImpl: (async (_input, init) => {
+        calls += 1;
+        await new Response(init!.body).text();
+        pending = true;
+        throw Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+      }) as typeof fetch,
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(calls).toBe(1);
+    expect(waited).toBe(0);
+  });
+
+  test("resends a refused request once the tunnel is back, inside the same hold window", async () => {
+    let pending = false;
+    let calls = 0;
+    let clock = 1_000;
+    const waits: number[] = [];
+    const tunnel: LinkTunnelGate = {
+      connected: () => ({ kind: pending ? "unavailable" : "match" }),
+      pending: () => pending,
+      waitForConnected: async timeoutMs => {
+        waits.push(timeoutMs);
+        clock += 14_000;
+        pending = false;
+        return true;
+      },
+    };
+    const bodies: string[] = [];
+    const response = await relayLinkDataRequest(relayRequest({
+      method: "POST", headers: { "Content-Type": "application/json" }, body: '{"input":"again"}',
+    }), target, {
+      tunnel,
+      now: () => clock,
+      fetchImpl: (async (_input, init) => {
+        calls += 1;
+        // Refused twice: the second refusal finds the 15 s window spent and gets 503.
+        if (calls <= 2) {
+          pending = true;
+          throw Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" });
+        }
+        bodies.push(await new Response(init!.body).text());
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+    });
+    expect(waits).toEqual([LINK_RELAY_HOLD_MS, LINK_RELAY_HOLD_MS - 14_000]);
+    expect(calls).toBe(3);
+    expect(response.status).toBe(200);
+    expect(bodies).toEqual(['{"input":"again"}']);
+
+    clock = 0;
+    calls = 0;
+    let spentConnected = false;
+    const spent = await relayLinkDataRequest(relayRequest({ method: "POST", body: "{}" }), target, {
+      tunnel: { connected: () => ({ kind: spentConnected ? "match" : "unavailable" }), pending: () => !spentConnected,
+        waitForConnected: async () => { clock += LINK_RELAY_HOLD_MS; spentConnected = true; return true; } },
+      now: () => clock,
+      fetchImpl: (async () => {
+        calls += 1;
+        throw Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" });
+      }) as typeof fetch,
+    });
+    expect(spent.status).toBe(503);
+    expect(calls).toBe(1);
+  });
+
+  test("a refused connection to a real closed port leaves the streamed body intact for the resend", async () => {
+    const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const port = probe.port!;
+    probe.stop(true);
+    let pending = false;
+    let home: Server<unknown> | undefined;
+    const received: string[] = [];
+    try {
+      const response = await relayLinkDataRequest(relayRequest({
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input: "x".repeat(100_000) }),
+      }), { tunnelPort: port, admissionKey: LINK_KEY }, {
+        tunnel: {
+          connected: () => ({ kind: pending ? "unavailable" : "match" }),
+          pending: () => pending,
+          waitForConnected: async () => {
+            home = Bun.serve({ hostname: "127.0.0.1", port, async fetch(req) { received.push(await req.text()); return Response.json({ ok: true }); } });
+            pending = false;
+            return true;
+          },
+        },
+        fetchImpl: (async (input, init) => {
+          try {
+            return await fetch(input, init);
+          } catch (error) {
+            pending = true;
+            throw error;
+          }
+        }) as typeof fetch,
+      });
+      expect(response.status).toBe(200);
+      expect(received).toEqual([JSON.stringify({ input: "x".repeat(100_000) })]);
+    } finally {
+      home?.stop(true);
+    }
+  });
+
+  test("the Child's listener holds a relayed request on its tunnel gate", async () => {
+    writeFileSync(join(root, "service-api-token"), `${LINK_KEY}\n`, { mode: 0o600 });
+    const hub = authenticatedHome(async () => Response.json({ relayed: true }));
+    servers.push(hub);
+    const gate = manualGate();
+    const machine = startMachineListener(0, { state: linkConnection(hub.port!), linkTunnel: gate.tunnel });
+    servers.push(machine);
+    let settled = false;
+    const pending = fetch(new URL("/v1/responses", machine.url), {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }).then(response => { settled = true; return response; });
+    await Bun.sleep(50);
+    expect(settled).toBe(false);
+    expect(gate.waits).toEqual([LINK_RELAY_HOLD_MS]);
+    gate.release(true);
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ relayed: true });
+  });
+});
+
+test("a transient owner deadline retries before forwarding even when diagnostics throw", async () => {
+  const { gate, checks } = observedGate(["deadline", "match"]);
+  let forwarded = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "untouched" }), target, {
+    tunnel: gate,
+    diagnostic: () => { throw new Error("diagnostic sink unavailable"); },
+    // This trusted fetch seam records only the final data dispatch.
+    fetchImpl: (async (_url, init) => { forwarded += 1; expect(await new Response(init?.body).text()).toBe("untouched"); return Response.json({ ok: true }); }) as typeof fetch,
+  });
+  expect(response.status).toBe(200);
+  expect(checks()).toBe(2);
+  expect(forwarded).toBe(1);
+});
+
+
+function observedGate(outcomes: Array<LinkAdmissionResult["kind"]>, onCheck?: () => void) {
+  let checks = 0;
+  const gate: LinkTunnelGate = {
+    connected() {
+      const kind = outcomes[Math.min(checks++, outcomes.length - 1)];
+      onCheck?.();
+      return { kind, elapsedMs: kind === "deadline" ? 2000 : 1, generation: 2, state: "connected" };
+    }, pending: () => false, waitForConnected: async () => false,
+  };
+  return { gate, checks: () => checks };
+}
+
+test.each(["mismatch", "lookup_error", "stale", "identity_unknown", "identity_mismatch", "unavailable"] as const)(
+  "does not retry an owner refusal without a deadline: %s", async kind => {
+    const { gate, checks } = observedGate([kind]);
+    let forwards = 0;
+    const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "private" }), target, {
+      tunnel: gate, fetchImpl: (async () => { forwards++; return new Response("unexpected"); }) as typeof fetch,
+    });
+    expect(response.status).toBe(503);
+    expect(checks()).toBe(1);
+    expect(forwards).toBe(0);
+  });
+
+test("repeated owner deadlines stop after one recovery and correlate the final refusal", async () => {
+  const { gate, checks } = observedGate(["deadline"]);
+  const records: LinkDiagnosticRecord[] = [];
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST" }), target, { tunnel: gate, diagnostic: row => records.push(row) });
+  expect(response.status).toBe(503);
+  expect(checks()).toBe(2);
+  expect(response.headers.get("retry-after")).toBe("1");
+  const requestId = response.headers.get("x-opencodex-link-request-id");
+  expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(records.map(row => [row.event, row.outcome, row.attempt, row.requestId])).toEqual([
+    ["relay_retry", "deadline", 1, requestId], ["relay_failure", "deadline", 1, requestId],
+  ]);
+});
+
+test("an auth deadline retries fresh admission and delivers the original body once", async () => {
+  const { gate, checks } = observedGate(["match"]);
+  const records: LinkDiagnosticRecord[] = [];
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "original bytes" }), target, {
+    tunnel: gate, diagnostic: row => { records.push(row); throw new Error("logging unavailable"); },
+    fetchImpl: (async (_url, init) => {
+      if (++attempts === 1) throw new LinkRelayAuthTimeoutError();
+      expect(await new Response(init?.body).text()).toBe("original bytes");
+      return new Response("ok");
+    }) as typeof fetch,
+  });
+  expect(await response.text()).toBe("ok");
+  expect(checks()).toBe(2);
+  expect(attempts).toBe(2);
+  expect(records.map(row => [row.event, row.outcome])).toEqual([
+    ["relay_retry", "auth_timeout"], ["relay_recovered", "recovered"],
+  ]);
+});
+
+test("an upstream 500 after a preflight retry is not reported as recovered", async () => {
+  const { gate, checks } = observedGate(["match"]);
+  const records: LinkDiagnosticRecord[] = [];
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST" }), target, {
+    tunnel: gate, diagnostic: row => records.push(row),
+    fetchImpl: (async () => {
+      if (++attempts === 1) throw new LinkRelayAuthTimeoutError();
+      return new Response("upstream failed", { status: 500 });
+    }) as typeof fetch,
+  });
+  expect(response.status).toBe(500);
+  expect(await response.text()).toBe("upstream failed");
+  expect(checks()).toBe(2);
+  expect(attempts).toBe(2);
+  expect(records.map(row => [row.event, row.outcome])).toEqual([["relay_retry", "auth_timeout"]]);
+});
+
+test.each([false, true])("owner and auth deadlines share a single recovery budget (auth first: %s)", async authFirst => {
+  const { gate, checks } = observedGate(authFirst ? ["match", "deadline"] : ["deadline", "match"]);
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "original" }), target, {
+    tunnel: gate, fetchImpl: (async () => { attempts++; throw new LinkRelayAuthTimeoutError(); }) as typeof fetch,
+  });
+  expect(response.status).toBe(503);
+  expect(checks()).toBe(2);
+  expect(attempts).toBe(1);
+});
+
+test.each([new LinkRelayAuthenticationError(), new Error("socket reset after dispatch")])(
+  "never retries authentication refusal or ambiguous transport failure: %s", async failure => {
+    const { gate, checks } = observedGate(["match"]);
+    let attempts = 0;
+    const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST" }), target, {
+      tunnel: gate, fetchImpl: (async () => { attempts++; throw failure; }) as typeof fetch,
+    });
+    expect(response.status).toBe(503);
+    expect(checks()).toBe(1);
+    expect(attempts).toBe(1);
+  });
+
+test("caller cancellation during an owner deadline prevents both recovery and dispatch", async () => {
+  const abort = new AbortController();
+  const { gate, checks } = observedGate(["deadline", "match"], () => abort.abort());
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", signal: abort.signal }), target, {
+    tunnel: gate, fetchImpl: (async () => { attempts++; return new Response("unexpected"); }) as typeof fetch,
+  });
+  expect(response.status).toBe(503);
+  expect(checks()).toBe(1);
+  expect(attempts).toBe(0);
+});
+
+test("a real five-second silent preflight recovers on a new socket and nonce without replaying data", async () => {
+  let challenges = 0, dispatches = 0;
+  const records: LinkDiagnosticRecord[] = [];
+  const nonces: string[] = [];
+  const ports: number[] = [];
+  const sessions = createLinkRelaySessions({ fingerprints: () => [serviceApiTokenFingerprint(LINK_KEY)] });
+  const home = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req, server) {
+    const url = new URL(req.url);
+    if (url.pathname === LINK_RELAY_AUTH_PATH) {
+      challenges++;
+      nonces.push(url.searchParams.get("nonce")!);
+      ports.push(server.requestIP(req)!.port);
+      expect(req.headers.has("authorization")).toBe(false);
+      if (challenges === 1) return new Promise<Response>(() => {});
+    }
+    return sessions.dispatch(req, server, async data => {
+      dispatches++;
+      expect(await data.text()).toBe("sent exactly once");
+      return new Response("recovered");
+    });
+  } });
+  servers.push(home);
+  const { gate, checks } = observedGate(["match"]);
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "sent exactly once" }), {
+    ...target, tunnelPort: home.port!, linkId: `lnk_${"a".repeat(16)}`, apiKeyId: "ocx_data_fixture",
+  }, { tunnel: gate, diagnostic: row => records.push(row) });
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe("recovered");
+  expect(challenges).toBe(2);
+  expect(new Set(nonces).size).toBe(2);
+  expect(new Set(ports).size).toBe(2);
+  expect(checks()).toBe(2);
+  expect(dispatches).toBe(1);
+  const retry = records.find(row => row.event === "relay_retry" && row.outcome === "auth_timeout");
+  expect(retry?.elapsedMs).toBeGreaterThanOrEqual(4500);
+  expect(retry?.elapsedMs).toBeLessThan(10_000);
+}, 12_000);
+
+
+test("repeated auth deadlines stop after the second preflight without dispatching data", async () => {
+  const { gate, checks } = observedGate(["match"]);
+  const records: LinkDiagnosticRecord[] = [];
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: "untouched" }), target, {
+    tunnel: gate, diagnostic: row => records.push(row), fetchImpl: (async () => {
+      attempts++;
+      await Bun.sleep(20);
+      throw new LinkRelayAuthTimeoutError();
+    }) as typeof fetch,
+  });
+  expect(response.status).toBe(503);
+  expect(checks()).toBe(2);
+  expect(attempts).toBe(2);
+  expect(records.map(row => [row.event, row.outcome])).toEqual([
+    ["relay_retry", "auth_timeout"], ["relay_failure", "auth_timeout"],
+  ]);
+  for (const record of records) expect(record.elapsedMs).toBeGreaterThanOrEqual(15);
+});
+
+test("concurrent requests keep their recovery budget and correlation separate", async () => {
+  const records: LinkDiagnosticRecord[] = [];
+  const first = observedGate(["deadline"]);
+  const second = observedGate(["deadline"]);
+  const responses = await Promise.all([first, second].map(({ gate }) => relayLinkDataRequestImpl(
+    relayRequest({ method: "POST" }), target, { tunnel: gate, diagnostic: row => records.push(row) },
+  )));
+  const ids = responses.map(response => response.headers.get("x-opencodex-link-request-id"));
+  expect(new Set(ids).size).toBe(2);
+  for (const id of ids) {
+    expect(records.filter(row => row.requestId === id).map(row => [row.event, row.attempt])).toEqual([
+      ["relay_retry", 1], ["relay_failure", 1],
+    ]);
+  }
+  expect(first.checks()).toBe(2);
+  expect(second.checks()).toBe(2);
+});
+
+
+test("an oversized streamed body remains a 413 when the credential-free auth deadline expires", async () => {
+  const records: LinkDiagnosticRecord[] = [];
+  let attempts = 0;
+  const response = await relayLinkDataRequestImpl(relayRequest({ method: "POST", body: new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(4)); controller.close(); },
+  }) }), target, {
+    tunnel: connectedTunnel, bodyLimitBytes: 3, diagnostic: row => records.push(row),
+    fetchImpl: (async () => {
+      attempts++;
+      // The cap may prefetch while authentication is pending, before data dispatch starts.
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      throw new LinkRelayAuthTimeoutError();
+    }) as typeof fetch,
+  });
+  expect(response.status).toBe(413);
+  expect(await response.json()).toEqual({ error: "link relay request body too large" });
+  expect(attempts).toBe(1);
+  expect(records.some(row => row.event === "relay_retry")).toBe(false);
+});

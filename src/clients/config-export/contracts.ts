@@ -1,6 +1,12 @@
 // Shared client export contracts.
+import type { ExportClientId } from "../client-ids";
+export type { ExportClientId } from "../client-ids";
+import { canonicalizeReasoningEfforts } from "../../reasoning-effort";
 import type { OcxConfig } from "../../types";
 import type { ConfigFormat } from "../../integrations/serialize";
+import type { ExportModelNames } from "./model-names";
+
+export const DROID_DEFAULT_EFFORT_HEADER = "x-opencodex-droid-default-effort";
 
 /**
  * One entry opencodex owns inside a client's config: the JSON path to it and
@@ -37,6 +43,13 @@ export interface OpencodeCatalogModel {
   provider?: string;
   id?: string;
   contextWindow?: number;
+  maxTokens?: number;
+  /**
+   * Authoritative input ceiling, distinct from `contextWindow` (GPT-5.6 advertises 922k
+   * usable input under a 1.05M window). Carried from the catalog row so a client that has a
+   * separate input limit never treats the whole window as prompt budget.
+   */
+  maxInputTokens?: number;
   displayName?: string;
   /**
    * Declared input modalities, carried verbatim from `/api/models`. Serialized as opencode's
@@ -47,12 +60,18 @@ export interface OpencodeCatalogModel {
   inputModalities?: readonly string[];
   /** Declared effort ladder. Exported as opencode model variants where the client reads them. */
   reasoningEfforts?: readonly string[];
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
   /**
    * Declared default effort. Carried so every client export reads one deduped, visibility-
-   * filtered ladder per model. The opencode serializer deliberately does NOT turn it into a
-   * model-level setting — see {@link opencodeEffortVariants} for why.
+   * filtered ladder per model. Client serializers map it into their own model defaults
+   * and allow the selected variant to override it.
    */
   defaultReasoningEffort?: string;
+  supportsTools?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningSummaries?: boolean;
 }
 
 /**
@@ -63,6 +82,8 @@ export interface OpencodeCatalogModel {
 export interface ExportModel {
   /** Canonical proxy selector: `provider/id`, or bare slug for native. */
   namespaced: string;
+  /** Provider-qualified alias proven equivalent by the shared management row loader. */
+  aliasNamespaced?: string;
   /** Hub-resolved Fast availability; exporters never infer it from local config. */
   fastRowAvailable?: boolean;
   provider: string;
@@ -71,13 +92,109 @@ export interface ExportModel {
   native?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxTokens?: number;
+  /** Authoritative input ceiling; optional and never guessed from the context window. */
+  maxInputTokens?: number;
   inputModalities?: string[];
   /** Optional effort ladder exported only to clients that support it. */
   reasoningEfforts?: string[];
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
   defaultReasoningEffort?: string;
+  supportsTools?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningSummaries?: boolean;
+}
+
+/**
+ * Effective, override-applied export metadata for one model row: what a client export should
+ * serialize, as distinct from the raw editor representation `/api/models` also carries.
+ *
+ * Custom rows are the reason this exists. Their row fields are the operator's stored
+ * OVERRIDES (an absent field means "not overridden", an empty ladder means "no rungs"), so a
+ * serializer reading only them drops every capability the model inherits from the provider,
+ * the registry, or the gathered catalog. The management row list resolves that projection
+ * from the same canonical sources routed rows use and attaches it additively — the raw
+ * override fields stay exactly what the editor wrote.
+ */
+export interface EffectiveModelExportMetadata {
+  contextWindow?: number;
+  /** Input ceiling; distinct from `contextWindow`, carried only when a source asserts one. */
+  maxInputTokens?: number;
+  /** Output ceiling (a catalog row's `maxOutputTokens`). */
+  maxTokens?: number;
+  inputModalities?: string[];
+  /** Effective ladder; `[]` is an explicit "no rungs" declaration and survives as `[]`. */
+  reasoningEfforts?: string[];
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
+  /**
+   * A default some canonical source declared — never one synthesized from the ladder's
+   * preference order, and only when it is a member of the effective ladder. An empty
+   * ladder suppresses it entirely: there is no rung to default to.
+   */
+  defaultReasoningEffort?: string;
+  supportsTools?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningSummaries?: boolean;
+}
+
+/**
+ * Canonical explicit capabilities and positive evidence for otherwise unknown booleans.
+ * No independent provider fact tables or name-based inference.
+ */
+export interface ExportCapabilityEvidence {
+  native?: boolean;
+  supportsReasoning?: boolean;
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  reasoningEfforts?: readonly string[];
+  supportsReasoningSummaries?: boolean;
+  /** Normalized upstream capability names a catalog row carried (e.g. `"tools"`). */
+  capabilities?: readonly string[];
+  /** Provider-level parallel tool call opt-in for this model. */
+  parallelToolCalls?: boolean;
+}
+
+/**
+ * Tool support a canonical source positively asserts, or undefined when nothing is known.
+ *
+ * Mirrors the routing reader (`src/routing/capability.ts`): a catalog row without `"tools"`
+ * is UNKNOWN, never a negative — the row may simply not enumerate capabilities. `native`
+ * rows and the parallel-call opt-in are positive evidence on their own.
+ */
+export function knownToolsSupport(evidence: ExportCapabilityEvidence): boolean | undefined {
+  if (evidence.native === true) return true;
+  if (evidence.capabilities?.includes("tools") === true) return true;
+  if (evidence.parallelToolCalls === true) return true;
+  return undefined;
+}
+
+/**
+ * Explicit reasoning support, or positive canonical evidence when no boolean is declared.
+ *
+ * Never `false` from a missing or empty effort ladder: an empty ladder says "no ADJUSTABLE
+ * effort", which is not the claim "cannot reason" — a model can reason at a fixed depth with
+ * no rung to select. Known evidence is a positive reasoning rung (the catalog's own statement
+ * that the model accepts reasoning parameters) or delivered reasoning summaries. `none` is
+ * the off sentinel, not a rung: a ladder of only `none` offers an off variant and asserts
+ * nothing about whether the model reasons, so it is not positive evidence on its own.
+ */
+export function knownReasoningSupport(evidence: ExportCapabilityEvidence): boolean | undefined {
+  if (typeof evidence.supportsReasoning === "boolean") return evidence.supportsReasoning;
+  if (evidence.supportsThinkingToggle === true || evidence.supportsReasoningEffort === true) return true;
+  if (evidence.supportsReasoningSummaries === true) return true;
+  if (evidence.supportsReasoningEffort !== false && evidence.reasoningEfforts !== undefined
+    && canonicalizeReasoningEfforts(evidence.reasoningEfforts).some(effort => effort !== "none")) {
+    return true;
+  }
+  return undefined;
 }
 
 export interface ExportContext {
+  modelNames?: ExportModelNames;
   /** `http://host:port/v1` — the OpenAI-compatible surface the client dials. */
   baseUrl: string;
   models: readonly ExportModel[];
@@ -86,24 +203,22 @@ export interface ExportContext {
    * admission from `apiKey` to the `x-opencodex-api-key` header.
    */
   config?: OcxConfig;
+  droidReasoningDefaults?: DroidReasoningDefaults;
+  /**
+   * The parsed target document, when the caller has one in hand.
+   *
+   * A client whose reader picks between two roots needs the bytes on disk to
+   * choose: Command Code resolves `document.provider ?? document.providers`, so
+   * writing the singular root into a document that already carries the plural one
+   * leaves the user's providers unreadable rather than merging with them. Absent
+   * for `ocx export`, which has no target file — the builder then writes its
+   * default root, exactly as before.
+   */
+  document?: unknown;
 }
 
-export type ExportClientId =
-  | "opencode"
-  | "pi"
-  | "omp"
-  | "hermes"
-  | "openclaw"
-  | "kimi"
-  | "gajae"
-  | "dsh"
-  | "mcode"
-  | "zcode"
-  | "prime"
-  | "aside"
-  | "raycast"
-  | "omo"
-  | "cline";
+/** Namespaced model selector to one of that model's declared reasoning efforts. */
+export type DroidReasoningDefaults = Record<string, string>;
 
 export interface ExportClientSpec {
   id: ExportClientId;
@@ -144,6 +259,18 @@ export interface ExportClientSpec {
    * reasoning as the Grok managed block's non-loopback refusal.
    */
   loopbackOnly: boolean;
+  /** Refuse apply/refresh without blocking status, disable or Undo. Pure and value-free. */
+  validateApply?: (ctx: ExportContext) => string | null;
+  /**
+   * True when the destination file may carry comments and trailing commas
+   * even though `format` is "json" and serialization stays pretty JSON.
+   *
+   * Parse tolerates them by canonicalizing the text before the rewrite-safety
+   * scan (Kilo's kilo.jsonc). A spec flag rather than a client-name branch:
+   * the next OpenCode-family client opts in here instead of growing another
+   * `clientId ===` check at every parse site.
+   */
+  jsonc?: boolean;
 }
 
 export interface PiModelEntry {

@@ -11,6 +11,7 @@
  */
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "./callback-server";
 import { generatePKCE } from "./pkce";
+import { normalizeOAuthPlan } from "./plan";
 import type { OAuthController, OAuthCredentials } from "./types";
 import { antigravityUserAgent, ANTIGRAVITY_IDE_VERSION } from "../adapters/client-fingerprint";
 
@@ -67,6 +68,12 @@ function emailFromToken(accessToken: string, idToken: string | undefined): strin
   return typeof email === "string" && email.length > 0 ? email.toLowerCase() : undefined;
 }
 
+function subjectFromToken(accessToken: string, idToken: string | undefined): string | undefined {
+  const payload = (idToken ? decodeJwtPayload(idToken) : undefined) ?? decodeJwtPayload(accessToken);
+  const sub = payload?.sub;
+  return typeof sub === "string" && sub.trim().length > 0 ? sub.trim() : undefined;
+}
+
 async function postToken(body: Record<string, string>, signal?: AbortSignal): Promise<GoogleTokenPayload> {
   const response = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
@@ -94,7 +101,7 @@ function extractProjectId(data: Record<string, unknown> | undefined): string | u
   return undefined;
 }
 
-async function loadCodeAssistProject(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
+async function loadCodeAssistProject(accessToken: string, signal?: AbortSignal): Promise<{ projectId?: string; plan: string | null; defaultTierId?: string } | undefined> {
   const response = await fetch(`${PROD_API}/${API_VERSION}:loadCodeAssist`, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": antigravityUserAgent() },
@@ -102,10 +109,31 @@ async function loadCodeAssistProject(accessToken: string, signal?: AbortSignal):
     signal: requestSignal(signal),
   });
   if (!response.ok) return undefined;
-  return extractProjectId((await response.json().catch(() => undefined)) as Record<string, unknown> | undefined);
+  const data: unknown = await response.json().catch(() => undefined);
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  const payload = data as Record<string, unknown>;
+  const tier = (value: unknown) => value && typeof value === "object" && "id" in value
+    ? normalizeOAuthPlan(value.id) : undefined;
+  let defaultTierId: string | undefined;
+  if (Array.isArray(payload.allowedTiers)) {
+    for (const entry of payload.allowedTiers) {
+      if (entry && typeof entry === "object" && (entry as { isDefault?: unknown }).isDefault === true) {
+        const id = (entry as { id?: unknown }).id;
+        if (typeof id === "string" && id.trim()) {
+          defaultTierId = id.trim();
+          break;
+        }
+      }
+    }
+  }
+  return {
+    projectId: extractProjectId(payload),
+    plan: tier(payload.paidTier) ?? tier(payload.currentTier) ?? null,
+    ...(defaultTierId ? { defaultTierId } : {}),
+  };
 }
 
-async function onboardProject(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
+async function onboardProject(accessToken: string, signal?: AbortSignal, tierId = "free-tier"): Promise<string | undefined> {
   for (let attempt = 0; attempt < ONBOARD_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw signal.reason ?? new Error("Antigravity onboarding aborted");
     const response = await fetch(`${DAILY_API}/${API_VERSION}:onboardUser`, {
@@ -116,7 +144,7 @@ async function onboardProject(accessToken: string, signal?: AbortSignal): Promis
       // sending a parenthesized UA string in a field the real client fills with `2.5.5`. It is a
       // fingerprint mismatch rather than a crash, which is why nothing failed: the request still
       // succeeds, it just does not look like Antigravity.
-      body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: ANTIGRAVITY_IDE_VERSION } }),
+      body: JSON.stringify({ tier_id: tierId, metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: ANTIGRAVITY_IDE_VERSION } }),
       signal: requestSignal(signal),
     });
     if (!response.ok) {
@@ -138,7 +166,18 @@ async function onboardProject(accessToken: string, signal?: AbortSignal): Promis
 
 /** Discover the CCA project for an access token (loadCodeAssist → onboardUser fallback). */
 export async function discoverAntigravityProject(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
-  return (await loadCodeAssistProject(accessToken, signal)) ?? (await onboardProject(accessToken, signal));
+  return (await discoverAntigravityAccount(accessToken, signal)).projectId;
+}
+
+async function discoverAntigravityAccount(accessToken: string, signal?: AbortSignal): Promise<{ projectId?: string; plan?: string | null }> {
+  const account = await loadCodeAssistProject(accessToken, signal);
+  // Once loadCodeAssist answered, an onboarding failure must not discard its tier observation;
+  // a missing project still fails login, and cancellation still propagates.
+  const projectId = account?.projectId ?? await (account
+    ? onboardProject(accessToken, signal, account.defaultTierId).catch(error => { if (signal?.aborted) throw error; return undefined; })
+    : onboardProject(accessToken, signal));
+  // An unanswered loadCodeAssist observed nothing; only a parsed body may clear a stored label.
+  return { projectId, ...(account ? { plan: account.plan } : {}) };
 }
 
 function credentialsFromPayload(payload: GoogleTokenPayload, refreshFallback = ""): OAuthCredentials {
@@ -151,10 +190,12 @@ function credentialsFromPayload(payload: GoogleTokenPayload, refreshFallback = "
   if (!refresh) throw new Error("Antigravity token response did not include a refresh token");
   const expiresIn = typeof payload.expires_in === "number" && Number.isFinite(payload.expires_in) ? payload.expires_in : 3600;
   const idToken = typeof payload.id_token === "string" ? payload.id_token : undefined;
+  const accountId = subjectFromToken(payload.access_token, idToken);
   return {
     refresh,
     access: payload.access_token,
     expires: Date.now() + expiresIn * 1000 - REFRESH_SKEW_MS,
+    ...(accountId ? { accountId } : {}),
     email: emailFromToken(payload.access_token, idToken),
   };
 }
@@ -207,13 +248,13 @@ class AntigravityOAuthFlow extends OAuthCallbackFlow {
     }, this.ctrl.signal);
     const creds = credentialsFromPayload(payload);
     this.ctrl.onProgress?.("Discovering Cloud Code Assist project");
-    const projectId = await discoverAntigravityProject(creds.access, this.ctrl.signal);
+    const { projectId, plan } = await discoverAntigravityAccount(creds.access, this.ctrl.signal);
     if (!projectId) {
       // Fail the login rather than persisting a credential that every request would reject for a
       // missing CCA project — otherwise status shows "logged in" while all calls fail closed.
       throw new Error("Antigravity login could not discover a Cloud Code Assist project for this account. Ensure the account has Antigravity/Cloud Code Assist access and try again.");
     }
-    return { ...creds, projectId };
+    return { ...creds, projectId, plan };
   }
 }
 
@@ -231,8 +272,8 @@ export async function refreshAntigravityToken(refreshToken: string, signal?: Abo
   }, signal);
   const creds = credentialsFromPayload(payload, refreshToken);
   // Re-discover the project on refresh so a newly-onboarded account fills in projectId.
-  const projectId = await discoverAntigravityProject(creds.access, signal).catch(() => undefined);
-  return projectId ? { ...creds, projectId } : creds;
+  const account = await discoverAntigravityAccount(creds.access, signal).catch(() => undefined);
+  return account ? { ...creds, ...account } : creds;
 }
 
 /**

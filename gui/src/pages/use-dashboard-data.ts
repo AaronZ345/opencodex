@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useKeyedClientResource } from "../client-resource";
 import { replaceHash } from "../hash-routing";
 import { useI18n } from "../i18n/shared";
+import { openDesktopUpdatePage } from "../lib/desktop-shell";
 import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import {
   PROJECT_CONFIG_DIAGNOSTICS_POLL_MS,
@@ -41,17 +42,21 @@ import {
   type UpdateCheckData,
   type UpdateJob,
   type UsageSummary30d,
+  type SidecarCodexApply,
   UPDATE_CHECK_MAX_AUTO_RETRIES,
   UPDATE_CHECK_RETRY_BASE_MS,
   defaultUpdateChannel,
   hashRequestsUpdateDialog,
   mergeSidecarSetting,
+  sidecarPatchForSave,
+  nextSidecarCodexApply,
   readDashboardSectionFromHash,
   requireJson,
   webSearchModelOptionsForPicker,
   visionModelOptions,
   useModalDialog,
 } from "./dashboard-shared";
+import { shadowCallSaveErrorKey } from "./models-shared";
 
 const CONTROLS_CACHE_PREFIX = "ocx.dash.controls.v1:";
 const OVERVIEW_CACHE_PREFIX = "ocx.dash.overview.v1:";
@@ -177,7 +182,9 @@ export function useDashboardData(apiBase: string, refreshEpoch = 0) {
   const [shadowCall, setShadowCall] = useState<ShadowCallData | null>(() => cachedControls?.shadowCall ?? null);
   const [usage30d, setUsage30d] = useState<UsageSummary30d | null>(() => cachedUsage);
   const [sidecarSaving, setSidecarSaving] = useState(false);
+  const [sidecarCodexApply, setSidecarCodexApply] = useState<SidecarCodexApply | undefined>();
   const [shadowCallSaving, setShadowCallSaving] = useState(false);
+  const [shadowCallError, setShadowCallError] = useState<string | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [maMode, setMaMode] = useState<MaMode>(() => cachedMaMode ?? "default");
@@ -557,6 +564,7 @@ const [maBusy, setMaBusy] = useState(false);
 
   const saveSidecar = async (patch: SidecarPatch) => {
     if (!sidecar || sidecarSaving) return;
+    patch = sidecarPatchForSave(sidecar, patch);
     const previous = sidecar;
     const next = {
       webSearch: mergeSidecarSetting(sidecar.webSearch, patch.webSearch),
@@ -573,6 +581,11 @@ const [maBusy, setMaBusy] = useState(false);
         body: JSON.stringify(patch),
       });
       const data = await requireJson<SidecarData>(res, "save failed");
+      // The Codex-side write is a separate outcome from the stored switch: it can be refused
+      // while the setting is saved, and the card has to say so instead of implying it happened.
+      // A save that did not move this switch answers `not_requested` about a file it never
+      // touched, so it must not clear an earlier failure.
+      setSidecarCodexApply(previousReport => nextSidecarCodexApply(previousReport, data.codexWebSearch));
       setSidecar({
         webSearch: data.webSearch,
         vision: data.vision,
@@ -591,6 +604,8 @@ const [maBusy, setMaBusy] = useState(false);
       });
     } catch {
       setSidecar(previous);
+      // The request failed before any answer existed, so it says nothing about the Codex file:
+      // an outstanding report stays until a write that ran or a successful sync settles it.
     } finally {
       setSidecarSaving(false);
     }
@@ -601,6 +616,7 @@ const [maBusy, setMaBusy] = useState(false);
     const previous = shadowCall;
     const updated = { ...shadowCall, ...patch };
     setShadowCallSaving(true);
+    setShadowCallError(null);
     shadowCallMutationInFlightRef.current = true;
     setShadowCall(updated);
     try {
@@ -609,10 +625,16 @@ const [maBusy, setMaBusy] = useState(false);
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       });
-      if (!res.ok) throw new Error("shadow-call save failed");
+      if (!res.ok) {
+        setShadowCall(previous);
+        const body = await res.json().catch(() => null) as { code?: unknown } | null;
+        setShadowCallError(t(shadowCallSaveErrorKey(body?.code)));
+        return;
+      }
       shadowCallMutationEpochRef.current += 1;
     } catch {
       setShadowCall(previous);
+      setShadowCallError(t("models.networkError"));
     } finally {
       shadowCallMutationInFlightRef.current = false;
       setShadowCallSaving(false);
@@ -787,6 +809,9 @@ const [maBusy, setMaBusy] = useState(false);
       setSyncResult(data);
       if (data.ok && data.status === "applied") {
         dispatchSettings({ type: "applied" });
+        // A successful sync rewrites the Codex config from the stored settings, which is exactly
+        // the write the sidecar card was still warning about.
+        setSidecarCodexApply(undefined);
       }
       if (data.projectConfigGrouped) setProjectConfigWarnings(data.projectConfigGrouped);
     } catch (err) {
@@ -846,6 +871,7 @@ const [maBusy, setMaBusy] = useState(false);
   };
 
   const openUpdateDialog = () => {
+    if (openDesktopUpdatePage()) return;
     const channel = defaultUpdateChannel(health?.version);
     setUpdateChannel(channel);
     setUpdateRestart(true);
@@ -915,7 +941,7 @@ const [maBusy, setMaBusy] = useState(false);
     health, startupHealth, providers, models, settings, sidecar, shadowCall, usage30d,
     usageLoading: usagePoll.loading && !usage30d,
     healthLoading: overviewPoll.loading && !health,
-    sidecarSaving, shadowCallSaving, modelsLoading, settingsSaving, syncing,
+    sidecarSaving, shadowCallSaving, shadowCallError, modelsLoading, settingsSaving, syncing,
 maMode, maModeResolved, maBusy, setMaHelpOpen, maHelpOpen,
    maError,
     maAdvisory, maAdvisoryOpen, pendingMaMode, keepMaMode, chooseMaV1, dismissMaSurfaceDialog,
@@ -930,6 +956,7 @@ maMode, maModeResolved, maBusy, setMaHelpOpen, maHelpOpen,
     effortCapHelpTriggerRef, updateTriggerRef, maHelpTriggerRef, shadowCallHelpTriggerRef,
     effortCapHelpDialogRef, updateDialogRef, maHelpDialogRef, shadowCallHelpDialogRef,
     filteredGroups, sidecarModels, visionModels,
+    sidecarCodexApply,
     saveSidecar, saveShadowCall, switchMaMode, toggleCodexAutoStart, toggleCodexDesktopAuthless,
     toggleCodexClientCompaction, runSync, clearSyncFeedback,
     fetchUpdateCheck, closeUpdateDialog, openUpdateDialog, changeUpdateChannel, runUpdate,

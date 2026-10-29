@@ -1,3 +1,5 @@
+import { isPassiveRead } from "./passive-read";
+
 export type AppOwnedRetainedCategory = "logs" | "caches" | "blobs" | "continuation";
 export type AppOwnedObservedCategory = "translator" | "serialized_tails";
 
@@ -14,6 +16,11 @@ export interface RetainedStoreRegistration {
   category: AppOwnedRetainedCategory;
   snapshot(): RetainedStoreSnapshot;
   evictOldest(): number;
+  /**
+   * Eviction only releases memory: no spill, snapshot or other write. Only such stores are
+   * demoted inside a passive read (#6959); the rest wait for this process's own next enforcement.
+   */
+  passiveEvictable?: true;
 }
 
 export interface ObservedBufferRegistration {
@@ -168,11 +175,15 @@ function nextCandidate(
   snapshots: ReadonlyMap<string, RetainedStoreSnapshot>,
   ineligible: Set<string>,
 ): RetainedStoreRegistration | undefined {
+  // A passive read (a Remote Link Child's, #6959) demotes only stores whose eviction is memory-only:
+  // a continuation spills to disk and a replay cache rewrites its snapshot.
+  const passive = isPassiveRead();
   for (const category of CATEGORY_ORDER) {
     let candidate: RetainedStoreRegistration | undefined;
     let candidateAt = Number.POSITIVE_INFINITY;
     for (const registration of retainedStores.values()) {
       if (registration.category !== category || ineligible.has(registration.id)) continue;
+      if (passive && registration.passiveEvictable !== true) continue;
       const snapshot = snapshots.get(registration.id);
       if (!snapshot || snapshot.evictableBytes <= 0) continue;
       const oldestAt = snapshot.oldestAt;
@@ -209,14 +220,14 @@ function warnPinnedSaturation(): void {
   console.warn("[app-owned-memory] retained state remains over budget with no evictable candidate");
 }
 
-export function enforceAppOwnedMemoryBudget(): AppOwnedBytesSnapshot {
+export function enforceAppOwnedMemoryBudget(reservedPinnedBytes = 0): AppOwnedBytesSnapshot {
   if (isEnforcing) return appOwnedBytesSnapshot();
   isEnforcing = true;
   enforcementCounters.runs += 1;
   try {
     const ineligible = new Set<string>();
     const current = retainedSnapshots();
-    while (current.total > budgetBytes) {
+    while (current.total + reservedPinnedBytes > budgetBytes) {
       const candidate = nextCandidate(current.stores, ineligible);
       if (!candidate) {
         enforcementCounters.noEvictableCandidate += 1;
@@ -248,6 +259,17 @@ export function enforceAppOwnedMemoryBudget(): AppOwnedBytesSnapshot {
   } finally {
     isEnforcing = false;
   }
+}
+
+/**
+ * Admission for a pinned allocation the owner cannot demote later. The proposal is
+ * counted against the shared target BEFORE the normal eviction pass runs, so
+ * reclaimable logs, caches, blobs and continuations are demoted first and only a
+ * projected total still above budget — pinned state that cannot fit — is refused.
+ */
+export function admitAppOwnedPinnedBytes(proposedPinnedBytes: number): boolean {
+  const snapshot = enforceAppOwnedMemoryBudget(Math.max(0, proposedPinnedBytes));
+  return snapshot.retainedBytes + Math.max(0, proposedPinnedBytes) <= snapshot.budgetBytes;
 }
 
 export function resetAppOwnedMemoryForTests(): void {

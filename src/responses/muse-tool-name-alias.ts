@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { wireToolInnerName } from "./tool-name-aliases";
 
 const MUSE_TOOL_NAME_MAX = 64;
@@ -7,6 +6,25 @@ const MUSE_TOOL_NAME_HASH_LEN = 8;
 const MUSE_SAFE_NAME = /^[a-zA-Z0-9_-]+$/;
 
 export type MuseToolNameAliases = ReadonlyMap<string, string>;
+
+/**
+ * Final wire name for an identity before the Muse length rewrite.
+ *
+ * The alias map is request-local and already narrowed by `tool_choice`. Returning undefined for
+ * a contradictory map keeps downstream identity checks fail-closed instead of choosing one alias.
+ */
+export function museWireNameForOriginal(
+  originalName: string,
+  aliases: MuseToolNameAliases,
+): string | undefined {
+  let wireName: string | undefined;
+  for (const [candidate, original] of aliases) {
+    if (original !== originalName) continue;
+    if (wireName !== undefined && wireName !== candidate) return undefined;
+    wireName = candidate;
+  }
+  return wireName ?? originalName;
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -34,7 +52,7 @@ function isPassThroughMuseToolName(name: string): boolean {
 
 function hashSuffix(originalName: string, salt: number): string {
   const hashInput = salt === 0 ? originalName : originalName + "#" + salt;
-  return createHash("sha256").update(hashInput).digest("hex").slice(0, MUSE_TOOL_NAME_HASH_LEN);
+  return Bun.SHA256.hash(hashInput, "hex").slice(0, MUSE_TOOL_NAME_HASH_LEN);
 }
 
 /**

@@ -23,6 +23,25 @@ Responses 표현이 이 연결의 중심입니다. 네이티브 호환 경로는
 
 자격 증명을 포함하는 모델·이미지·동영상·검색 요청은 동일 출처를 포함한 HTTP 리다이렉트를 자동으로 따라가지 않습니다. 리다이렉트하는 별칭 대신 최종 업스트림 API URL을 설정하세요. 서버는 리다이렉트 대상으로 자격 증명이나 요청 본문을 다시 보내지 않습니다. 각 응답 처리 경로의 기존 오류·전달 동작은 유지되며, native Responses와 compact 경로는 원래 3xx와 `Location`을 클라이언트에 반환할 수 있습니다. 클라이언트의 리다이렉트 동작은 이 서버 전송 정책과 별개입니다.
 
+## xAI policy refusals
+
+일부 xAI Chat Completions 거부는 HTTP 200과 `finish_reason: content_filter` 대신, HTTP 403과 `I can't help with that request.` 같은 거절 문장만 돌려줍니다. Codex는 403을 전송 실패로 보므로 사용자 턴이 기록되지 않고 같은 요청을 다시 보냅니다.
+
+콤보가 아닌 Responses 요청에서 OpenCodex는 allowlist에 오른 그 403을 HTTP 200 Responses, `status: "incomplete"`, `incomplete_details.reason: "content_filter"`로 바꿉니다. openai-chat 어댑터 경로와 openai-responses passthrough(grok-4.6 / grok-4.5 OAuth) 모두에서 동작합니다. 스트리밍도 같은 incomplete 경계입니다. 빈 본문 403은 오류로 남습니다. 구독, 크레딧, 권한, `not allowed to use this model` 403은 오류로 남습니다. 콤보 페일오버는 원래 HTTP 403을 그대로 봅니다.
+
+## 선언되지 않은 도구 호출
+
+Responses 엔드포인트에서 요청이 도구 카탈로그를 선언한 경우, 네이티브 패스스루 응답이 그 카탈로그에 없는 클라이언트 실행 도구를 호출하면 호출을 전달하는 대신 턴을 실패 처리합니다: 오류 코드 `undeclared_tool_call`이 포함된 `response.failed` 이벤트와 `data: [DONE]`을 보내고, 버퍼링된 JSON은 같은 코드와 함께 HTTP 502를 반환합니다. 이 거부는 응답이 후속 처리 상태에 들어가기 전에 실행되며, `authMode: "forward"` 공급자이거나 요청에 선언된 카탈로그가 없는 경우에만 적용되지 않습니다.
+
+Chat Completions와 Messages 엔드포인트는 지연된 도구 카탈로그를 지원합니다: 이러한 클라이언트는 카탈로그의 일부만 선언하고 나머지를 자체 도구 레지스트리를 통해 런타임에 발견할 수 있으며, 전체 선언 경계는 번역된 카탈로그 스냅숏이 아니라 그 레지스트리가 소유합니다. 선언된 목록에 없는 호출은 클라이언트가 검증하도록 전달되고, 명시적으로 빈 `tools: []`에 대한 호출은 여전히 거부됩니다 — 빈 선언 아래에는 지연 레지스트리가 존재하지 않기 때문입니다. 이러한 거부도 모든 와이어에서 `undeclared_tool_call` 코드를 유지합니다:
+
+- **Chat Completions:** 코드를 포함하는 OpenAI 형식 `error` 객체가 담긴 `data:` 프레임을 보낸 뒤, 성공 완료나 `[DONE]` 없이 스트림을 닫습니다. 버퍼링된 JSON은 코드와 함께 HTTP 502를 반환합니다.
+- **Messages:** 본문이 `{ "type": "error", "error": { "type": "api_error", "code": "undeclared_tool_call", ... } }`인 Anthropic `event: error` 프레임을 보내며, 성공적인 `message_stop`이나 `[DONE]`은 보내지 않습니다. 버퍼링된 JSON은 코드가 포함된 HTTP 502 `api_error`를 반환합니다. 확정적인 카탈로그 위반은 재시도 가능한 `overloaded_error`(HTTP 529)로 보고되지 않습니다.
+
+별도로, 모든 인바운드 와이어에서 공급자의 `default.` 네임스페이스 호출은 요청이 선언한 원래 도구 이름으로 정규화됩니다(`default.Read` → `Read`).
+
+네이티브 Messages는 `tools: []`와 함께 제공된 시스템 메시지의 인라인 도구 정의도 인식합니다. 해당 이름은 영구적으로 제거될 때까지 호출할 수 있으며, 다른 클라이언트 도구를 허용하지는 않습니다. 호스팅된 MCP 호출과 서버 도구의 인수 스트림은 네이티브 형식을 유지합니다.
+
 ## 엔드포인트 개요
 
 | 클라이언트 표면 | 엔드포인트 | 성공한 비스트리밍 결과 | 성공한 스트리밍 또는 소켓 결과 |
@@ -66,6 +85,14 @@ deltas, 그리고 정확히 하나의 종료 `response.completed`, `response.fai
 
 `stream: false`이거나 `stream`이 없으면, 같은 adapter 이벤트가 하나의 Responses JSON 객체로 수집됩니다.
 두 형식 모두 선택한 모델, output item, 종료 상태, usage를 보존합니다.
+
+canonical ChatGPT Codex 경로는 upstream이 SSE만 받으므로 upstream 요청에만 `stream: true`를 사용합니다.
+OpenCodex는 종료 스트림을 제한된 크기 안에서 검증한 뒤 클라이언트가 요청한 JSON 형태로 접습니다.
+명시적인 `store` 값은 바꾸지 않으며, 검증에 실패하면 일부 JSON을 HTTP 200으로 반환하지 않고 오류로
+끝냅니다. 한도는 프레임당 4 MiB, transcript와 재구성 입력 각각 32 MiB, 100,000 SSE 프레임, 재구성
+output item 10,000개입니다. `stallTimeoutSec`는 첫 body byte와 이후 무응답 간격에 모두 적용됩니다.
+값이 `0`이거나 로컬 upstream 기본값으로 비활성화된 경우 즉시 만료하지 않고, 독립된 15분 전체 상한만
+적용합니다. 스트리밍 클라이언트의 동작은 바뀌지 않습니다.
 
 클라이언트로 전달되는 Responses SSE 프레임은 SSE 블록 구분자 앞의 원시 바이트 기준으로 프레임당 4 MiB로 제한됩니다. HTTP에서는 구분자 없이 이 한도를 초과한 업스트림 프레임을 합성 `response.failed` 이벤트와 이어지는 `data: [DONE]`으로 fail closed 처리합니다. Responses WebSocket 브리지에서는 같은 조건에서 502 `websocket_protocol_error`를 보내고 업스트림 reader를 취소합니다. 완전한 Responses 종료 프레임이 이미 수신된 경우에는 그 종료가 우선하며, 이후의 과도한 크기 또는 잘못된 바이트는 완료된 턴을 전송 오류로 바꾸지 않고 버립니다.
 
@@ -267,12 +294,17 @@ call creation 이후 클라이언트는 다음의 지원되는 모든 inbound �
 프록시는 업스트림 join URL을 정규화한 뒤, 양방향 텍스트 및 바이너리 프레임을 투명하게 릴레이합니다. 업스트림
 인증은 프록시가 소유한 상태로 유지되며, 클라이언트 프로토콜 헤더는 보존됩니다.
 
+sideband 연결을 종료할 때 프록시는 업스트림의 정상 종료를 1초 동안 기다린 뒤, 응답하지 않는
+전송 연결을 강제로 닫습니다. 클라이언트 업그레이드가 실패한 경우에도 실제 업스트림 연결이
+닫힌 것을 확인한 후에만 해당 계정의 활성 통화 용량을 반환합니다.
+
 call creation과 sideband join은 같은 OpenAI 계정으로 이루어져야 하며, 그렇지 않으면 업스트림이 join을
 거부합니다(`404`). 두 요청 모두 Codex의 `session-id`와 `thread-id` 헤더를 실어 보냅니다. Pool 모드는
 계정 선택을 그 쌍에 묶어 두므로(프로세스 로컬) 프록시에 도착한 join은 통화를 만든 계정을 그대로 쓰고,
 Direct 모드는 두 요청 모두 호출자의 현재 bearer를 전달합니다. 릴레이되는 클라이언트 헤더는 정확히
 `openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`,
-`x-codex-turn-metadata`(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
+`x-codex-turn-metadata`, `voice-session-id`(실시간 `x-session-id`와 별개인 클라이언트 음성 세션 id)
+(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
 호출자가 보낸 경우에만 전달되고 프록시가 만들어 내지 않습니다. `Authorization`과 ChatGPT 계정 id는
 ChatGPT 경로에서 프록시가 소유합니다(Pool은 저장된 계정으로 교체, Direct는 검증된 호출자 bearer를 전달).
 API 키 프로바이더는 자체 bearer를 씁니다. Codex가 join을 프록시로 보내는 것은
@@ -356,3 +388,21 @@ OpenAI 스타일 `origin_rejected` body가 아니라 403 `permission_error`입�
 opencodex는 읽을 수 없는 바이트를 프로바이더에 보내는 대신 `unreadable_encrypted_agent_task`로
 실패합니다. worker task와 관련된 클라이언트 동작은 [서브에이전트 표면](/guides/sub-agent-surface/)을
 참조하세요.
+
+### 기존 대화에서 프로바이더를 바꿀 때
+
+다시 보내는 추론 항목의 `encrypted_content`는 그것을 만든 프로바이더와 자격 증명만 읽을 수 있습니다.
+대화를 마지막으로 처리한 프로바이더가 달랐다는 사실을 opencodex가 알고 있으면, 보내기 전에 그 blob을
+빼고 항목의 요약은 남깁니다. 그 프로바이더가 엔드포인트나 자격 증명까지 달랐다면 항목의 `rs_…` id도
+뺍니다. 새 대상은 그 id가 가리키는 항목을 찾을 수 없기 때문입니다. 프록시를 다시 시작한 직후처럼
+opencodex가 알 수 없을 때는 새 대상이 blob을 거부합니다. OpenAI와 Azure OpenAI는
+`400 invalid_encrypted_content`로 응답합니다. 그러면 opencodex는 이전 프로바이더의 추론 상태, 즉 blob과
+`rs_…` id를 뺀 요청을 한 번만 다시 보냅니다. id를 남기면 `Item with id 'rs_…' not found`가 나기
+때문입니다.
+
+이 복구는 Responses 프로토콜을 쓰는 모든 어댑터에 적용되므로 `openai-responses`와 `azure-openai`는
+똑같이 동작합니다. 복구에 성공하면 같은 대상에서 이어지는 그 대화의 턴은 이후 5분 동안 첫 전송 전에
+이 상태를 뺍니다. 재전송은 요청의 일반 전송 예산에서 차감됩니다. 일반 400과 429는 이 방식으로 다시
+보내지 않고 5xx도 마찬가지입니다. 예외는 하나뿐입니다. 암호화된 도구 출력이 들어 있는 요청에 대해 본문이
+그 복호화 실패 거부와 정확히 같은 502는 같은 한 번의 재전송을 받습니다. 두 번째 거부는 그대로
+클라이언트에 전달됩니다. 이때는 대상 프로바이더에서 새 대화를 시작하세요.

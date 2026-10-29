@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   applySidecarBackendChange,
   applySidecarModelChange,
+  applySidecarPoolChange,
   serializeSidecarOverride,
   sidecarSelectValue,
 } from "../src/pages/claude-code-sidecar";
@@ -31,6 +32,20 @@ test("Empty Auto serializes as null (reloads as Inherit)", () => {
   expect(serializeSidecarOverride({})).toBeNull();
 });
 
+test("disabled intent survives untouched saves and backend drafts until explicit reset or model choice", () => {
+  const disabled = { enabled: false };
+  expect(serializeSidecarOverride(disabled)).toEqual({ enabled: false, backend: null, model: "" });
+  expect(serializeSidecarOverride({ enabled: true })).toEqual({ enabled: true, backend: null, model: "" });
+  expect(serializeSidecarOverride(applySidecarBackendChange(disabled, "auto"))).toEqual({ enabled: false, backend: null, model: "" });
+  expect(serializeSidecarOverride(applySidecarBackendChange(disabled, "inherit"))).toBeNull();
+  expect(serializeSidecarOverride(applySidecarModelChange(disabled, "gpt-5.6-luna")))
+    .toEqual({ enabled: true, backend: null, model: "gpt-5.6-luna" });
+  const typedThenCleared = applySidecarModelChange(applySidecarModelChange(disabled, "gpt-5.6-luna"), "  ");
+  expect(serializeSidecarOverride(typedThenCleared)).toEqual({ enabled: false, backend: null, model: "" });
+  expect(serializeSidecarOverride({ enabled: false, backend: "openai", model: "gpt-5.6-luna" }))
+    .toEqual({ enabled: false, backend: "openai", model: "gpt-5.6-luna" });
+});
+
 test("Switching back to Inherit clears the override", () => {
   const withModel = applySidecarModelChange(
     applySidecarBackendChange(undefined, "auto"),
@@ -39,6 +54,18 @@ test("Switching back to Inherit clears the override", () => {
   expect(applySidecarBackendChange(withModel, "inherit")).toBeUndefined();
   expect(sidecarSelectValue(undefined)).toBe("inherit");
   expect(serializeSidecarOverride(undefined)).toBeNull();
+});
+
+test("clearing a model preserves an already-enabled or implicit override", () => {
+  for (const enabled of [true, undefined]) {
+    const initial = { enabled, backend: "openai" as const, model: "gpt-5.6-luna" };
+    const cleared = applySidecarModelChange(initial, "   ");
+    expect(serializeSidecarOverride(cleared)).toEqual({
+      ...(enabled === undefined ? {} : { enabled }), backend: "openai", model: "",
+    });
+    expect(serializeSidecarOverride(applySidecarModelChange(applySidecarModelChange(initial, "replacement"), "")))
+      .toEqual(serializeSidecarOverride(cleared));
+  }
 });
 
 test("Switching Auto ↔ OpenAI ↔ Anthropic preserves the model", () => {
@@ -71,4 +98,17 @@ test("Explicit backends trim whitespace-padded models before persist", () => {
     backend: "anthropic",
     model: "claude-sonnet-4",
   });
+});
+
+test("pool serializer omits untouched inheritance, carries B, and deletes only explicit edits", () => {
+  expect(serializeSidecarOverride({ backend: "anthropic", model: "claude-haiku-4-5" }))
+    .toEqual({ backend: "anthropic", model: "claude-haiku-4-5" });
+  const chosen = applySidecarPoolChange({ backend: "anthropic", model: "claude-haiku-4-5" }, "anthropic2");
+  expect(serializeSidecarOverride(chosen)).toEqual({ backend: "anthropic", model: "claude-haiku-4-5", anthropicInstance: "anthropic2" });
+  expect(serializeSidecarOverride(applySidecarPoolChange(chosen, "")))
+    .toEqual({ backend: "anthropic", model: "claude-haiku-4-5", anthropicInstance: null });
+  expect(serializeSidecarOverride(applySidecarBackendChange(chosen, "openai")))
+    .toEqual({ backend: "openai", model: "claude-haiku-4-5", anthropicInstance: null });
+  expect(serializeSidecarOverride(applySidecarPoolChange(undefined, "anthropic2")))
+    .toEqual({ backend: null, model: "", anthropicInstance: "anthropic2" });
 });

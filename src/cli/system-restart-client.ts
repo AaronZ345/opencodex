@@ -1,4 +1,5 @@
 import { readRuntimePort } from "../config/process-state";
+import { readBoundedResponseBytes } from "../lib/bounded-body";
 import {
   LOCAL_ATTESTATION_CHALLENGE_HEADER,
   LOCAL_ATTESTATION_PROOF_HEADER,
@@ -6,6 +7,8 @@ import {
   verifyLocalAttestationProof,
 } from "../lib/local-management-attestation";
 import {
+  CLIENT_RESTART_REQUEST_MIN_REMAINING_MS,
+  RESTART_SUPERVISED_ERROR,
   SYSTEM_RESTART_CAPABILITY_HEADER,
   SYSTEM_RESTART_CAPABILITY_VERSION,
   SYSTEM_RESTART_EXPECTED_PID_HEADER,
@@ -16,7 +19,9 @@ import {
 } from "../lib/system-restart-contract";
 import {
   findLiveProxy,
+  isHealthzVersion,
   isOpencodexHealthz,
+  isPackageTreeFencedHealthz,
   probeHostname,
   type HealthzIdentity,
   type LiveProxy,
@@ -24,6 +29,8 @@ import {
 import type { ProxyRestartRequestOutcome } from "./tray-proxy";
 import { packageVersion } from "./help";
 import { computeVersionSkew } from "./version-skew";
+import { readUpdateRestartHome } from "./update-restart-home";
+import { UpdateRestartRequired } from "./update-restart-candidate";
 
 export const SYSTEM_RESTART_REQUEST_TIMEOUT_MS = 5_000;
 export const SYSTEM_RESTART_ATTESTATION_TIMEOUT_MS = 4_000;
@@ -36,6 +43,7 @@ export interface BoundSystemRestartDeps {
   now?: () => number;
   /** Invoking CLI version for the skew guard; defaults to this bundle's package version. */
   cliVersion?: string;
+  readUpdateHome?: typeof readUpdateRestartHome;
 }
 
 function rejected(code: string): ProxyRestartRequestOutcome {
@@ -88,6 +96,8 @@ export async function requestBoundSystemRestart(
     return rejected("restart_target_runtime_mismatch");
   }
 
+  let updateHome: ReturnType<typeof readUpdateRestartHome> | undefined;
+  try { updateHome = (deps.readUpdateHome ?? readUpdateRestartHome)(); } catch { /* normal in-place restart remains available */ }
   const attestationBudget = remaining(deadlineAt, now, SYSTEM_RESTART_ATTESTATION_TIMEOUT_MS);
   if (attestationBudget <= 0) return rejected("restart_deadline_expired");
 
@@ -105,9 +115,12 @@ export async function requestBoundSystemRestart(
   }
   const body = await proofResponse.json().catch(() => null) as HealthzIdentity | null;
   const proof = proofResponse.headers.get(LOCAL_ATTESTATION_PROOF_HEADER);
+  // A package-tree fence answers /healthz with 503 but still proves its identity (#5496).
+  // Only that exact body is admitted as a non-OK proof response; the proof check is unchanged.
+  const fenced = proofResponse.status === 503 && isPackageTreeFencedHealthz(body);
   if (
-    !proofResponse.ok
-    || !isOpencodexHealthz(body)
+    !(proofResponse.ok || fenced)
+    || !(isOpencodexHealthz(body) || fenced)
     || body?.pid !== target.pid
     || !verifyLocalAttestationProof(runtime.attestationSecret, challenge, target.pid, target.port, proof)
   ) {
@@ -127,18 +140,40 @@ export async function requestBoundSystemRestart(
   // diagnosis compares (packageVersion vs the /healthz version), so reuse that
   // comparison and refuse before POST. Placeholder versions (unknown/0.0.0) are
   // "cannot compare", not mismatch, and keep the existing behavior.
-  const proxyVersion = typeof body.version === "string" ? body.version : undefined;
-  if (computeVersionSkew(deps.cliVersion ?? ownCliVersion(), proxyVersion).skewed) {
-    return rejected("restart_version_skew");
+  //
+  // A fenced proxy booted from files that have since been replaced at the same path, so its
+  // boot version differs from this CLI by construction. What the respawn will run is the
+  // manifest now on disk, which the fence reports as installedVersion. Without a readable
+  // one the replacement is still in flight and restarting now could load a partial tree.
+  if (fenced && !isHealthzVersion(body.installedVersion)) {
+    return rejected("restart_package_tree_unsettled");
   }
+  const proxyVersion = fenced
+    ? body.installedVersion as string
+    : typeof body.version === "string" ? body.version : undefined;
+  const cliVersion = deps.cliVersion ?? ownCliVersion();
+  const skew = computeVersionSkew(cliVersion, proxyVersion);
+  if (skew.skewed && skew.relation !== "cli-newer") return rejected("restart_version_skew");
 
   let observed: LiveProxy | null;
   try {
-    observed = await (deps.findLive ?? findLiveProxy)({ deadlineAt, nowFn: now });
+    observed = await (deps.findLive ?? findLiveProxy)({ deadlineAt, nowFn: now, acceptPackageTreeFenced: true });
   } catch {
     return rejected("restart_target_recheck_failed");
   }
   if (!sameRestartTarget(target, observed)) return rejected("restart_target_changed");
+  if (skew.relation === "cli-newer") {
+    if (!updateHome) return rejected("update_restart_home_unverified");
+    const current = readRuntime(target.pid);
+    if (!current || current.pid !== runtime.pid || current.port !== runtime.port
+      || current.hostname !== runtime.hostname || current.attestationSecret !== runtime.attestationSecret) {
+      return rejected("restart_target_changed");
+    }
+    return { accepted: false, uncertain: false, error: new UpdateRestartRequired({
+      target: { ...target, pid: target.pid, version: proxyVersion },
+      runtime: { ...runtime, attestationSecret: runtime.attestationSecret }, cliVersion, home: updateHome,
+    }) };
+  }
 
   const capability = createSystemRestartCapability(
     runtime.attestationSecret,
@@ -149,6 +184,13 @@ export async function requestBoundSystemRestart(
     target.port,
   );
   if (!capability) return rejected("restart_capability_unavailable");
+
+  // A connected client runtime keeps serving when its replacement fails, but its rollback takes
+  // up to CLIENT_RESTART_BUDGET_MS. Ask only while that still ends before this CLI stops observing,
+  // or the recovery start below could race the rollback for the port (OCX-6).
+  if (body.role === "client" && deadlineAt - now() < CLIENT_RESTART_REQUEST_MIN_REMAINING_MS) {
+    return rejected("restart_deadline_expired");
+  }
 
   const requestBudget = remaining(deadlineAt, now, SYSTEM_RESTART_REQUEST_TIMEOUT_MS);
   if (requestBudget <= 0) return rejected("restart_deadline_expired");
@@ -162,10 +204,31 @@ export async function requestBoundSystemRestart(
       },
       signal: AbortSignal.timeout(requestBudget),
     });
-    return response.ok ? { accepted: true } : rejected(`restart_request_http_${response.status}`);
+    if (response.ok) return { accepted: true };
+    if (response.status === 409) {
+      const supervisor = await supervisedRefusal(response);
+      if (supervisor) return rejected(`${RESTART_SUPERVISED_ERROR}_${supervisor}`);
+    }
+    return rejected(`restart_request_http_${response.status}`);
   } catch {
     // The server may have accepted the restart before the response connection failed.
     // The coordinator observes the original PID for replacement instead of replaying.
     return uncertain("restart_request_outcome_unknown");
+  }
+}
+
+/**
+ * A client runtime under the desktop app or a service answers 409 `restart_supervised` and keeps
+ * serving (OCX-6). Read that small body and return the validated supervisor, or null.
+ */
+async function supervisedRefusal(response: Response): Promise<"service" | "desktop" | null> {
+  try {
+    const read = await readBoundedResponseBytes(response, { maxBytes: 1024, signal: AbortSignal.timeout(SYSTEM_RESTART_REQUEST_TIMEOUT_MS) });
+    if (read.oversized) return null;
+    const body = JSON.parse(new TextDecoder().decode(read.bytes)) as { error?: { code?: unknown; supervisor?: unknown } } | null;
+    if (body?.error?.code !== RESTART_SUPERVISED_ERROR) return null;
+    return body.error.supervisor === "service" || body.error.supervisor === "desktop" ? body.error.supervisor : null;
+  } catch {
+    return null;
   }
 }

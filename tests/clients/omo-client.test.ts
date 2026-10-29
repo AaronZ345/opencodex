@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   ClientPathError,
   EXPORT_CLIENTS,
@@ -43,14 +44,15 @@ describe("omo client config", () => {
    * Prime and Aside reuse Pi's builder with the session-affinity flag left at
    * its default, because nobody has verified that their engines read it. omo's
    * engine WAS verified: senpi's compiled validator accepts `compat` with
-   * `sendSessionAffinityHeaders`, so omo opts in and the generated provider is
+   * `sendSessionAffinityHeaders`, and senpi documents `supportsDeveloperRole`
+   * in the same block (#5664), so omo opts in and the generated provider is
    * byte-identical to Pi's.
    */
   test("is Pi's document including the session-affinity opt-in", () => {
     const omo = buildClientConfig("omo", context()) as PiGeneratedConfig;
     const pi = buildClientConfig("pi", context()) as PiGeneratedConfig;
     expect(omo).toEqual(pi);
-    expect(omo.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ sendSessionAffinityHeaders: true });
+    expect(omo.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ sendSessionAffinityHeaders: true, supportsDeveloperRole: false });
   });
 
   /**
@@ -102,24 +104,24 @@ describe("omo client config", () => {
     expect(omoAgentDir({}, "/home/u")).toBe(join("/home/u", ".omo", "agent"));
     expect(omoConfigPath({}, "/home/u")).toBe(join("/home/u", ".omo", "agent", "models.json"));
 
-    expect(omoConfigPath({ OMO_CODING_AGENT_DIR: "/from-omo" }, "/home/u")).toBe(join("/from-omo", "models.json"));
-    expect(omoConfigPath({ SENPI_CODING_AGENT_DIR: "/from-senpi" }, "/home/u")).toBe(join("/from-senpi", "models.json"));
-    expect(omoConfigPath({ PI_CODING_AGENT_DIR: "/from-pi" }, "/home/u")).toBe(join("/from-pi", "models.json"));
+    expect(omoConfigPath({ OMO_CODING_AGENT_DIR: join(tmpdir(), "from-omo") }, "/home/u")).toBe(join(join(tmpdir(), "from-omo"), "models.json"));
+    expect(omoConfigPath({ SENPI_CODING_AGENT_DIR: join(tmpdir(), "from-senpi") }, "/home/u")).toBe(join(join(tmpdir(), "from-senpi"), "models.json"));
+    expect(omoConfigPath({ PI_CODING_AGENT_DIR: join(tmpdir(), "from-pi") }, "/home/u")).toBe(join(join(tmpdir(), "from-pi"), "models.json"));
 
     // Precedence, not merely recognition.
     expect(omoConfigPath({
-      OMO_CODING_AGENT_DIR: "/from-omo",
-      SENPI_CODING_AGENT_DIR: "/from-senpi",
-      PI_CODING_AGENT_DIR: "/from-pi",
-    }, "/home/u")).toBe(join("/from-omo", "models.json"));
+      OMO_CODING_AGENT_DIR: join(tmpdir(), "from-omo"),
+      SENPI_CODING_AGENT_DIR: join(tmpdir(), "from-senpi"),
+      PI_CODING_AGENT_DIR: join(tmpdir(), "from-pi"),
+    }, "/home/u")).toBe(join(join(tmpdir(), "from-omo"), "models.json"));
     expect(omoConfigPath({
-      SENPI_CODING_AGENT_DIR: "/from-senpi",
-      PI_CODING_AGENT_DIR: "/from-pi",
-    }, "/home/u")).toBe(join("/from-senpi", "models.json"));
+      SENPI_CODING_AGENT_DIR: join(tmpdir(), "from-senpi"),
+      PI_CODING_AGENT_DIR: join(tmpdir(), "from-pi"),
+    }, "/home/u")).toBe(join(join(tmpdir(), "from-senpi"), "models.json"));
 
     // omo trims and then tests truthiness, so a blank value is not a path.
-    expect(omoConfigPath({ OMO_CODING_AGENT_DIR: "   ", PI_CODING_AGENT_DIR: "/from-pi" }, "/home/u"))
-      .toBe(join("/from-pi", "models.json"));
+    expect(omoConfigPath({ OMO_CODING_AGENT_DIR: "   ", PI_CODING_AGENT_DIR: join(tmpdir(), "from-pi") }, "/home/u"))
+      .toBe(join(join(tmpdir(), "from-pi"), "models.json"));
     expect(omoConfigPath({ OMO_CODING_AGENT_DIR: "" }, "/home/u"))
       .toBe(join("/home/u", ".omo", "agent", "models.json"));
 
@@ -147,7 +149,7 @@ describe("omo client config", () => {
     const spec = INTEGRATION_CLIENTS.omo;
     expect(spec.detectDir({}, "/home/u")).toBe(join("/home/u", ".omo", "agent"));
     expect(spec.detectDir({}, "/home/u")).not.toBe(join("/home/u", ".omo"));
-    expect(spec.detectDir({ OMO_CODING_AGENT_DIR: "/elsewhere" } as NodeJS.ProcessEnv, "/home/u")).toBe("/elsewhere");
+    expect(spec.detectDir({ OMO_CODING_AGENT_DIR: join(tmpdir(), "elsewhere") } as NodeJS.ProcessEnv, "/home/u")).toBe(join(tmpdir(), "elsewhere"));
   });
 
   test("ships as a loopback-only integration with no env var to export", () => {

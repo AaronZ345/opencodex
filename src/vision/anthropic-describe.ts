@@ -1,10 +1,16 @@
-import type { OcxProviderConfig } from "../types";
+import { resolveAnthropicHelperSnapshot, fetchAnthropicHelper, anthropicHelperMessagesUrl } from "../sidecar/anthropic-binding";
+import { isAnthropicInstanceId } from "../providers/anthropic-instance-id";
+import type { OAuthAccessSnapshot } from "../oauth";
+import type { OcxConfig, OcxProviderConfig } from "../types";
+import { sidecarThinkingOff } from "../adapters/anthropic-model-contract";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
 import { applyUpstreamRecoveryInit, fetchWithResetRetry } from "../lib/upstream-retry";
-import { getValidAccessToken, publicOAuthAuthenticationErrorMessage } from "../oauth";
+import { publicOAuthAuthenticationErrorMessage } from "../oauth";
+import { getAnthropicSidecarAccessToken } from "../oauth/anthropic-routing";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
+import { CLAUDE_CLI_USER_AGENT } from "../providers/claude-cli-identity";
 import type { DescribeOutcome, VisionSettings } from "./describe";
 
 const ANTHROPIC_VISION_MAX_TOKENS = 1024;
@@ -151,13 +157,21 @@ export async function describeImageAnthropic(
   provider: OcxProviderConfig,
   settings: VisionSettings,
   abortSignal?: AbortSignal,
+  config?: OcxConfig,
 ): Promise<DescribeOutcome> {
   const image = buildImageBlock(imageUrl);
   if (!image.block) return { text: "", error: image.error ?? "invalid image" };
 
   let token: string;
+  let snapshot: OAuthAccessSnapshot | undefined;
+  const capturedTarget = provider.baseUrl;
   try {
-    token = await getValidAccessToken(providerName);
+    if (config && isAnthropicInstanceId(providerName)) {
+      snapshot = await resolveAnthropicHelperSnapshot(config, providerName, settings.model);
+      token = snapshot.accessToken;
+    } else {
+      token = await getAnthropicSidecarAccessToken(providerName, settings.model, config);
+    }
   } catch (error) {
     return { text: "", error: `anthropic vision sidecar auth failed: ${publicOAuthAuthenticationErrorMessage(error)}` };
   }
@@ -166,7 +180,7 @@ export async function describeImageAnthropic(
     "Content-Type": "application/json",
     "anthropic-version": "2023-06-01",
     "Accept": "text/event-stream",
-    "User-Agent": "@anthropic-ai/sdk/0.74.0",
+    "User-Agent": CLAUDE_CLI_USER_AGENT,
     "Authorization": `Bearer ${token}`,
     "anthropic-beta": ANTHROPIC_OAUTH_BETA,
     ...CLAUDE_CODE_HEADERS,
@@ -181,7 +195,7 @@ export async function describeImageAnthropic(
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_VISION_MAX_TOKENS,
-    thinking: { type: "disabled" },
+    ...sidecarThinkingOff(settings.model),
     system: [
       { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
       { type: "text", text: DESCRIBE_INSTRUCTION },
@@ -192,13 +206,16 @@ export async function describeImageAnthropic(
 
   // Anthropic image blocks have no detail field, but detail remains part of the cache identity.
   void detail;
-  const base = provider.baseUrl.replace(/\/v1\/?$/, "");
+  const url = anthropicHelperMessagesUrl(provider.baseUrl);
+  const dispatch = (target: string, init: RequestInit) => snapshot && config
+    ? fetchAnthropicHelper(config, snapshot, settings.model, capturedTarget, target, init)
+    : fetch(target, init);
   const linkedSignal = signalWithTimeout(settings.timeoutMs, abortSignal);
   const sidecarExit = sidecarEnter("vision");
   const startedAt = Date.now();
   try {
     const res = await fetchWithResetRetry(
-      recovery => fetch(`${base}/v1/messages`, applyUpstreamRecoveryInit({
+      recovery => dispatch(url, applyUpstreamRecoveryInit({
         method: "POST",
         redirect: "manual",
         headers,

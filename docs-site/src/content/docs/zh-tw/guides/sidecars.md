@@ -66,8 +66,10 @@ OAuth 帳號時使用 `anthropic`，否則使用 `openai`。明確選擇 `anthro
 
 當路由模型列在其 provider 的 `noVisionModels` 中，或該模型在 `modelInputModalities` 中被宣告為僅文字，
 且請求包含圖像時，只要有可用的 vision sidecar plan，opencodex 就會在主呼叫**之前**描述每張圖像並用文字替換圖像。
-若沒有可用 plan，原始圖像會被移除，不會繼續轉送給純文字後端。模型目錄會為每個由 sidecar 處理的模型宣告圖像輸入。
-只有當每個 combo 成員都能原生或透過 sidecar 接受圖像，且 combo 的 `imageInput` 設定未停用時，combo 才會宣告圖像輸入；
+若沒有可用 plan，原始圖像會被移除，不會繼續轉送給純文字後端。當 `visionSidecar.enabled: false` 時，
+模型目錄不會為純文字模型新增由 sidecar 提供的圖像輸入，包括自訂項目與 combo 成員。原生圖像支援及明確設定的圖像模態會保留。
+省略 `enabled` 時，仍會宣告 sidecar 提供的圖像輸入；目錄中顯示這項能力不代表已確認 sidecar 的憑證或處理容量可用。
+只有當每個 combo 成員都能原生或透過已啟用的 sidecar 接受圖像，且 combo 的 `imageInput` 設定未停用時，combo 才會宣告圖像輸入；
 如此 Codex 應用程式等用戶端會允許附件，而不會在 sidecar 執行前阻擋它們。Dashboard 和管理 API 目前顯示的預設值是
 `gpt-5.6-luna`，啟動時也會把明確儲存的舊 `gpt-5.4-mini` 值遷移到 Luna。只有在
 `visionSidecar.model` 欄位不存在或為空字串時，vision 執行路徑才會使用程式碼中的 `gpt-5.6-luna` 回退值。
@@ -121,5 +123,15 @@ OAuth 帳號時使用 `anthropic`，否則使用 `openai`。明確選擇 `anthro
 
 `PUT /api/sidecar-settings` 接受相同欄位。部分更新會保留未提交的鍵。`timeoutMs` 使用執行時整數邊界（1–2147483647 毫秒）。
 
+透過 `PUT /api/sidecar-settings` 變更 Vision 開關的實際生效狀態後，儲存完成便會重新整理受管理的目錄與快取；`catalogRefreshPending=true` 表示重新整理未完成，並非用戶端的確認回覆。
+
+Web 搜尋 sidecar 卡片採用相同的控制項形態：模型選擇器的第一列是 **關閉 (Off)**。關閉會停止
+OpenCodex 對 `web_search` 的攔截，同時 Codex 整合會把 `web_search = "disabled"`
+寫入 `~/.codex/config.toml`；因為 Codex 在自身模式如此宣告前會一直宣告其原生託管的
+`web_search` 工具，而當 MCP 搜尋伺服器需要成為唯一搜尋路徑時，這正是必要的。重新開啟會
+移除該行，並還原 Codex 日誌中記錄、由操作者寫入的根層級 `web_search` 行。該寫入需要受管理的
+`~/.codex/config.toml`（`ocx sync`）；若未執行，儀表板卡片會提出警告，
+`ocx agent sidecar web --enabled off` 也會回報結果。
+
 如果更想直接改檔案，仍可在 `config.json` 中把 `enabled` 設為 `false`。Anthropic OAuth 搜尋和圖像描述沿用現有 Claude Code OAuth fingerprint 先例，但仍應使用目標帳號和實際負載充分 soak test。所有欄位見
-[設定參考](/zh-tw/reference/configuration/#sidecars)。
+[設定參考](/zh-tw/reference/configuration/server/#sidecar)。

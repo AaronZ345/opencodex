@@ -1,15 +1,25 @@
-import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { mkdirSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   getValidAccessTokenForAccount,
+  getValidAccessTokenSnapshot,
+  getValidAccessSnapshotForAccount,
+  MAX_OAUTH_TOKEN_REFRESH_WAITERS,
+  OAuthTokenRefreshBusyError,
+  refreshGenericAccountWithLock,
   OAuthLoginRequiredError,
+  OAuthTokenRefreshStaleError,
   OAUTH_PROVIDERS,
 } from "../../src/oauth";
 import type { OAuthCredentials } from "../../src/oauth/types";
+import { ChatGptTokenError, ChatGptTokenRequestError, refreshChatGPTToken } from "../../src/oauth/chatgpt";
 import { getAccountCredential, getAccountSet, saveCredential } from "../../src/oauth/store";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { getActiveTurnCount, tryAdmitTurn } from "../../src/server/lifecycle";
+import { handleResponses } from "../../src/server/responses";
+import type { OcxConfig } from "../../src/types";
 
 // Gate/CAS refresh races can exceed the 5s default under windows-latest contention
 // (same flake class as kiro-oauth / oauth queue budgets).
@@ -204,4 +214,324 @@ describe("generic OAuth refresh lock + CAS", () => {
     expect(getAccountCredential("kimi", accountId)?.access).toBe("replacement");
     expect(getAccountSet("kimi")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
   });
+});
+
+describe("ChatGPT refresh through the registered provider", () => {
+  const originalFetch = globalThis.fetch;
+  const originalChatgptRefresh = OAUTH_PROVIDERS.chatgpt!.refresh;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    OAUTH_PROVIDERS.chatgpt!.refresh = originalChatgptRefresh;
+  });
+
+  async function seedExpiredChatgpt(): Promise<string> {
+    await saveCredential("chatgpt", {
+      access: "chatgpt-old", refresh: "rt-old", expires: Date.now() - 1, accountId: "chatgpt-acct",
+    });
+    return getAccountSet("chatgpt")!.activeAccountId;
+  }
+
+  test("400 invalid_grant marks the current credential generation needsReauth", async () => {
+    const accountId = await seedExpiredChatgpt();
+    globalThis.fetch = (async () => Response.json({ error: "invalid_grant" }, { status: 400 })) as typeof fetch;
+    await expect(refreshChatGPTToken("synthetic-refresh")).rejects.toMatchObject({ terminal: true });
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).rejects.toBeInstanceOf(OAuthLoginRequiredError);
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBe(true);
+  });
+
+  test("a nested terminal endpoint response marks the account needsReauth", async () => {
+    const accountId = await seedExpiredChatgpt();
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return Response.json({ error: { code: "refresh_token_expired", message: "synthetic private text" } }, { status: 401 });
+    }) as typeof fetch;
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).rejects.toBeInstanceOf(OAuthLoginRequiredError);
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  for (const [label, body] of [
+    ["missing code", { error_description: "refresh token expired" }],
+    ["blank code", { error: " ", error_description: "refresh token revoked" }],
+    ["nested blank code", { error: { code: " ", message: "refresh token invalidated" } }],
+    ["nested message-only envelope", { error: { message: "upstream route revoked temporarily" } }],
+  ] as const) {
+    test(`${label} prose stays nonterminal and registry recovers`, async () => {
+      const accountId = await seedExpiredChatgpt();
+      const credential = getAccountCredential("chatgpt", accountId)!;
+      globalThis.fetch = (async () => Response.json(body, { status: 400 })) as typeof fetch;
+      const error = await refreshGenericAccountWithLock("chatgpt", accountId,
+        OAUTH_PROVIDERS.chatgpt!, credential).catch(error => error);
+      expect(error).toBeInstanceOf(ChatGptTokenError);
+      expect(error).toMatchObject({ httpStatus: 400, terminal: false, oauthError: undefined });
+      expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+      globalThis.fetch = (async () => Response.json({ access_token: "recovered", refresh_token: "rt-new" })) as typeof fetch;
+      await expect(refreshGenericAccountWithLock("chatgpt", accountId,
+        OAUTH_PROVIDERS.chatgpt!, credential)).resolves.toBe("recovered");
+      expect(getAccountCredential("chatgpt", accountId)?.refresh).toBe("rt-new");
+      expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+    });
+  }
+
+  test("a transient endpoint failure does not mark needsReauth and a later refresh can recover", async () => {
+    const accountId = await seedExpiredChatgpt();
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      if (calls === 1) return Response.json({ error: "invalid_grant", error_description: "revoked" }, { status: 503 });
+      return Response.json({ access_token: "chatgpt-fresh", refresh_token: "rt-new", expires_in: 3600 });
+    }) as typeof fetch;
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).rejects.toBeInstanceOf(ChatGptTokenError);
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).resolves.toBe("chatgpt-fresh");
+    expect(getAccountCredential("chatgpt", accountId)?.refresh).toBe("rt-new");
+    expect(calls).toBe(2);
+  });
+
+  test("the registry forwards caller cancellation and releases the refresh lock", async () => {
+    const accountId = await seedExpiredChatgpt();
+    const caller = new AbortController();
+    let started!: () => void;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    globalThis.fetch = ((_url: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      started();
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    })) as typeof fetch;
+    const pending = refreshGenericAccountWithLock("chatgpt", accountId, OAUTH_PROVIDERS.chatgpt!,
+      getAccountCredential("chatgpt", accountId)!, { signal: caller.signal });
+    const reason = new DOMException("invalid_grant synthetic-private-token", "AbortError");
+    const rejected = pending.catch((error: unknown) => error);
+    await began;
+    caller.abort(reason);
+    const err = await rejected;
+    expect(err).toBeInstanceOf(ChatGptTokenRequestError);
+    expect(err).toMatchObject({ name: "AbortError", message: "ChatGPT token request cancelled" });
+    expect(err).not.toBe(reason);
+    expect(err).not.toHaveProperty("cause");
+    for (const text of ["invalid_grant", "synthetic-private-token"]) {
+      expect(JSON.stringify(err) + String(err) + (err as Error).stack).not.toContain(text);
+    }
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+    globalThis.fetch = (async () => Response.json({ access_token: "recovered", refresh_token: "rt-new", expires_in: 3600 })) as typeof fetch;
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).resolves.toBe("recovered");
+  });
+
+  test("a late terminal response cannot mark a replacement credential needsReauth", async () => {
+    const accountId = await seedExpiredChatgpt();
+    let release!: (response: Response) => void;
+    let started!: () => void;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    globalThis.fetch = (() => new Promise<Response>(resolve => { release = resolve; started(); })) as typeof fetch;
+    const pending = getValidAccessTokenForAccount("chatgpt", accountId);
+    await began;
+    await saveCredential("chatgpt", {
+      access: "replacement", refresh: "replacement-rt", expires: Date.now() + 3_600_000, accountId: "chatgpt-acct",
+    });
+    release(Response.json({ error: "refresh_token_invalidated" }, { status: 401 }));
+    await expect(pending).rejects.toBeInstanceOf(OAuthLoginRequiredError);
+    expect(getAccountCredential("chatgpt", accountId)?.refresh).toBe("replacement-rt");
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+  });
+  test("non-HTTP registry failures sanitize misleading grant text, private properties, stack and OAuth logs", async () => {
+    const privateValues = ["synthetic-private-access", "synthetic-private-refresh", "synthetic-private@example.test",
+      "synthetic-private-account-id"];
+    await saveCredential("chatgpt", {
+      access: privateValues[0]!, refresh: privateValues[1]!, email: privateValues[2]!,
+      accountId: privateValues[3]!, expires: Date.now() - 1,
+    });
+    const accountId = getAccountSet("chatgpt")!.activeAccountId;
+    const logs: string[] = [];
+    const logger = spyOn(console, "info").mockImplementation((...args) => { logs.push(args.join(" ")); });
+    try {
+      for (const marker of ["invalid_grant", "revoked", "refresh_token_reused"]) {
+        globalThis.fetch = (async () => {
+          throw Object.assign(new Error(`${marker} ${privateValues.join(" ")}`), {
+            access: privateValues[0], refresh: privateValues[1], email: privateValues[2], accountId,
+            cause: new Error(privateValues.join(" ")),
+          });
+        }) as typeof fetch;
+        const error = await getValidAccessTokenForAccount("chatgpt", accountId).catch(error => error);
+        expect(error).toBeInstanceOf(ChatGptTokenRequestError);
+        expect(error.message).toBe("ChatGPT token request failed");
+        expect(error).not.toHaveProperty("cause");
+        const surfaced = JSON.stringify(Object.getOwnPropertyDescriptors(error)) + String(error) + logs.join(" ");
+        for (const text of [...privateValues, accountId, marker]) expect(surfaced).not.toContain(text);
+        expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+      }
+      expect(logs.length).toBeGreaterThan(0);
+      expect(logs.some(line => line.includes("account="))).toBe(true);
+      globalThis.fetch = (async () => Response.json({ access_token: "recovered", refresh_token: "rt-new" })) as typeof fetch;
+      await expect(getValidAccessTokenForAccount("chatgpt", accountId)).resolves.toBe("recovered");
+    } finally { logger.mockRestore(); }
+  });
+
+  test("registry deadline is nonterminal and a later refresh recovers", async () => {
+    const accountId = await seedExpiredChatgpt();
+    // Exercise the real registered refresh path with a bounded test deadline.
+    OAUTH_PROVIDERS.chatgpt!.refresh = (rt, signal) => refreshChatGPTToken(rt, { signal, timeoutMs: 20 });
+    let cancelled = false;
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      cancel() { cancelled = true; },
+    }))) as typeof fetch;
+    const error = await getValidAccessTokenForAccount("chatgpt", accountId).catch(error => error);
+    expect(error).toBeInstanceOf(ChatGptTokenRequestError);
+    expect(error).toMatchObject({ name: "TimeoutError", message: "ChatGPT token request timed out" });
+    expect(cancelled).toBe(true);
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+    globalThis.fetch = (async () => Response.json({ access_token: "recovered", refresh_token: "rt-new" })) as typeof fetch;
+    await expect(getValidAccessTokenForAccount("chatgpt", accountId)).resolves.toBe("recovered");
+    expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+  });
+
+  test("ChatGPT stale-flight abort still reaches the registry as OAuthTokenRefreshStaleError", async () => {
+    const accountId = await seedExpiredChatgpt();
+    let started!: () => void;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    let calls = 0;
+    globalThis.fetch = ((_url: unknown, init?: RequestInit) => {
+      calls++;
+      if (calls > 1) return Promise.resolve(Response.json({ access_token: "replacement", refresh_token: "rt-new" }));
+      return new Promise<Response>((_, reject) => {
+        init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+        started();
+      });
+    }) as typeof fetch;
+    const old = getValidAccessTokenForAccount("chatgpt", accountId).catch(error => error);
+    await began;
+    const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 120_001);
+    try {
+      const replacement = getValidAccessTokenForAccount("chatgpt", accountId);
+      expect(await old).toBeInstanceOf(OAuthTokenRefreshStaleError);
+      await expect(replacement).resolves.toBe("replacement");
+      expect(calls).toBe(2);
+      expect(getAccountSet("chatgpt")!.accounts.find(a => a.id === accountId)!.needsReauth).toBeUndefined();
+    } finally { clock.mockRestore(); }
+  });
+
+});
+
+/** Real resolver calls retain refresh admission after their client turn has cancelled. */
+describe("OAuth refresh consumer admission", () => {
+  test("cancelled callers cannot grow one pending refresh beyond the consumer limit", async () => {
+    const accountId = await seedExpiredKimi();
+    let finish!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    const tracker = stubKimiRefresh(async () => {
+      started();
+      await blocked;
+      return { access: "fixture-refreshed", refresh: "fixture-rotated", expires: Date.now() + 3_600_000 };
+    });
+    const waiting: Promise<unknown>[] = [];
+    const rejected: unknown[] = [];
+    const activeBefore = getActiveTurnCount();
+    try {
+      for (let i = 0; i < MAX_OAUTH_TOKEN_REFRESH_WAITERS + 44; i++) {
+        const controller = new AbortController();
+        const lease = tryAdmitTurn(undefined, controller.signal);
+        expect(lease).not.toBeNull();
+        const promise = i % 2 === 0 ? getValidAccessTokenSnapshot("kimi")
+          : getValidAccessSnapshotForAccount("kimi", accountId);
+        waiting.push(promise.catch(error => { rejected.push(error); }));
+        controller.abort(new Error("fixture disconnected"));
+        lease?.release();
+      }
+      await entered;
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(getActiveTurnCount()).toBe(activeBefore);
+      expect(rejected).toHaveLength(44);
+      expect(rejected.every(error => error instanceof OAuthTokenRefreshBusyError)).toBe(true);
+      expect(tracker.calls()).toBe(1);
+      expect(getAccountCredential("kimi", accountId)?.access).toBe("kimi-old");
+      expect(getAccountSet("kimi")?.accounts.find(row => row.id === accountId)?.needsReauth).not.toBe(true);
+    } finally {
+      finish();
+      await Promise.all(waiting);
+    }
+    await expect(getValidAccessTokenForAccount("kimi", accountId)).resolves.toBe("fixture-refreshed");
+    expect(tracker.calls()).toBe(1);
+  });
+
+  test("rejected shared refresh releases all consumers and permits one later retry", async () => {
+    const accountId = await seedExpiredKimi();
+    let fail!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const blocked = new Promise<void>((_resolve, reject) => { fail = () => reject(new Error("fixture transient failure")); });
+    stubKimiRefresh(async () => { started(); await blocked; throw new Error("unreachable"); });
+    const waiting = Array.from({ length: MAX_OAUTH_TOKEN_REFRESH_WAITERS }, () =>
+      getValidAccessTokenForAccount("kimi", accountId).catch(error => error));
+    try {
+      await entered;
+      // Do not await an over-budget control without a deadline: the unpatched resolver waits.
+      let refused: unknown;
+      const overflow = getValidAccessTokenForAccount("kimi", accountId).catch(error => { refused = error; });
+      waiting.push(overflow);
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      expect(refused).toBeInstanceOf(OAuthTokenRefreshBusyError);
+    } finally { fail(); await Promise.all(waiting); }
+    const tracker = stubKimiRefresh(async () => ({
+      access: "fixture-retry", refresh: "fixture-next", expires: Date.now() + 3_600_000,
+    }));
+    await expect(getValidAccessTokenForAccount("kimi", accountId)).resolves.toBe("fixture-retry");
+    expect(tracker.calls()).toBe(1);
+    expect(getAccountSet("kimi")?.accounts.find(row => row.id === accountId)?.needsReauth).not.toBe(true);
+  });
+
+  test("fresh snapshots remain usable while refresh consumers are full", async () => {
+    const expiredId = await seedExpiredKimi();
+    await saveCredential("kimi", { access: "fixture-cached", refresh: "fixture-cached-refresh",
+      expires: Date.now() + 3_600_000, accountId: "fixture-cached-account" });
+    const freshId = getAccountSet("kimi")!.activeAccountId;
+    let finish!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    const tracker = stubKimiRefresh(async () => { started(); await blocked; return {
+      access: "fixture-finished", refresh: "fixture-finished-refresh", expires: Date.now() + 3_600_000,
+    }; });
+    const waiting = Array.from({ length: MAX_OAUTH_TOKEN_REFRESH_WAITERS }, () =>
+      getValidAccessTokenForAccount("kimi", expiredId).catch(error => error));
+    try {
+      await entered;
+      await expect(getValidAccessTokenForAccount("kimi", freshId)).resolves.toBe("fixture-cached");
+      expect(tracker.calls()).toBe(1);
+    } finally { finish(); await Promise.all(waiting); }
+  });
+});
+
+
+test("Responses maps exhausted OAuth refresh consumers to retryable capacity, not login failure", async () => {
+  const accountId = await seedExpiredKimi();
+  let finish!: () => void;
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const blocked = new Promise<void>(resolve => { finish = resolve; });
+  stubKimiRefresh(async () => { started(); await blocked; return {
+    access: "fixture-finished", refresh: "fixture-rotated", expires: Date.now() + 3_600_000,
+  }; });
+  const waiting = Array.from({ length: MAX_OAUTH_TOKEN_REFRESH_WAITERS }, () =>
+    getValidAccessTokenForAccount("kimi", accountId).catch(error => error));
+  let inferenceSends = 0;
+  const config = { port: 0, defaultProvider: "kimi", providers: { kimi: {
+    adapter: "openai-chat", authMode: "oauth", baseUrl: "https://fixture.invalid/v1", models: ["fixture-model"],
+    fetch: async () => { inferenceSends++; throw new Error("unexpected fixture send"); },
+  } } } as OcxConfig;
+  try {
+    await entered;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "kimi/fixture-model", input: "fixture", stream: false }),
+    }), config, { model: "", provider: "" });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    const body = await response.text();
+    expect(body).toContain("OAuth token refresh capacity reached");
+    expect(body).not.toContain("kimi-old");
+    expect(inferenceSends).toBe(0);
+    expect(getAccountSet("kimi")?.accounts.find(row => row.id === accountId)?.needsReauth).not.toBe(true);
+  } finally { finish(); await Promise.all(waiting); }
 });

@@ -1,7 +1,9 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,6 +20,7 @@ import {
   changedSelectionFailure,
   captureTestOutput,
   createIsolatedTestEnvironment,
+  LIVE_INSTALL_CREDENTIAL_ENV,
   ensureGuiDependencies,
   inspectChangedRun,
   resolveBunTestArgs,
@@ -32,6 +35,9 @@ import {
 import { helperPath, repoPath, repoRoot } from "../helpers/repo-root";
 import {
   acquireTestRunLock,
+  parseDarwinTestProcessStart,
+  parseLinuxTestProcessStart,
+  readTestRunProcessStartBatch,
   resolveBareTestRunIdentity,
   resolveDefaultTestRunLockPath,
   resolveInheritedTestRunLock,
@@ -290,13 +296,14 @@ describe("test runner captured output", () => {
 
 describe("test runner isolation", () => {
   test("redirects user homes to a disposable root", () => {
-    const isolated = createIsolatedTestEnvironment({ PATH: "/test/bin", HOME: "/real/home" });
+    const isolated = createIsolatedTestEnvironment({ PATH: "/test/bin", HOME: "/real/home", OCX_OWNER_REGISTRY_DIR: "/real/registry" });
     try {
       expect(isolated.env).toMatchObject({
         PATH: "/test/bin",
         HOME: isolated.root,
         USERPROFILE: isolated.root,
         OPENCODEX_HOME: join(isolated.root, ".opencodex"),
+        OCX_OWNER_REGISTRY_DIR: join(isolated.root, ".opencodex", "ocx-homes"),
         CODEX_HOME: join(isolated.root, ".codex"),
         TEMP: join(isolated.root, "tmp"),
         TMP: join(isolated.root, "tmp"),
@@ -325,6 +332,23 @@ describe("test runner isolation", () => {
       isolated.cleanup();
     }
     expect(existsSync(isolated.root)).toBe(false);
+  });
+
+  test("drops the developer's live install credentials and keeps the rest of the environment", () => {
+    const isolated = createIsolatedTestEnvironment({
+      PATH: "/test/bin",
+      FIXTURE: "unchanged",
+      OPENCODEX_API_AUTH_TOKEN: "live-data-token",
+      OPENCODEX_ADMIN_AUTH_TOKEN: "live-admin-token",
+      OCX_API_TOKEN_FILE: "/real/home/.opencodex/service-api-token",
+    });
+    try {
+      for (const name of LIVE_INSTALL_CREDENTIAL_ENV) expect(name in isolated.env).toBe(false);
+      expect(isolated.env.FIXTURE).toBe("unchanged");
+      expect(isolated.env.PATH).toBe("/test/bin");
+    } finally {
+      isolated.cleanup();
+    }
   });
 
   test.if(process.platform === "win32")("gives the Windows sandbox a real profile shape", () => {
@@ -367,6 +391,155 @@ describe("test runner isolation", () => {
       }
     },
   );
+});
+
+describe("test runner transpiler cache isolation", () => {
+  test("places the default executable cache inside its owned sandbox", () => {
+    const isolated = createIsolatedTestEnvironment({});
+    try {
+      const cache = isolated.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH!;
+      expect(cache).toBe(join(isolated.root, "bun-transpiler-cache"));
+      const entry = lstatSync(cache);
+      expect(entry.isDirectory()).toBe(true);
+      expect(entry.isSymbolicLink()).toBe(false);
+      if (process.platform !== "win32") {
+        expect(entry.uid).toBe(process.geteuid!());
+        expect(entry.mode & 0o777).toBe(0o700);
+        expect(lstatSync(isolated.root).mode & 0o777).toBe(0o700);
+        expect(lstatSync(isolated.env.TMPDIR!).mode & 0o777).toBe(0o700);
+      }
+    } finally { isolated.cleanup(); }
+    expect(existsSync(isolated.root)).toBe(false);
+  });
+
+  test("independent sandboxes neither reuse nor remove another default cache", () => {
+    const first = createIsolatedTestEnvironment({});
+    const second = createIsolatedTestEnvironment({});
+    try {
+      const firstCache = first.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH!;
+      const secondCache = second.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH!;
+      expect(firstCache).not.toBe(secondCache);
+      writeFileSync(join(firstCache, "fixture"), "first");
+      writeFileSync(join(secondCache, "fixture"), "second");
+      first.cleanup();
+      expect(existsSync(firstCache)).toBe(false);
+      expect(readFileSync(join(secondCache, "fixture"), "utf8")).toBe("second");
+    } finally { first.cleanup(); second.cleanup(); }
+  });
+
+  test("nested home isolation inherits the parent's cache and leaves its lifetime to the owner", () => {
+    const parent = createIsolatedTestEnvironment({});
+    const child = createIsolatedTestEnvironment(parent.env);
+    try {
+      const cache = parent.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH!;
+      expect(child.root).not.toBe(parent.root);
+      expect(child.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH).toBe(cache);
+      writeFileSync(join(cache, "fixture"), "parent-owned");
+      child.cleanup();
+      expect(readFileSync(join(cache, "fixture"), "utf8")).toBe("parent-owned");
+    } finally { child.cleanup(); parent.cleanup(); }
+  });
+
+  test("keeps an explicit cache path without creating or reclaiming it", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "ocx-cache-override-"));
+    const override = join(fixture, "operator-selected");
+    const isolated = createIsolatedTestEnvironment({ BUN_RUNTIME_TRANSPILER_CACHE_PATH: override });
+    try {
+      expect(isolated.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH).toBe(override);
+      expect(existsSync(override)).toBe(false);
+      expect(existsSync(join(isolated.root, "bun-transpiler-cache"))).toBe(false);
+      mkdirSync(override);
+      writeFileSync(join(override, "fixture"), "operator-owned");
+      isolated.cleanup();
+      expect(readFileSync(join(override, "fixture"), "utf8")).toBe("operator-owned");
+    } finally { isolated.cleanup(); removeTreeWithRetry(fixture); }
+  });
+
+  test.each(["", "0"])("preserves cache-disable value %j without allocating a default cache", value => {
+    const isolated = createIsolatedTestEnvironment({ BUN_RUNTIME_TRANSPILER_CACHE_PATH: value });
+    try {
+      expect(isolated.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH).toBe(value);
+      expect(existsSync(join(isolated.root, "bun-transpiler-cache"))).toBe(false);
+    } finally { isolated.cleanup(); }
+  });
+
+  test.each(["directory", "symlink"])("does not adopt or alter a pre-existing shared cache %s", kind => {
+    const fixture = mkdtempSync(join(tmpdir(), "ocx-cache-legacy-"));
+    const legacy = join(fixture, "ocx-test-bun-transpiler-cache");
+    const target = join(fixture, "foreign-cache");
+    mkdirSync(target);
+    writeFileSync(join(target, "fixture"), "leave-unchanged");
+    if (kind === "symlink") symlinkSync(target, legacy, process.platform === "win32" ? "junction" : "dir");
+    else { mkdirSync(legacy); writeFileSync(join(legacy, "fixture"), "leave-unchanged"); }
+    const before = lstatSync(legacy);
+    const oldEnv = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+    let isolated: ReturnType<typeof createIsolatedTestEnvironment> | undefined;
+    try {
+      process.env.TMPDIR = fixture; process.env.TMP = fixture; process.env.TEMP = fixture;
+      isolated = createIsolatedTestEnvironment({});
+      expect(dirname(isolated.root)).toBe(fixture);
+      expect(isolated.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH).toBe(join(isolated.root, "bun-transpiler-cache"));
+      isolated.cleanup();
+      expect(readFileSync(join(legacy, "fixture"), "utf8")).toBe("leave-unchanged");
+      expect(lstatSync(legacy).ino).toBe(before.ino);
+      expect(lstatSync(legacy).mode).toBe(before.mode);
+      expect(lstatSync(legacy).isSymbolicLink()).toBe(kind === "symlink");
+    } finally {
+      isolated?.cleanup();
+      for (const [name, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+      removeTreeWithRetry(fixture);
+    }
+  });
+
+  test("Bun children with different homes reuse only the selected private cache", () => {
+    const isolated = createIsolatedTestEnvironment({ ...process.env, BUN_RUNTIME_TRANSPILER_CACHE_PATH: undefined });
+    try {
+      const cache = isolated.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH!;
+      const source = join(isolated.root, "cacheable-fixture.ts");
+      // Above the pinned Bun runtime's cache threshold; no production code or credential is loaded.
+      writeFileSync(source, `const value: string = ${JSON.stringify("x".repeat(70_000))}; console.log(value.length);`);
+      // A hit only reads; a miss for the identical input must add or rewrite an entry. Seal the
+      // first home's entries at a sentinel mtime, then the second home proves reuse by adding
+      // nothing, rewriting nothing, and leaving no cache anywhere else in the sandbox.
+      const sealedAt = new Date("2001-01-01T00:00:00Z");
+      const sandboxPiles = () => readdirSync(isolated.root, { recursive: true })
+        .map(String)
+        .filter(entry => entry.endsWith(".pile"))
+        .sort();
+      let sealed: string[] | undefined;
+      for (const name of ["first-home", "second-home"]) {
+        const home = join(isolated.root, name);
+        mkdirSync(home);
+        const child = Bun.spawnSync([process.execPath, source], {
+          cwd: isolated.root,
+          env: { ...isolated.env, HOME: home, USERPROFILE: home },
+          stdout: "pipe", stderr: "pipe", timeout: SPAWN_BUDGET_MS,
+        });
+        expect(child.exitCode, new TextDecoder().decode(child.stderr)).toBe(0);
+        expect(new TextDecoder().decode(child.stdout).trim()).toBe("70000");
+        expect(readdirSync(home)).toEqual([]);
+        const piles = sandboxPiles();
+        if (sealed === undefined) {
+          expect(piles.length).toBeGreaterThan(0);
+          for (const entry of piles) {
+            const file = join(isolated.root, entry);
+            expect(pathIsContainedBy(cache, file, process.platform === "win32" ? "win32" : "posix"))
+              .toBe(true);
+            utimesSync(file, sealedAt, sealedAt);
+          }
+          sealed = piles;
+        } else {
+          expect(piles).toEqual(sealed);
+          for (const entry of sealed) {
+            expect(statSync(join(isolated.root, entry)).mtimeMs).toBe(sealedAt.getTime());
+          }
+        }
+      }
+      expect(dirname(cache)).toBe(isolated.root);
+    } finally { isolated.cleanup(); }
+  }, { timeout: SPAWN_BUDGET_MS * 3 });
 });
 
 describe("Windows test TEMP recovery", () => {
@@ -544,6 +717,25 @@ describe("bun test argv", () => {
     }
     expect(plan.find(lane => lane.label === "release-helper.test.ts")?.timeoutMs).toBe(5 * 60 * 1000);
     expect(plan.find(lane => lane.label === "codex-shim.test.ts")?.timeoutMs).toBe(3 * 60 * 1000);
+  });
+
+  test("a control budget is bounded and changes only the main lane", () => {
+    const baseline = resolveBunTestPlan([], undefined, {});
+    expect(baseline[0]!.timeoutMs).toBe(900_000);
+    const control = resolveBunTestPlan([], undefined, { OCX_TEST_MAIN_TIMEOUT_MS: "3600000" });
+    expect(control[0]!.timeoutMs).toBe(3_600_000);
+    expect(control.slice(1)).toEqual(baseline.slice(1));
+    for (const value of ["", "-1", "59999", "3600001", "Infinity", "1e6", "900000.5"]) {
+      expect(() => resolveBunTestPlan([], undefined, { OCX_TEST_MAIN_TIMEOUT_MS: value })).toThrow("OCX_TEST_MAIN_TIMEOUT_MS");
+    }
+  });
+
+  test("server admission fixtures finish in a dedicated process", () => {
+    const plan = resolveBunTestPlan([]);
+    expect(plan[0]?.args).toContain("**/active-registry-admission.test.ts");
+    expect(plan.find(lane => lane.label === "active-registry-admission.test.ts")?.args).toEqual([
+      "--isolate", "--parallel=1", "./tests/codex-integration/active-registry-admission.test.ts",
+    ]);
   });
 
   test("serial lanes override caller parallelism without changing the main lane", () => {
@@ -1295,6 +1487,227 @@ describe("bun test user lock", () => {
     } finally {
       removeTreeWithRetry(root);
     }
+  });
+
+  const startA = "win32:1600000000000";
+  const startB = "win32:1600000000001";
+  const identityReader = (start: string | null) => (pids: readonly number[]) =>
+    new Map(pids.map(pid => [pid, start]));
+  const identityFixture = (ownerStart: unknown, memberStart?: unknown, legacyMember = false) => {
+    const root = mkdtempSync(join(tmpdir(), "opencodex-test-lock-"));
+    const lockPath = join(root, "suite.lock");
+    const owner = {
+      version: 1, runId: "held", token: "fixture-token", acquiredAt: new Date().toISOString(),
+      pid: memberStart === undefined && !legacyMember ? process.pid : 2_147_483_647,
+      ...(ownerStart === undefined ? {} : { processStart: ownerStart }),
+    };
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify(owner));
+    if (memberStart !== undefined || legacyMember) {
+      mkdirSync(join(lockPath, "members"));
+      const prefix = legacyMember ? String(process.pid)
+        : `${process.pid}.v2.${createHash("sha256").update(String(memberStart)).digest("hex")}`;
+      writeFileSync(join(lockPath, "members", `${prefix}-${owner.token}`),
+        legacyMember ? "" : JSON.stringify(memberStart));
+    }
+    return { root, lockPath, owner };
+  };
+
+  for (const member of [false, true]) {
+    test(`a reused ${member ? "member" : "owner"} PID is reclaimed by a different or same run`, async () => {
+      for (const runId of ["next", "held"]) {
+        const fixture = identityFixture(startA, member ? startA : undefined);
+        try {
+          const replacement = await acquireTestRunLock({
+            runId, lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 50,
+            env: queuedTestEnv, processStartBatch: identityReader(startB),
+          });
+          expect(replacement.acquired).toBe(true);
+          expect(replacement.owner?.processStart).toBe(startB);
+          replacement.release();
+          expect(existsSync(fixture.lockPath)).toBe(false);
+        } finally { removeTreeWithRetry(fixture.root); }
+      }
+    });
+
+    for (const [label, recorded, current] of [
+      ["matching", startA, startA],
+      ["unreadable", startA, null],
+      ["malformed current", startA, "unrecognized"],
+      ["malformed recorded", { unexpected: true }, startB],
+      ["invalid calendar", "darwin:2026-99-99T25:00:00Z", startB],
+      ["different platform", startA, "linux:00000000-0000-0000-0000-000000000001:10"],
+    ] as const) {
+      test(`${label} ${member ? "member" : "owner"} identity preserves the live veto`, async () => {
+        const fixture = identityFixture(recorded, member ? recorded : undefined);
+        try {
+          await expect(acquireTestRunLock({
+            runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+            env: queuedTestEnv, processStartBatch: identityReader(current),
+          })).rejects.toThrow("timed out");
+          expect(JSON.parse(readFileSync(join(fixture.lockPath, "owner.json"), "utf8"))).toEqual(fixture.owner);
+        } finally { removeTreeWithRetry(fixture.root); }
+      });
+    }
+  }
+
+  for (const member of [false, true]) {
+    test(`a legacy ${member ? "member" : "owner"} with a live PID always vetoes reclamation`, async () => {
+      const fixture = identityFixture(undefined, undefined, member);
+      try {
+        await expect(acquireTestRunLock({
+          runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+          env: queuedTestEnv, processStartBatch: identityReader(startB),
+        })).rejects.toThrow("timed out");
+      } finally { removeTreeWithRetry(fixture.root); }
+    });
+  }
+
+  test("modern re-registration uses a new path; legacy re-registration remains a PID veto", async () => {
+    const fixture = identityFixture(startA);
+    let current = startA;
+    const processStartBatch = (pids: readonly number[]) => new Map(pids.map(pid =>
+      [pid, pid === process.ppid ? startA : current]));
+    // A separate live owner lets successive instances of the member PID join.
+    fixture.owner.pid = process.ppid;
+    writeFileSync(join(fixture.lockPath, "owner.json"), JSON.stringify(fixture.owner));
+    const options = { runId: "held", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+      env: queuedTestEnv, processStartBatch };
+    try {
+      expect((await acquireTestRunLock(options)).acquired).toBe(false);
+      current = startB;
+      expect((await acquireTestRunLock(options)).acquired).toBe(false);
+      const files = readdirSync(join(fixture.lockPath, "members"));
+      expect(files.length).toBe(2);
+      for (const file of files) {
+        expect(Number.parseInt(file, 10)).toBe(process.pid); // old-reader compatibility
+        expect(file.endsWith(`-${fixture.owner.token}`)).toBe(true);
+      }
+      fixture.owner.pid = 2_147_483_647;
+      writeFileSync(join(fixture.lockPath, "owner.json"), JSON.stringify(fixture.owner));
+      await expect(acquireTestRunLock({ ...options, runId: "blocked" })).rejects.toThrow("timed out");
+      // The legacy writer appends empty to its own PID-only path. Even after all
+      // modern identities become stale, that registration must preserve liveness.
+      const legacy = join(fixture.lockPath, "members", `${process.pid}-${fixture.owner.token}`);
+      writeFileSync(legacy, JSON.stringify(startA));
+      writeFileSync(legacy, "", { flag: "a" });
+      current = "win32:1600000000002";
+      await expect(acquireTestRunLock({ ...options, runId: "blocked" })).rejects.toThrow("timed out");
+      expect(readFileSync(legacy, "utf8")).toBe(JSON.stringify(startA));
+    } finally { removeTreeWithRetry(fixture.root); }
+  });
+
+  test("unknown registration falls back to an empty legacy member marker", async () => {
+    const fixture = identityFixture(undefined);
+    try {
+      await acquireTestRunLock({
+        runId: "held", lockPath: fixture.lockPath, env: queuedTestEnv,
+        processStartBatch: identityReader(null),
+      });
+      expect(readFileSync(join(fixture.lockPath, "members", `${process.pid}-${fixture.owner.token}`), "utf8")).toBe("");
+    } finally { removeTreeWithRetry(fixture.root); }
+  });
+
+  test("a failed identity probe stays conservative", async () => {
+    const fixture = identityFixture(startA);
+    try {
+      await expect(acquireTestRunLock({
+        runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+        env: queuedTestEnv, processStartBatch() { throw new Error("unreadable"); },
+      })).rejects.toThrow("timed out");
+    } finally { removeTreeWithRetry(fixture.root); }
+  });
+
+  test("stale verdicts are not cached across polls", async () => {
+    const fixture = identityFixture(startA, startB);
+    fixture.owner.pid = process.ppid;
+    writeFileSync(join(fixture.lockPath, "owner.json"), JSON.stringify(fixture.owner));
+    let waited = false;
+    let ownerProbes = 0;
+    const startedAt = Date.now();
+    let now = startedAt;
+    let freshOwnerObserved = false;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    // Leave the real scheduler and gate intact. If cached liveness suppresses
+    // the next identity probe, the existing real deadline still ends the wait.
+    const escapeAt = performance.now() + INTERNAL_DEADLINE_MS;
+    const escape = setInterval(() => {
+      if (performance.now() >= escapeAt) now = startedAt + 20;
+    }, 5);
+    try {
+      await expect(acquireTestRunLock({
+        runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20, env: queuedTestEnv,
+        onWait() { waited = true; now = Math.max(now, startedAt + 19); },
+        processStartBatch: pids => new Map(pids.map(pid => {
+          if (pid === process.ppid) {
+            ownerProbes += 1;
+            if (waited) {
+              freshOwnerObserved = true;
+              now = startedAt + 20;
+            }
+          }
+          return [pid, waited ? startA : startB];
+        })),
+      })).rejects.toThrow("timed out");
+      expect(freshOwnerObserved).toBe(true);
+      expect(ownerProbes).toBeGreaterThan(1);
+    } finally {
+      clearInterval(escape);
+      clock.mockRestore();
+      removeTreeWithRetry(fixture.root);
+    }
+  });
+
+  test("only ESRCH proves a PID dead", async () => {
+    for (const [code, member] of ["EPERM", "EACCES", "EINVAL", undefined].flatMap(code =>
+      [[code, false], [code, true]] as const)) {
+      const fixture = identityFixture(startA, member ? startA : undefined);
+      const originalKill = process.kill.bind(process);
+      const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (member && pid !== process.pid) return originalKill(pid, signal);
+        throw Object.assign(new Error("probe"), { code });
+      });
+      try {
+        await expect(acquireTestRunLock({
+          runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+          env: queuedTestEnv, processStartBatch: identityReader(startB),
+        })).rejects.toThrow("timed out");
+      } finally { kill.mockRestore(); removeTreeWithRetry(fixture.root); }
+    }
+  });
+
+  test("the platform identity reader reports a stable own identity", () => {
+    const first = readTestRunProcessStartBatch([process.pid]).get(process.pid);
+    if (!["win32", "darwin", "linux"].includes(process.platform)) return;
+    expect(first?.startsWith(`${process.platform}:`)).toBe(true);
+    expect(readTestRunProcessStartBatch([process.pid]).get(process.pid)).toBe(first);
+  });
+
+  test("macOS process starts use strict English UTC tokens", () => {
+    expect(parseDarwinTestProcessStart("Thu Oct 22 10:03:04 2026")).toBe("darwin:2026-10-22T10:03:04Z");
+    for (const value of ["Thu Oct 22 10:03:04 2026 PST", "Thu Oct 22 25:03:04 2026",
+      "Thu Feb 31 10:03:04 2026", "Wed Oct 22 10:03:04 2026", "jeu. oct. 22 10:03:04 2026"]) {
+      expect(parseDarwinTestProcessStart(value)).toBeNull();
+    }
+  });
+
+  test("Linux identity uses normalized start ticks and boot UUID without a wall clock", () => {
+    const boot = "00000000-0000-0000-0000-000000000001";
+    const stat = `123 (name with ) parentheses) S ${Array(18).fill("0").join(" ")} 000123 0`;
+    expect(parseLinuxTestProcessStart(stat, `${boot}\n`)).toBe(`linux:${boot}:123`);
+    expect(parseLinuxTestProcessStart(stat, "unreadable")).toBeNull();
+    expect(parseLinuxTestProcessStart(stat.replace("000123", "invalid"), boot)).toBeNull();
+  });
+
+  test("file timestamps never override matching process identities", async () => {
+    const fixture = identityFixture(startA);
+    try {
+      utimesSync(join(fixture.lockPath, "owner.json"), new Date(0), new Date(0));
+      await expect(acquireTestRunLock({
+        runId: "blocked", lockPath: fixture.lockPath, pollMs: 5, maxWaitMs: 20,
+        env: queuedTestEnv, processStartBatch: identityReader(startA),
+      })).rejects.toThrow("timed out");
+    } finally { removeTreeWithRetry(fixture.root); }
   });
 
   test("a live competing run fails closed after the bounded wait", async () => {

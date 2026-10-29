@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "../../src/config";
+import { flushConfigDirHardeningAndReaps } from "../../src/config/paths";
 import { readRecentUsageEntries } from "../../src/usage/log";
 import { buildDesktop3pRegistry } from "../../src/claude/desktop-3p";
 import type { DesktopProfile } from "../../src/claude/desktop-profile";
@@ -31,6 +32,7 @@ import { estimateTokens } from "../../src/lib/token-estimate";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { isolateClientLifecycleLock } from "../helpers/client-lifecycle-lock";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { SERVER_BUDGET_MS } from "../helpers/test-budget";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -48,6 +50,7 @@ import {
 } from "../../src/codex/native-profile-startup";
 
 let testDir = "";
+let lifecycleLock: ReturnType<typeof isolateClientLifecycleLock>;
 let previousHome: string | undefined;
 let previousDesktopConfigDir: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
@@ -57,13 +60,17 @@ beforeEach(() => {
   previousHome = process.env.OPENCODEX_HOME;
   isolatedCodexHome = installIsolatedCodexHome("ocx-claude-endpoint-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-claude-endpoint-"));
+  lifecycleLock = isolateClientLifecycleLock(testDir);
   process.env.OPENCODEX_HOME = testDir;
   previousDesktopConfigDir = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
   process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = join(testDir, "claude-desktop");
   globalThis.fetch = originalFetch;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  if (testDir) await flushConfigDirHardeningAndReaps(testDir);
+  lifecycleLock.restore();
+  if (isolatedCodexHome) await flushConfigDirHardeningAndReaps(isolatedCodexHome.path);
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (previousDesktopConfigDir === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
@@ -383,11 +390,18 @@ test("fetchWithHeaderDeadline classifies expiry as timeout and still clears exac
 });
 
 test("native Anthropic passthrough returns 502 when the upstream connection is refused (reject-path activation)", async () => {
-  const closed = Bun.serve({ port: 0, fetch: () => new Response() });
-  const closedOrigin = closed.url.toString().replace(/\/$/, "");
-  closed.stop(true);
+  const refusedOrigin = "http://127.0.0.1:1";
+  let rejected = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.origin === refusedOrigin) {
+      rejected += 1;
+      throw Object.assign(new TypeError("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    }
+    return originalFetch(input, init);
+  }) as typeof globalThis.fetch;
   const config = mockConfig("http://127.0.0.1:1/v1", {
-    anthropicBaseUrl: closedOrigin,
+    anthropicBaseUrl: refusedOrigin,
   });
   config.connectTimeoutMs = 60_000;
   saveConfig(config);
@@ -403,10 +417,12 @@ test("native Anthropic passthrough returns 502 when the upstream connection is r
       }),
     });
     expect(response.status).toBe(502);
+    expect(rejected).toBe(1);
     const json = await response.json() as Record<string, any>;
     expect(json.error?.type).toBe("api_error");
     expect(String(json.error?.message)).toContain("anthropic passthrough failed");
   } finally {
+    globalThis.fetch = originalFetch;
     await server.stop(true);
   }
 });
@@ -416,10 +432,10 @@ test("native Anthropic passthrough returns 502 when the upstream connection is r
 const sseEncoder = new TextEncoder();
 
 function spyFinalize() {
-  const calls: Array<{ status: number; closeReason: string }> = [];
+  const calls: Array<{ status: number; closeReason: string; terminalStatus?: string }> = [];
   return {
     calls,
-    finalize: (status: number, meta: { closeReason: string }) => calls.push({ status, closeReason: meta.closeReason }),
+    finalize: (status: number, meta: { closeReason: string; terminalStatus?: string }) => calls.push({ status, ...meta }),
   };
 }
 
@@ -435,6 +451,7 @@ const MESSAGE_START_FRAME = 'event: message_start\ndata: {"type":"message_start"
 const UNSPACED_USAGE_FRAMES = [
   'event:message_start\ndata:{"type":"message_start","message":{"usage":{"input_tokens":11}}}\n\n',
   'event:message_delta\ndata:{"type":"message_delta","usage":{"output_tokens":7}}\n\n',
+  'event:message_stop\ndata:{"type":"message_stop"}\n\n',
 ].join("");
 
 test("A0: usage extraction accepts unspaced data fields (#1170)", async () => {
@@ -451,8 +468,8 @@ test("A0: usage extraction accepts unspaced data fields (#1170)", async () => {
 
   // The bytes pass through untouched either way; what the strict prefix broke was the inspection.
   expect(text).toContain("message_start");
-  // "terminal" rather than "eof" is itself part of the fix: recognizing the unspaced
-  // `message_delta` is what lets the tap classify the close as a real terminal frame.
+  // A 200 terminal close depends on recognizing the unspaced frames: an unparsed
+  // `message_stop` would leave the turn looking cut short.
   expect(calls).toEqual([{ status: 200, closeReason: "terminal" }]);
   expect(ctx.usage).toEqual(expect.objectContaining({ inputTokens: 11, outputTokens: 7 }));
 });
@@ -470,7 +487,7 @@ test("A1: stalled upstream body gets an Anthropic timeout_error tail and body_st
   expect(text).toContain("message_start"); // prior bytes preserved
   expect(text).toContain("\n\nevent: error\ndata: ");
   expect(text).toContain('"type":"timeout_error"');
-  expect(calls).toEqual([{ status: 200, closeReason: "body_stall" }]);
+  expect(calls).toEqual([{ status: 502, closeReason: "body_stall", terminalStatus: "incomplete" }]);
 });
 
 test("A2: unbounded upstream body gets an api_error tail and body_overflow close reason", async () => {
@@ -485,7 +502,7 @@ test("A2: unbounded upstream body gets an api_error tail and body_overflow close
   expect(text).toContain("\n\nevent: error\ndata: ");
   expect(text).toContain('"type":"api_error"');
   expect(text).toContain("exceeded 120 bytes");
-  expect(calls).toEqual([{ status: 200, closeReason: "body_overflow" }]);
+  expect(calls).toEqual([{ status: 502, closeReason: "body_overflow", terminalStatus: "incomplete" }]);
 });
 
 test("A3: client abort mid-body finalizes 499 client_cancel, not 200 terminal (misclassification regression)", async () => {
@@ -1564,7 +1581,7 @@ test("native passthrough precedes even invalid compatibility mode", async () => 
 test("compatibility survives management toggles and rejects Desktop source features", async () => {
   const { server: upstream, urls } = mockChatUpstreamCapturing();
   saveConfig(mockConfig(new URL("/v1", upstream.url).href, { compatibility: "enforce" }));
-  const server = startServer(0);
+  const server = startServer(0, { managementApi: { claudeAgentConfigDir: join(testDir, "claude-agents") } });
   try {
     for (const enabled of [false, true]) {
       const toggle = await fetch(new URL("/api/native-integrations/claude", server.url), {
@@ -1666,7 +1683,7 @@ test("generated agent effort directive restores exact xhigh and max after Claude
         max_tokens: 32000,
         stream: true,
         system: [
-          { type: "text", text: "<!-- ocx-route: claude-ocx-mock--test-model -->" },
+          { type: "text", text: "<!-- ocx-route: ocx-claude-mock--test-model -->" },
           { type: "text", text: `<!-- ocx-effort: ${effort} -->` },
         ],
         thinking: { type: "enabled", budget_tokens: 31999 },
@@ -1726,7 +1743,7 @@ test("generated agent effort directive preserves routed Anthropic structured out
       max_tokens: 32000,
       stream: true,
       system: [
-        { type: "text", text: "<!-- ocx-route: claude-ocx-mock-anthropic--claude-sonnet-5 -->" },
+        { type: "text", text: "<!-- ocx-route: ocx-claude-mock-anthropic--claude-sonnet-5 -->" },
         { type: "text", text: "<!-- ocx-effort: max -->" },
       ],
       thinking: { type: "enabled", budget_tokens: 31999 },

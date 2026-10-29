@@ -1,3 +1,5 @@
+import { bindAnthropicRejectionPolicy } from "../../adapters/anthropic-rejection-memo";
+import { getReasoningReplayOpaqueBlobRejection } from "../../responses/reasoning-replay-cache";
 import type {
   OcxProviderContinuationOwner,
   OcxProviderContinuationState,
@@ -19,8 +21,13 @@ import {
   reasoningReplayCodexCredentialIdentity,
   reasoningReplayKeyCredentialIdentity,
   durableReplayDestinationIdentity,
+  nativeReasoningTag,
+  nativeReasoningTagMatches,
+  type NativeReasoningOwner,
   bindReasoningReplayScope,
   reasoningReplayServingIdentityChanged,
+  reasoningReplayServingIdentityChange,
+  reasoningReplayItemStoreChanged,
   reasoningReplayOpaqueBlobRejectionMemoized,
 } from "../../responses/reasoning-replay-cache";
 import type { OAuthAccessSnapshot } from "../../oauth";
@@ -28,12 +35,18 @@ import type { CodexAuthContext } from "../../codex/auth-context";
 import { thoughtSignatureReplaySalt } from "../../responses/thought-signature-replay";
 import { randomUUID } from "node:crypto";
 import { requiresPlaintextReasoningReplay } from "../../adapters/openai-responses/passthrough";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 
 /**
  * Adapters whose continuation state must survive Codex's store:false requests.
  */
 export function adapterNeedsForcedContinuation(name: string): boolean {
   return name === "kiro" || name === "cursor";
+}
+
+/** Adapters opting into restricted store:false replay for pending client function calls. */
+export function adapterNeedsToolCallContinuation(name: string): boolean {
+  return name === "qoder";
 }
 
 
@@ -112,6 +125,18 @@ export function bindRouteReasoningReplayScope(args: {
     ...args,
     modelId: parsed.modelId,
   });
+  const owner = nativeReasoningOwnerForRoute(args);
+  if (owner) parsed._nativeReasoningBoundOwner = owner;
+  else delete parsed._nativeReasoningBoundOwner;
+  if (parsed._nativeReasoningReplay?.size) {
+    const rejected = new Set<string>();
+    for (const [blob, tag] of parsed._nativeReasoningReplay) {
+      if (!nativeReasoningTagMatches(nativeReasoningTag(owner, blob), tag)) {
+        rejected.add(blob);
+      }
+    }
+    if (rejected.size) stripNativeReasoningBlobs(parsed, rejected);
+  }
   const continuationDestinationIdentity = providerContinuationDestinationIdentity(parsed, provider);
   const continuationOwner = providerContinuationOwnerFromReplayIdentity(
     replayIdentity && continuationDestinationIdentity
@@ -135,13 +160,96 @@ export function bindRouteReasoningReplayScope(args: {
   );
   // Keep this sticky for the whole outbound request: a later auth/key rebind may compare equal
   // after the first mismatch, but it cannot make history minted by the prior route decodable.
-  if (reasoningReplayServingIdentityChanged(parsed._reasoningReplayScope)) {
-    parsed._stripReasoningEncryptedContent = true;
+  const identityChange = reasoningReplayServingIdentityChange(parsed._reasoningReplayScope);
+  if (identityChange) {
+    // Reasoning retention does not establish portability of native compacted history.
+    parsed._stripNativeCompactionEncryptedContent = true;
+    const retention = parsed._nativeReasoningRetention;
+    const mayRetainReasoning = isCanonicalOpenAiForwardProvider(provider)
+      && !identityChange.providerChanged
+      && !identityChange.destinationChanged
+      && !identityChange.adapterChanged
+      && (!identityChange.modelChanged || retention?.modelSwitch === true)
+      && (!identityChange.credentialChanged || retention?.accountSwitch === true);
+    if (!mayRetainReasoning) parsed._stripReasoningEncryptedContent = true;
+    else if (parsed._stripReasoningEncryptedContent !== true) parsed._nativeReasoningRetainedAcrossRoute = true;
+    // Only a different destination or credential makes the replayed item ids unresolvable; a
+    // model change on the same store keeps them.
+    if (reasoningReplayItemStoreChanged(parsed._reasoningReplayScope)) {
+      parsed._dropForeignReasoningItemIds = true;
+    }
   }
+  const rejectionMemo = getReasoningReplayOpaqueBlobRejection(parsed._reasoningReplayScope);
+  bindAnthropicRejectionPolicy(parsed, adapterName === "anthropic" ? rejectionMemo : undefined);
   if (reasoningReplayOpaqueBlobRejectionMemoized(parsed._reasoningReplayScope)) {
-    parsed._stripReasoningEncryptedContent = true;
+    if (adapterName !== "anthropic" || rejectionMemo?.mode !== "selective") parsed._stripReasoningEncryptedContent = true;
+    parsed._stripNativeCompactionEncryptedContent = true;
+    parsed._dropForeignReasoningItemIds = true;
   }
+  // Stripping is authoritative: nothing retained remains to be refused.
+  if (parsed._stripReasoningEncryptedContent === true) delete parsed._nativeReasoningRetainedAcrossRoute;
   bindProviderContinuationForRoute(parsed, continuationOwner);
+}
+
+function stripNativeReasoningBlobs(parsed: OcxParsedRequest, rejected: ReadonlySet<string>): void {
+  const input = (parsed._rawBody as { input?: unknown } | undefined)?.input;
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (item && typeof item === "object" && item.type === "reasoning" && rejected.has(item.encrypted_content)) {
+        delete item.encrypted_content;
+        delete item.id;
+      }
+    }
+  }
+  for (const message of parsed.context.messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "thinking" || typeof part.signature !== "string") continue;
+      try {
+        const item: unknown = JSON.parse(part.signature);
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const reasoning = item as Record<string, unknown>;
+        if (reasoning.type !== "reasoning" || typeof reasoning.encrypted_content !== "string"
+          || !rejected.has(reasoning.encrypted_content)) continue;
+        delete reasoning.encrypted_content;
+        delete reasoning.id;
+        part.signature = JSON.stringify(reasoning);
+        delete part.itemId;
+      } catch { /* A provider signature is not the parser's JSON carrier. */ }
+    }
+  }
+}
+
+export function nativeReasoningOwnerForRoute(args: {
+  provider: OcxProviderConfig;
+  oauthCredentialSnapshot?: Pick<OAuthAccessSnapshot, "accountId" | "generation">;
+  codexAuthContext?: CodexAuthContext;
+}): NativeReasoningOwner | undefined {
+  const { provider } = args;
+  const salt = thoughtSignatureReplaySalt();
+  if (!salt || salt.length < 16) return undefined;
+  const destination = durableReplayDestinationIdentity(JSON.stringify([
+    provider.baseUrl.trim().replace(/\/+$/, ""), provider.responsesPath ?? "",
+  ]));
+  let credential: string | undefined;
+  if (provider.authMode === "oauth") {
+    const snapshot = args.oauthCredentialSnapshot;
+    if (snapshot?.accountId && snapshot.generation !== undefined) credential = durableReplayCredentialIdentity(
+      "oauth", `${snapshot.accountId}\0${snapshot.generation}`, provider.headers, salt,
+    );
+  } else if (provider.authMode === "forward") {
+    const context = args.codexAuthContext;
+    if (context && (context.kind === "pool" || context.kind === "main-pool")
+      && context.accountId && context.writerGeneration !== undefined
+      && (context.kind !== "pool" || context.generation !== undefined)) {
+      credential = durableReplayCredentialIdentity("codex", JSON.stringify([
+        context.accountId, context.kind === "pool" ? context.generation : null, context.writerGeneration,
+      ]), provider.headers, salt);
+    }
+  } else if (provider.authMode !== "local") {
+    credential = durableReplayCredentialIdentity("key", nonEmptyProviderApiKey(provider), provider.headers, salt);
+  }
+  return destination && credential ? { destination, credential } : undefined;
 }
 
 
@@ -236,6 +344,7 @@ function routeReasoningReplayIdentity(args: {
 export function mandatoryResponsesReasoningReplayUnavailable(args: {
   body: unknown;
   clientThreadId: string | undefined;
+  clientPrincipalId?: string;
   providerName: string;
   provider: OcxProviderConfig;
   adapterName: string;
@@ -251,7 +360,7 @@ export function mandatoryResponsesReasoningReplayUnavailable(args: {
   ) return false;
 
   const current = routeReasoningReplayIdentity(args);
-  return reasoningReplayServingIdentityChanged({ clientThreadId, current });
+  return reasoningReplayServingIdentityChanged({ clientThreadId, clientPrincipalId: args.clientPrincipalId, current });
 }
 
 

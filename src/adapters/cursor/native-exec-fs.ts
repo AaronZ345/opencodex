@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import {
   DeleteErrorSchema,
@@ -35,14 +35,17 @@ import {
 } from "./gen/agent_pb";
 import { errorText, execBytes, lineCount, textDecoder, textEncoder } from "./native-exec-common";
 
+import { CURSOR_TOOL_CALL_CONTINUATION } from "./tool-wording";
+
 const MAX_GREP_FILES = 500;
 const MAX_GREP_RESULTS = 200;
 const MAX_FILE_BYTES = 1_000_000;
 
-function codexNativeMutationRefusal(operation: "write" | "delete", structuredEditAvailable: boolean): string {
+function codexNativeMutationRefusal(operation: "write" | "delete", structuredEditAvailable: boolean, plainToolWording = false): string {
   const structuredHint = structuredEditAvailable
     ? " Use the structured edit tools (`edit_file` / `multi_edit`) or the `apply_patch` tool for file edits so Codex can approve the change, enforce sandbox policy, show diffs, and record rollout."
     : " Use the `apply_patch` tool for file edits so Codex can approve the change, enforce sandbox policy, show diffs, and record rollout.";
+  if (plainToolWording) return `Cursor-native ${operation} is not available for this request.${structuredHint} No file was changed. ${CURSOR_TOOL_CALL_CONTINUATION}`;
   return `Make this ${operation} through the Codex edit path instead.${structuredHint} No file was changed. Do NOT narrate this redirect or comment on tool availability — just make the edit call.`;
 }
 
@@ -87,24 +90,24 @@ export function readExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-export function rejectWriteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false): Uint8Array {
+export function rejectWriteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "writeArgs") throw new Error("invalid write exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "writeResult", create(WriteResultSchema, {
     result: {
       case: "rejected",
-      value: create(WriteRejectedSchema, { path, reason: codexNativeMutationRefusal("write", structuredEditAvailable) }),
+      value: create(WriteRejectedSchema, { path, reason: codexNativeMutationRefusal("write", structuredEditAvailable, plainToolWording) }),
     },
   }));
 }
 
-export function rejectWriteExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
+export function rejectWriteExecForPolicy(execMsg: ExecServerMessage, hint?: string, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "writeArgs") throw new Error("invalid write exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "writeResult", create(WriteResultSchema, {
     result: {
       case: "rejected",
-      value: create(WriteRejectedSchema, { path, reason: `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
+      value: create(WriteRejectedSchema, { path, reason: plainToolWording ? `No file was changed. ${hint ?? NATIVE_LOCAL_EXEC_DISABLED}` : `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
     },
   }));
 }
@@ -136,24 +139,24 @@ export function writeExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-export function rejectDeleteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false): Uint8Array {
+export function rejectDeleteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "deleteArgs") throw new Error("invalid delete exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "deleteResult", create(DeleteResultSchema, {
     result: {
       case: "rejected",
-      value: create(DeleteRejectedSchema, { path, reason: codexNativeMutationRefusal("delete", structuredEditAvailable) }),
+      value: create(DeleteRejectedSchema, { path, reason: codexNativeMutationRefusal("delete", structuredEditAvailable, plainToolWording) }),
     },
   }));
 }
 
-export function rejectDeleteExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
+export function rejectDeleteExecForPolicy(execMsg: ExecServerMessage, hint?: string, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "deleteArgs") throw new Error("invalid delete exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "deleteResult", create(DeleteResultSchema, {
     result: {
       case: "rejected",
-      value: create(DeleteRejectedSchema, { path, reason: `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
+      value: create(DeleteRejectedSchema, { path, reason: plainToolWording ? `No file was changed. ${hint ?? NATIVE_LOCAL_EXEC_DISABLED}` : `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
     },
   }));
 }
@@ -232,19 +235,21 @@ export function lsExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-function matchesGlob(file: string, glob?: string): boolean {
-  if (!glob) return true;
-  if (glob.startsWith("*.") || glob.startsWith("**/*.")) return file.endsWith(glob.slice(glob.indexOf("*") + 1));
-  return file.includes(glob.replaceAll("*", ""));
+function grepFileMatcher(root: string, glob?: string): (file: string) => boolean {
+  if (!glob) return () => true;
+  const matcher = new Bun.Glob(glob.replace(/^(?:\.\/)+/, ""));
+  // Bare patterns apply to each basename; slash patterns are relative to the selected root.
+  const pathPattern = glob.includes("/");
+  return file => matcher.match(pathPattern ? relative(root, file).split(sep).join("/") : basename(file));
 }
 
-function collectFiles(root: string, glob?: string, out: string[] = []): string[] {
+function collectFiles(root: string, matchesFile: (file: string) => boolean, out: string[] = []): string[] {
   if (out.length >= MAX_GREP_FILES) return out;
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (entry.name === "node_modules" || entry.name === ".git") continue;
     const path = join(root, entry.name);
-    if (entry.isDirectory()) collectFiles(path, glob, out);
-    if (entry.isFile() && matchesGlob(path, glob)) out.push(path);
+    if (entry.isDirectory()) collectFiles(path, matchesFile, out);
+    if (entry.isFile() && matchesFile(path)) out.push(path);
     if (out.length >= MAX_GREP_FILES) break;
   }
   return out;
@@ -266,7 +271,7 @@ export function grepExec(execMsg: ExecServerMessage): Uint8Array {
   const root = resolve(args.path || process.cwd());
   try {
     const pattern = new RegExp(args.pattern, args.caseInsensitive ? "i" : "");
-    const files = existsSync(root) && statSync(root).isDirectory() ? collectFiles(root, args.glob) : [root];
+    const files = existsSync(root) && statSync(root).isDirectory() ? collectFiles(root, grepFileMatcher(root, args.glob)) : [root];
     const matches = [];
     for (const file of files) {
       if (matches.length >= MAX_GREP_RESULTS) break;

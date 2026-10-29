@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { getConfigDir } from "../config";
-import { atomicWriteFile } from "../config/atomic-write";
+import { atomicWriteFile, atomicWriteFileNoFollow } from "../config/atomic-write";
 
 const MAX_SERVICE_API_TOKEN_BYTES = 4096;
 
@@ -46,6 +46,103 @@ export function readServiceApiTokenState(): ServiceApiTokenState {
     return { kind: "present", token, fingerprint: serviceApiTokenFingerprint(token) };
   } catch {
     return { kind: "unsafe", reason: "service token file could not be read" };
+  }
+}
+
+/**
+ * Validate and tighten a reused service token without applying permissions to a
+ * pathname that may have been replaced since validation.
+ *
+ * The token is read off the opened descriptor — never off the path a second
+ * time — and once it validates, it is REPUBLISHED through the no-follow atomic
+ * writer rather than hardened in place. Windows ACL tooling is pathname-based,
+ * so an in-place harden there could still land on a substituted entry; the
+ * republish instead replaces whatever entry sits at the path with a freshly
+ * hardened owner-only file holding the same token. On return the path names
+ * that file, which is the contract `origin: "file"` reports. On POSIX the
+ * opened descriptor is also fchmod'd first, so a token-bearing inode a race
+ * moved aside is still tightened wherever its entry ended up.
+ *
+ *
+ * Return contract vs `readServiceApiTokenState`: an empty or malformed token file
+ * reports `unsafe` here and is never written — the path-based pre-check may still
+ * pass the install on loopback while this writer deliberately leaves the file
+ * untouched. Only `absent` permits a fresh write; anything unreadable stays as-is.
+ *
+ * Callers must run this under `withConfigMutationLockSync`: client-key rotation
+ * replaces the token under that lock, and a republish outside it could rename a
+ * stale token back over a committed rotation.
+ */
+export function hardenReusedServiceApiToken(
+  validate: (token: string) => void,
+): ServiceApiTokenState {
+  const path = serviceApiTokenFilePath();
+  // O_NOFOLLOW refuses a symlinked entry and O_NONBLOCK keeps a FIFO (or other
+  // blocking node) from stalling the open before fstat can reject it. Windows
+  // omits both flags, so there the descriptor is bound to its entry by the
+  // lstat/fstat identity comparison below.
+  const flags = process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, flags);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "absent" };
+    if (code === "ELOOP") return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    return { kind: "unsafe", reason: "service token path could not be inspected" };
+  }
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    if (!stat.isFile() || stat.size > BigInt(MAX_SERVICE_API_TOKEN_BYTES)) {
+      return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    }
+    if (process.platform === "win32") {
+      let entry;
+      try {
+        entry = lstatSync(path, { bigint: true });
+      } catch {
+        return { kind: "unsafe", reason: "service token path could not be inspected" };
+      }
+      if (entry.isSymbolicLink() || !entry.isFile() || entry.dev !== stat.dev || entry.ino !== stat.ino) {
+        return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+      }
+    }
+    // Bound the read as well as the stat: a file that grows past the cap after
+    // fstat is unsafe, not something to buffer whole.
+    const bytes = Buffer.alloc(MAX_SERVICE_API_TOKEN_BYTES + 1);
+    let length = 0;
+    try {
+      while (length < bytes.length) {
+        const count = readSync(fd, bytes, length, bytes.length - length, null);
+        if (!count) break;
+        length += count;
+      }
+    } catch {
+      return { kind: "unsafe", reason: "service token file could not be read" };
+    }
+    if (length > MAX_SERVICE_API_TOKEN_BYTES) {
+      return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    }
+    const token = bytes.subarray(0, length).toString("utf8").trim();
+    if (!token) return { kind: "unsafe", reason: "service token file is empty" };
+    validate(token);
+    if (process.platform !== "win32") {
+      // Best-effort matches the previous repair behavior: the descriptor binds
+      // the chmod to the regular file opened above even if its directory entry
+      // moved, so the validated inode is never left loose under another name.
+      try { fchmodSync(fd, 0o600); } catch { /* best-effort */ }
+    }
+    // The descriptor's work ends here — and must: Windows refuses to rename over
+    // a file this process still holds open, so the republish cannot run while it
+    // is held.
+    closeSync(fd);
+    fd = undefined;
+    atomicWriteFileNoFollow(path, `${token}\n`);
+    return { kind: "present", token, fingerprint: serviceApiTokenFingerprint(token) };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -171,18 +268,53 @@ export function removeServiceApiTokenFileIfOwned(
  * token file into the environment). Pure: returns the token or null — the CALLER
  * assigns it to process.env.OPENCODEX_API_AUTH_TOKEN. Loads only when the env token
  * is empty and OCX_API_TOKEN_FILE names a readable file.
+ *
+ * OCX_API_TOKEN_FILE is inherited from the environment, so the path is untrusted: the read
+ * goes through one no-follow, nonblocking descriptor, accepts only a regular file of at most
+ * MAX_SERVICE_API_TOKEN_BYTES, and returns only a single-line printable token. Anything else
+ * (a FIFO, device, symlink, oversized or multi-line file) loads nothing.
  */
 export function loadServiceTokenFromFile(env: Record<string, string | undefined>): string | null {
   if (env.OPENCODEX_API_AUTH_TOKEN?.trim()) return null;
   const file = env.OCX_API_TOKEN_FILE?.trim();
   if (!file) return null;
+  const flags = process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  let fd: number | undefined;
   try {
-    const token = readFileSync(file, "utf8").trim();
-    return token || null;
+    // Windows has no O_NOFOLLOW: refuse a link up front, then bind the opened descriptor to the
+    // entry by identity so a link swapped in between lstat and open is still refused.
+    const entry = process.platform === "win32" ? lstatSync(file, { bigint: true }) : undefined;
+    if (entry?.isSymbolicLink()) return null;
+    fd = openSync(file, flags);
+    const stat = fstatSync(fd, { bigint: true });
+    if (!stat.isFile() || stat.size > BigInt(MAX_SERVICE_API_TOKEN_BYTES)) return null;
+    if (entry) {
+      const after = lstatSync(file, { bigint: true });
+      if (after.isSymbolicLink() || after.dev !== stat.dev || after.ino !== stat.ino || entry.ino !== stat.ino || entry.dev !== stat.dev) return null;
+    }
+    const buffer = Buffer.alloc(MAX_SERVICE_API_TOKEN_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = readSync(fd, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > MAX_SERVICE_API_TOKEN_BYTES) return null;
+    const token = buffer.subarray(0, length).toString("utf8").trim();
+    return SERVICE_TOKEN_FILE_SHAPE.test(token) ? token : null;
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
   }
 }
+
+/** One line of printable, non-space ASCII: never JSON with newlines, binary, or a second line. */
+const SERVICE_TOKEN_FILE_SHAPE = /^[\x21-\x7e]{1,4096}$/;
 
 /**
  * The data-plane token a boot should export, or null when the environment already has one

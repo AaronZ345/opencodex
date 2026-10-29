@@ -1,3 +1,4 @@
+import { anthropicProgressItems } from "../responses/anthropic-progress";
 import type {
   AdapterEvent,
   OcxMessagePhase,
@@ -7,6 +8,7 @@ import type {
   OcxUsage,
 } from "../types";
 import { coerceIntegerToolArguments } from "../lib/tool-argument-integers";
+import { attemptDeliveryRecorder } from "../usage/attempt-delivery";
 import {
   adapterFailureFromMessage,
   classifyError,
@@ -16,7 +18,7 @@ import {
   type OcxErrorPayload,
 } from "../lib/errors";
 import { mayBecomePatchEnvelope, repairFreeformToolInput } from "../responses/apply-patch-envelope";
-import { encodeCompactionSummary } from "../responses/compaction";
+import { encodeCompactionSummary, releaseCompactionCiphertextLease } from "../responses/compaction";
 import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "../responses/code-mode-helper-compat";
 import { isTruncatedStopReason, truncationReasonFor } from "../responses/truncated-stop-reason";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "../responses/reasoning-envelope";
@@ -40,34 +42,59 @@ import {
   type TranslatorBudget,
   type TranslatorBufferKind,
 } from "../lib/translator-budget";
-import { adapterFailureFromEvent, emptyChunks, joinChunks, responsesUsage, toolCallArgumentsUsable, uuid, webSearchAction } from "./internal";
+import { adapterFailureFromEvent, emptyChunks, joinChunks, responsesUsage, toolCallArgumentsUsable, uuid, webSearchAction, webSearchCellItemId } from "./internal";
 import type { OutputItem, StringChunks } from "./internal";
 import { bridgeToResponsesSSE } from "./sse";
 
+/** Build a buffered Responses result within a caller-owned or temporary translator budget. */
 export function buildResponseJSON(
   events: AdapterEvent[],
   modelId: string,
-  options?: Parameters<typeof buildResponseJSONWithBudget>[2],
+  options?: Parameters<typeof buildResponseJSONWithBudget>[2] & {
+    /**
+     * False when the body is not what the client receives: a direct client encoder counts its
+     * own relayed frames and folds the same events here only for the completion effects.
+     */
+    recordBufferedDelivery?: boolean;
+  },
 ): Record<string, unknown> {
   // Default-budget safety net: a caller that omits the budget gets a bounded
   // default (disposed with the call), never the unbounded append path.
-  if (options?.translatorBudget) return buildResponseJSONWithBudget(events, modelId, options);
-  const budget = createTranslatorBudget();
+  const ownsBudget = !options?.translatorBudget;
+  const budget = options?.translatorBudget ?? createTranslatorBudget();
   try {
-    return buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
+    const body = buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
+    // Buffered delivery has no per-frame recorder; retain its existing one-shot attribution.
+    if (options?.translatorBudget && options.recordBufferedDelivery !== false) {
+      attemptDeliveryRecorder(budget)?.noteBufferedDelivery(body);
+    }
+    if (body.status === "completed" && options?.compaction
+      && !events.some(event => event.type === "done" && event.compactionEncryptedContent)) options.compactionRetention?.commit();
+    return body;
   } finally {
-    budget.dispose();
+    for (const event of events) {
+      releaseTranslatedEvent(event, budget);
+      releaseCompactionCiphertextLease(event, budget);
+    }
+    if (ownsBudget) budget.dispose();
   }
 }
 
+/** Fold adapter events into a Responses result while enforcing the requested tool boundary. */
 function buildResponseJSONWithBudget(
   events: AdapterEvent[],
   modelId: string,
   options?: {
     hideThinkingSummary?: boolean;
+    /** Internal Chat delivery override for raw reasoning only; summaries keep their policy. */
+    chatRawReasoningVisible?: boolean;
+    /** Provider policy: suppress raw content-channel reasoning, keep provider-authored summaries. */
+    hideRawReasoning?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
-    /** Request-visible tool names. When present, an upstream call outside this set fails closed. */
+    /** Request-visible tool names. Required for client calls when enforcement is explicitly enabled. */
     declaredToolNames?: ReadonlySet<string>;
+    /** Bare custom declarations; unlike freeformToolNames, excludes foreign namespace children. */
+    bareCustomToolNames?: ReadonlySet<string>;
     /** See `bridgeToResponsesSSE`: enforcement is separate from normalization (#4735). */
     enforceDeclaredToolNames?: boolean;
     /** Declared parameter schema per tool name; repairs integral-float integer args (#1611). */
@@ -76,12 +103,20 @@ function buildResponseJSONWithBudget(
     toolSearchToolNames?: Set<string>;
     /** Remote compaction v2 turn — append one synthetic compaction output item (see bridgeToResponsesSSE). */
     compaction?: boolean;
+    compactionRetention?: { encode(summary: string): string; commit(): void };
     onProviderState?: (state: OcxProviderContinuationState) => void;
     /** Raw adapter-reported usage before wire normalization (see bridgeToResponsesSSE onUsage). */
     onUsage?: (usage: OcxUsage | undefined) => void;
     translatorBudget?: TranslatorBudget;
     /** Conversation identity for the reasoning replay cache (issue #950). */
     replayCacheScope?: OcxReasoningReplayScopeRef;
+    /**
+     * Fold-only callers whose body never reaches the client (direct client encoders): hidden raw
+     * reasoning is still handed to the replay cache, but no client-bound `ocxr1` envelope is
+     * materialized. Encoding reserves roughly ten times the text against the translator budget,
+     * so a block that fit live delivery could otherwise overflow here and lose the cache write.
+     */
+    omitHiddenReasoningEnvelope?: boolean;
   },
 ): Record<string, unknown> {
   const responseId = `resp_${uuid()}`;
@@ -220,7 +255,7 @@ function buildResponseJSONWithBudget(
     const text = stripCitationMarkers(currentTextStr);
     const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
     const annotations = pendingWebSources.map(s => ({
-      type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
+      type: "url_citation", url: s.url, title: s.title || s.url, start_index: 0, end_index: 0,
     }));
     pendingWebSources = [];
     const item = {
@@ -264,7 +299,12 @@ function buildResponseJSONWithBudget(
     const rawText = joinChunks(currentRawReasoning);
     if (!rawText) return;
     rawReasoningForNextToolCall = rawText;
-    if (options?.hideThinkingSummary === true) {
+    if (!(options?.chatRawReasoningVisible ?? !options?.hideThinkingSummary) || options?.hideRawReasoning === true) {
+      if (options?.omitHiddenReasoningEnvelope === true) {
+        budget?.releaseRetained(currentRawReasoning.bytes, { kind: "reasoning" });
+        currentRawReasoning = emptyChunks();
+        return;
+      }
       // Same contract as the streaming path: no visible reasoning, txt-only envelope round-trip.
       pushOutput({
         type: "reasoning", id: `rs_${uuid()}`, summary: [],
@@ -352,6 +392,16 @@ function buildResponseJSONWithBudget(
         flushToolCall();
         break;
       case "text_delta":
+        if (options?.compaction && e.anthropicThinkingSignature) break;
+        if (e.anthropicThinkingSignature) {
+          rawReasoningForNextToolCall = "";
+          flushText("commentary");
+          flushSummaryReasoning();
+          flushRawReasoning();
+          flushToolCall();
+          for (const item of anthropicProgressItems(e.text, e.anthropicThinkingSignature, budget)) pushOutput(item as OutputItem);
+          break;
+        }
         // Only flush on an explicit phase change. A later delta that omits `phase` must keep
         // appending under the previously established phase.
         if (currentText.bytes > 0 && e.phase !== undefined && currentTextPhase !== e.phase) flushText("commentary");
@@ -433,11 +483,11 @@ function buildResponseJSONWithBudget(
           rememberReasoningForCall(e.id, rawReasoningForNextToolCall, replayCacheScope);
         }
         flushToolCall();
-        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames);
+        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames, undefined, options?.bareCustomToolNames);
         if (
-          options?.declaredToolNames
-          && options.enforceDeclaredToolNames !== false
-          && !options.declaredToolNames.has(effectiveName)
+          (options?.enforceDeclaredToolNames === true || options?.declaredToolNames != null)
+          && options?.enforceDeclaredToolNames !== false
+          && !options?.declaredToolNames?.has(effectiveName)
         ) {
           errorEvent = {
             type: "error",
@@ -466,6 +516,7 @@ function buildResponseJSONWithBudget(
         }
         break;
       case "tool_call_end":
+        if (e.incomplete) { flushToolCall("incomplete"); break; }
         if (!toolCallArgumentsUsable(currentToolCallArgs) && currentToolCallId) {
           // Mirror the streaming path: refuse to complete unusable arguments.
           const mapped = options?.toolNsMap?.get(currentToolCallName);
@@ -498,9 +549,10 @@ function buildResponseJSONWithBudget(
         flushToolCall();
         const safeSources = safeWebSearchSources(e.sources);
         pushOutput({
-          type: "web_search_call", id: `ws_${uuid()}`, status: e.status ?? "completed",
-          action: webSearchAction(e.queries),
+          type: "web_search_call", id: webSearchCellItemId(e.itemId), status: e.status ?? "completed",
+          action: webSearchAction(e.queries, e.anthropic),
           ...(safeSources.length > 0 ? { sources: safeSources } : {}),
+          ...(e.anthropic ? { anthropic_blocks: e.anthropic } : {}),
         });
         if (safeSources.length > 0) {
           for (const source of safeSources) {
@@ -582,9 +634,9 @@ function buildResponseJSONWithBudget(
   ) {
    const item = {
       type: "compaction", id: `cmp_${uuid()}`,
-      encrypted_content: compactionEncryptedContent ?? encodeCompactionSummary(joinChunks(batchCompaction)),
+      encrypted_content: compactionEncryptedContent ?? (options?.compactionRetention?.encode(joinChunks(batchCompaction)) ?? encodeCompactionSummary(joinChunks(batchCompaction))),
     };
-    pushOutput(item, compactionEncryptedContent ? bytesOf(compactionEncryptedContent) : batchCompaction.bytes);
+    pushOutput(item, compactionEncryptedContent ? 0 : batchCompaction.bytes);
   }
 
   const failure = errorEvent ? adapterFailureFromEvent(errorEvent) : undefined;
@@ -612,7 +664,7 @@ function buildResponseJSONWithBudget(
       : errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),
     ...(incompleteEvent ? {
       incomplete_details: {
-        reason: incompleteEvent.reason,
+        reason: truncationReasonFor(incompleteEvent.reason) ?? incompleteEvent.reason,
         ...(incompleteEvent.message ? { message: incompleteEvent.message } : {}),
         ...(incompleteEvent.retryable !== undefined ? { retryable: incompleteEvent.retryable } : {}),
       },

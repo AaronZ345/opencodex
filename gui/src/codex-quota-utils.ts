@@ -1,6 +1,7 @@
 import { isTerminalShortWindow } from "../../src/codex/quota-types";
 
 export interface AccountQuota {
+  workbuddyCredits?: import("../../src/providers/workbuddy-credit-balance").WorkBuddyCreditBalance;
   weeklyPercent?: number;
   fiveHourPercent?: number;
   /** Codex account API aliases for the same five-hour window. */
@@ -13,7 +14,7 @@ export interface AccountQuota {
   shortObservedAt?: number;
   shortWindowSeconds?: number;
   monthlyResetAt?: number;
-  customWindows?: { label: string; percent: number; resetAt?: number }[];
+  customWindows?: { label: string; percent: number; resetAt?: number; modelId?: string }[];
   creditsUsd?: {
     used: number;
     limit: number;
@@ -52,6 +53,7 @@ export function normalizeQuotaForPlan(quota: AccountQuota | null, plan: string |
   return {
     ...(normalized.monthlyPercent !== undefined ? { monthlyPercent: normalized.monthlyPercent } : {}),
     ...(normalized.monthlyResetAt !== undefined ? { monthlyResetAt: normalized.monthlyResetAt } : {}),
+    ...(normalized.workbuddyCredits !== undefined ? { workbuddyCredits: normalized.workbuddyCredits } : {}),
     ...(normalized.creditsUsd !== undefined ? { creditsUsd: normalized.creditsUsd } : {}),
     ...(normalized.resetCredits !== undefined ? { resetCredits: normalized.resetCredits } : {}),
     updatedAt: normalized.updatedAt,

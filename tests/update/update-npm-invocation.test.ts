@@ -1,14 +1,56 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   npmInvocation,
   resolveNpmCommand,
 } from "../../src/update/npm-invocation.mjs";
+import { spawnedNpmOperation } from "../helpers/npm-operation";
 
 const cwd = "C:\\work\\untrusted-project";
 const trustedNpm = "C:\\Program Files\\nodejs\\npm.cmd";
 const systemCmd = "C:\\Windows\\System32\\cmd.exe";
 
 describe("Windows npm update invocation", () => {
+  test.each([
+    "SystemRoot", "SYSTEMROOT", "sYsTeMrOoT", "windir", "WINDIR", "WiNdIr",
+    "ComSpec", "COMSPEC", "cOmSpEc",
+  ])("resolves the command processor from a copied %s environment key", key => {
+    // A sanitized environment is a plain object, without Windows process.env's
+    // case-insensitive property access. The npm path itself resolves in every case.
+    const env = { ...{
+      PATH: "C:\\Program Files\\nodejs", PATHEXT: ".CMD",
+      [key]: key.toLowerCase() === "comspec" ? systemCmd : "C:\\Windows",
+    } };
+    const deps = { cwd, exists: (path: string) => path === trustedNpm };
+    expect(resolveNpmCommand("win32", env, deps)).toBe(trustedNpm);
+    expect(npmInvocation(["view", "pkg@latest", "version"], "win32", env, deps)?.file).toBe(systemCmd);
+  });
+
+  test("preserves exact shell-key and SystemRoot precedence in copied environments", () => {
+    const env = {
+      PATH: "C:\\Program Files\\nodejs", PATHEXT: ".CMD",
+      SystemRoot: "C:\\Windows", SYSTEMROOT: "D:\\OtherWindows",
+      windir: "E:\\OtherWindows", ComSpec: "F:\\OtherWindows\\cmd.exe",
+    };
+    const deps = { cwd, exists: (path: string) => path === trustedNpm };
+    expect(npmInvocation(["--version"], "win32", env, deps)?.file).toBe(systemCmd);
+    expect(npmInvocation(["--version"], "win32", {
+      PATH: env.PATH, PATHEXT: env.PATHEXT, ComSpec: systemCmd, COMSPEC: "D:\\OtherWindows\\cmd.exe",
+    }, deps)?.file).toBe(systemCmd);
+  });
+
+  test("refuses missing, relative or ambiguous copied command-processor locations", () => {
+    for (const shell of [{}, { SYSTEMROOT: "relative" }, { COMSPEC: "cmd.exe" },
+      { SYSTEMROOT: "C:\\Windows", systemroot: "D:\\OtherWindows" }]) {
+      const env = { PATH: "C:\\Program Files\\nodejs", PATHEXT: ".CMD", ...shell };
+      const deps = { cwd, exists: (path: string) => path === trustedNpm };
+      expect(resolveNpmCommand("win32", env, deps)).toBe(trustedNpm);
+      expect(npmInvocation(["--version"], "win32", env, deps)).toBeNull();
+    }
+  });
+
   test("ignores current-directory candidates and resolves npm from an absolute PATH entry", () => {
     const existing = new Set([
       `${cwd}\\npm.cmd`,
@@ -45,6 +87,7 @@ describe("Windows npm update invocation", () => {
     const appDataNpm = `${home}\\AppData\\Roaming\\npm\\npm.cmd`;
     const env = {
       PATH: `${home}\\AppData\\Roaming\\npm`,
+      APPDATA: `${home}\\AppData\\Roaming`,
       PATHEXT: ".CMD",
       SystemRoot: "C:\\Windows",
     };
@@ -53,6 +96,161 @@ describe("Windows npm update invocation", () => {
       cwd: home,
       exists: path => path === appDataNpm,
     })).toBe(appDataNpm);
+  });
+
+  test.each([
+    ["C:\\Users\\dev", "C:\\Users\\dev\\AppData\\Local\\Volta\\bin", "LOCALAPPDATA", "C:\\Users\\dev\\AppData\\Local"],
+    ["C:\\", "C:\\Program Files\\nodejs", "ProgramFiles", "C:\\Program Files"],
+    ["C:\\Users\\dev", "C:\\Users\\dev\\scoop\\apps\\nodejs-lts\\current", "USERPROFILE", "C:\\Users\\dev"],
+    ["C:\\Users\\dev", "C:\\Users\\dev\\scoop\\apps\\nodejs-lts\\current\\bin", "USERPROFILE", "C:\\Users\\dev"],
+    ["C:\\Users\\dev", "C:\\Users\\dev\\scoop\\apps\\nodejs\\current", "USERPROFILE", "C:\\Users\\dev"],
+    ["C:\\Users\\dev", "C:\\Users\\dev\\scoop\\apps\\nodejs\\current\\bin", "USERPROFILE", "C:\\Users\\dev"],
+  ])("resolves trusted npm from broad cwd %s", (cwd, directory, envKey, root) => {
+    const npm = `${directory}\\npm.cmd`;
+    expect(resolveNpmCommand("win32", { PATH: directory, PATHEXT: ".CMD", [envKey]: root }, {
+      cwd, exists: path => path === npm, realpath: path => path,
+    })).toBe(npm);
+  });
+
+  test("does not trust a Scoop npm inside the launch tree or arbitrary Scoop apps", () => {
+    const home = "C:\\Users\\dev";
+    const root = `${home}\\scoop\\apps\\nodejs-lts\\current`;
+    const npm = `${root}\\bin\\npm.cmd`;
+    const env = { PATH: `${root}\\bin`, USERPROFILE: home, PATHEXT: ".CMD" };
+    const deps = { exists: (path: string) => path === npm, realpath: (path: string) => path };
+    expect(resolveNpmCommand("win32", env, { ...deps, cwd: home })).toBe(npm);
+    expect(resolveNpmCommand("win32", env, { ...deps, cwd: root })).toBeNull();
+    expect(resolveNpmCommand("win32", env, { ...deps, cwd: `${root}\\bin` })).toBeNull();
+    expect(resolveNpmCommand("win32", {
+      ...env, PATH: `${home}\\scoop\\apps\\other\\current\\bin`,
+    }, { cwd: home, exists: () => true })).toBeNull();
+  });
+
+  test.each(["nodejs", "nodejs-lts"])("canonicalizes only the short-home alias for Scoop %s persisted bins", appName => {
+    const physicalHome = "C:\\Users\\Runner Administrator";
+    for (const home of ["C:\\Users\\RUNNER~1", physicalHome]) {
+      const app = `${home}\\scoop\\apps\\${appName}`;
+      const physicalApp = `${physicalHome}\\scoop\\apps\\${appName}`;
+      const current = `${app}\\current`;
+      const version = `${physicalApp}\\24.1.0`;
+      const entry = `${current}\\bin`;
+      const candidate = `${entry}\\npm.cmd`;
+      const expectedPersist = `${home}\\scoop\\persist\\${appName}\\bin`;
+      const physicalPersist = `${physicalHome}\\scoop\\persist\\${appName}\\bin`;
+      const cwdAlias = "C:\\launch-alias";
+      const baseline = new Map<string, string>([
+        [home, physicalHome], [app, physicalApp], [current, version],
+        [entry, physicalPersist], [candidate, `${physicalPersist}\\npm.cmd`],
+        [expectedPersist, physicalPersist], [physicalPersist, physicalPersist],
+        [cwdAlias, physicalHome],
+      ]);
+      const resolve = (overrides: Array<[string, string | undefined]> = []) => {
+        const paths = new Map<string, string | undefined>(baseline);
+        for (const [from, to] of overrides) paths.set(from, to);
+        return resolveNpmCommand("win32", { USERPROFILE: home, PATH: entry, PATHEXT: ".CMD" }, {
+          cwd: cwdAlias, exists: path => path === candidate,
+          realpath: path => {
+            const target = paths.get(path);
+            if (target === undefined) throw new Error("unresolved synthetic path");
+            return target;
+          },
+        });
+      };
+      expect(resolve()).toBe(candidate);
+      for (const redirected of [`${physicalHome}\\other-bin`, "D:\\another-home\\bin"]) {
+        // Even resolving the expected persist path reaches the attacker target:
+        // accepting that result would silently redefine the trusted suffix.
+        expect(resolve([[entry, redirected], [candidate, `${redirected}\\npm.cmd`],
+          [expectedPersist, redirected], [physicalPersist, redirected]])).toBeNull();
+      }
+      expect(resolve([[candidate, `${physicalHome}\\elsewhere\\npm.cmd`]])).toBeNull();
+      expect(resolve([[current, "D:\\outside-app"]])).toBeNull();
+      expect(resolve([[current, physicalApp]])).toBeNull();
+      expect(resolve([[cwdAlias, version]])).toBeNull();
+      expect(resolve([[cwdAlias, physicalPersist]])).toBeNull();
+      expect(resolve([[home, "D:\\different-home"]])).toBeNull();
+      expect(resolve([[home, undefined]])).toBeNull();
+    }
+  });
+
+  test.skipIf(process.platform !== "win32")("resolves real Scoop junctions but rejects resolved cwd and redirected targets", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-scoop-node-"));
+    try {
+      const app = join(home, "scoop", "apps", "nodejs-lts");
+      const version = join(app, "24.1.0");
+      const current = join(app, "current");
+      const bin = join(current, "bin");
+      mkdirSync(join(version, "bin"), { recursive: true });
+      writeFileSync(join(version, "bin", "npm.cmd"), "@echo off\r\n");
+      symlinkSync(version, current, "junction");
+      const env = { PATH: bin, USERPROFILE: home, PATHEXT: ".CMD", SystemRoot: "C:\\Windows" };
+      const npm = join(bin, "npm.cmd");
+
+      expect(resolveNpmCommand("win32", env, { cwd: home })).toBe(npm);
+      expect(resolveNpmCommand("win32", env, { cwd: version })).toBeNull();
+      expect(npmInvocation(["--version"], "win32", env, { cwd: join(version, "bin") })).toBeNull();
+
+      rmSync(join(version, "bin"), { recursive: true });
+      const persistBin = join(home, "scoop", "persist", "nodejs-lts", "bin");
+      mkdirSync(persistBin, { recursive: true });
+      writeFileSync(join(persistBin, "npm.cmd"), "@echo off\r\n");
+      symlinkSync(persistBin, join(version, "bin"), "junction");
+      expect(resolveNpmCommand("win32", env, { cwd: home })).toBe(npm);
+      expect(resolveNpmCommand("win32", env, { cwd: persistBin })).toBeNull();
+
+      // Remove the directory junction itself, retaining the populated target.
+      rmdirSync(join(version, "bin"));
+      expect(readFileSync(join(persistBin, "npm.cmd"), "utf8")).toBe("@echo off\r\n");
+      const outsideBin = join(home, "other-bin");
+      mkdirSync(outsideBin);
+      writeFileSync(join(outsideBin, "npm.cmd"), "@echo off\r\n");
+      symlinkSync(outsideBin, join(version, "bin"), "junction");
+      expect(resolveNpmCommand("win32", env, { cwd: home })).toBeNull();
+
+      rmdirSync(current);
+      expect(readFileSync(join(version, "bin", "npm.cmd"), "utf8")).toBe("@echo off\r\n");
+      const outside = join(home, "other-app");
+      mkdirSync(join(outside, "bin"), { recursive: true });
+      writeFileSync(join(outside, "bin", "npm.cmd"), "@echo off\r\n");
+      symlinkSync(outside, current, "junction");
+      expect(resolveNpmCommand("win32", env, { cwd: home })).toBeNull();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("does not admit NO_JUNCTION or a custom Scoop root under the home", () => {
+    const home = "C:\\Users\\dev";
+    for (const entry of [
+      `${home}\\scoop\\apps\\nodejs-lts\\24.1.0\\bin`,
+      `${home}\\custom-scoop\\apps\\nodejs-lts\\current\\bin`,
+    ]) {
+      expect(resolveNpmCommand("win32", { PATH: entry, USERPROFILE: home, PATHEXT: ".CMD" }, {
+        cwd: home, exists: () => true,
+      })).toBeNull();
+    }
+  });
+
+  test("ignores npm candidates in current-directory subtrees", () => {
+    const projectNpm = `${cwd}\\node_modules\\.bin\\npm.cmd`;
+    const env = {
+      PATH: `${cwd}\\node_modules\\.bin;C:\\Program Files\\nodejs`,
+      PATHEXT: ".CMD",
+      SystemRoot: "C:\\Windows",
+    };
+    const existing = new Set([projectNpm, trustedNpm]);
+
+    expect(resolveNpmCommand("win32", env, {
+      cwd,
+      exists: path => existing.has(path),
+    })).toBe(trustedNpm);
+
+    const invocation = npmInvocation(["install", "-g", "pkg@latest"], "win32", env, {
+      cwd,
+      exists: path => existing.has(path),
+    });
+    expect(invocation?.args.at(-1)).toContain("nodejs\\npm.cmd");
+    expect(invocation?.args.at(-1)).not.toContain("node_modules\\.bin\\npm.cmd");
   });
 
   test("still skips the current directory when it is a PATH entry under the home tree", () => {
@@ -91,5 +289,68 @@ describe("Windows npm update invocation", () => {
       cwd,
       exists: path => path === `${cwd}\\npm.cmd`,
     })).toBeNull();
+  });
+
+  test("rejects the launch directory even when it is the trusted global npm prefix", () => {
+    // Regression: with cwd === %APPDATA%\npm the PATH entry equal to the launch
+    // directory satisfied both the subtree check and the trusted-prefix exception,
+    // re-admitting the exact current-directory candidate this hardening forbids.
+    const appData = "C:\\Users\\dev\\AppData\\Roaming";
+    const appDataNpmDir = `${appData}\\npm`;
+    const env = {
+      PATH: appDataNpmDir,
+      APPDATA: appData,
+      PATHEXT: ".CMD",
+      SystemRoot: "C:\\Windows",
+    };
+    const only = `${appDataNpmDir}\\npm.cmd`;
+
+    expect(resolveNpmCommand("win32", env, {
+      cwd: appDataNpmDir,
+      exists: path => path === only,
+    })).toBeNull();
+    expect(npmInvocation(["install", "-g", "pkg@latest"], "win32", env, {
+      cwd: appDataNpmDir,
+      exists: path => path === only,
+    })).toBeNull();
+  });
+
+  describe("registry-query classification against real npmInvocation shapes", () => {
+    const query = ["view", "@bitkyc08/opencodex@latest", "version"];
+    const winEnv = {
+      PATH: "C:\\Program Files\\nodejs", PATHEXT: ".CMD", SystemRoot: "C:\\Windows",
+    };
+    const winDeps = { cwd, exists: (path: string) => path === trustedNpm };
+
+    test("the cmd /d /s /c wrapper still reports 'view' as the npm operation", () => {
+      const invocation = npmInvocation(query, "win32", winEnv, winDeps);
+      expect(invocation?.options.windowsVerbatimArguments).toBe(true);
+      expect(spawnedNpmOperation(invocation?.args ?? [], invocation?.options)).toBe("view");
+    });
+
+    test("a spaced npm path holding a bare 'view' word cannot forge the operation", () => {
+      const spacedViewNpm = "C:\\Program Files\\tools view area\\npm.cmd";
+      const env = {
+        PATH: "C:\\Program Files\\tools view area",
+        ProgramFiles: "C:\\Program Files", PATHEXT: ".CMD", SystemRoot: "C:\\Windows",
+      };
+      const deps = { cwd, exists: (path: string) => path === spacedViewNpm };
+      const invocation = npmInvocation(query, "win32", env, deps);
+      expect(invocation?.args.at(-1)).toContain("tools^ view^ area");
+      expect(spawnedNpmOperation(invocation?.args ?? [], invocation?.options)).toBe("view");
+      const install = npmInvocation(["install", "-g", "@bitkyc08/opencodex@latest"], "win32", env, deps);
+      expect(spawnedNpmOperation(install?.args ?? [], install?.options)).toBe("install");
+    });
+
+    test("installs — including a package literally named 'view' — are not queries", () => {
+      for (const args of [["install", "-g", "@bitkyc08/opencodex@latest"], ["install", "view"]]) {
+        const wrapped = npmInvocation(args, "win32", winEnv, winDeps);
+        expect(spawnedNpmOperation(wrapped?.args ?? [], wrapped?.options)).toBe("install");
+      }
+      // Bare POSIX argv: the operation is argv[0], so a 'view' value later cannot match.
+      expect(spawnedNpmOperation(npmInvocation(query, "linux")?.args ?? [])).toBe("view");
+      expect(spawnedNpmOperation(["install", "view"])).toBe("install");
+      expect(spawnedNpmOperation(["install", "-g", "pkg@latest"])).toBe("install");
+    });
   });
 });

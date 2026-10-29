@@ -359,7 +359,6 @@ describe("kiro adapter — parseStream", () => {
       (tool: { toolSpecification: { name: string } }) => tool.toolSpecification.name,
     )).toEqual(["bash", KIRO_COMPLETION_TOOL_NAME]);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "I am checking.", phase: "commentary" },
       { type: "text_delta", text: "Final from fallback.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({
@@ -617,8 +616,6 @@ describe("kiro adapter — parseStream", () => {
 
     expect(fetches).toBe(1);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "The file has ", phase: "commentary" },
-      { type: "text_delta", text: "three lines.", phase: "commentary" },
       { type: "text_delta", text: "The file has three lines.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
@@ -689,7 +686,6 @@ describe("kiro adapter — parseStream", () => {
     ))));
 
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "Done.", phase: "commentary" },
       { type: "text_delta", text: "Done.", phase: "final_answer" },
     ]);
     expect(fetches).toBe(1);
@@ -1007,21 +1003,10 @@ describe("kiro adapter — parseStream", () => {
     expect(JSON.stringify(events)).not.toContain(KIRO_COMPLETION_TOOL_NAME);
   });
 
-  test("duplicate completion and completion mixed with real tools fail closed", async () => {
+  // A completion mixed with real tools is not an error; see kiro-completion-with-real-tools.test.ts.
+  test("duplicate completion fails closed", async () => {
     const cases: Uint8Array[][] = [
       [...completionFrames("one", "complete-1"), ...completionFrames("two", "complete-2")],
-      [
-        eventFrame({ name: "bash", toolUseId: "call-1" }),
-        eventFrame({ input: "{}", name: "bash", toolUseId: "call-1" }),
-        eventFrame({ name: "bash", stop: true, toolUseId: "call-1" }),
-        ...completionFrames("done", "complete-3"),
-      ],
-      [
-        ...completionFrames("done", "complete-4"),
-        eventFrame({ name: "bash", toolUseId: "call-2" }),
-        eventFrame({ input: "{}", name: "bash", toolUseId: "call-2" }),
-        eventFrame({ name: "bash", stop: true, toolUseId: "call-2" }),
-      ],
     ];
     for (const frames of cases) {
       const adapter = createKiroAdapter(provider);
@@ -2231,8 +2216,8 @@ describe("kiro adapter — non-streaming parseResponse", () => {
 
 describe("surrogate safety at kiro boundaries", () => {
   test("the reasoning carry never emits a delta ending on a lone high surrogate", async () => {
-    const { KiroThinkingParser } = await import("../../../src/adapters/kiro-thinking");
-    const parser = new KiroThinkingParser();
+    const { InlineThinkTagParser } = await import("../../../src/adapters/inline-think-tags");
+    const parser = new InlineThinkTagParser();
     // An astral char exactly at the carry/send boundary.
     const events = parser.feed("<thinking>🎆aaaaaaaaaaa");
     const emitted = JSON.stringify(events);

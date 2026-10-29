@@ -1,11 +1,12 @@
 import { withCodexAccountLogLabel } from "../account-label";
 import { getCodexAccountCredential, markCodexAccountValidated, readCodexAccountRecord, saveCodexAccountCredential, CodexCredentialRefreshLockTimeoutError, CodexCredentialRefreshBusyError, CodexCredentialRefreshStaleError } from "../account-store";
-import { clearAccountQuota, isCodexQuotaExhausted, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
+import { clearAccountQuota, isCodexQuotaExhausted, isValidWhamHistoryObservation, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
 import type { StoredAccountQuota, WhamUsageResponse } from "../quota";
 import { ConfigMutationLockError, withConfigMutationLockSync } from "../../config";
 import { appendDefaultCodexAccountNamespace, codexAccountPickerEnabled } from "../account-namespaces";
 import { catalogRefreshIsPending, normalizeCatalogDisposition } from "../catalog-refresh-status";
-import { checkAccountIdCollision } from "../auth-collision";
+import { checkAccountIdCollisionWithNativeMain as checkAccountIdCollision, CodexCollisionReadBusyError } from "./login-collision";
+import { extractChatgptPlanType } from "../plan";
 import { clearAccountNeedsReauth, isAccountNeedsReauth, markAccountNeedsReauth } from "../account-runtime-state";
 import { clearCodexPoolRefreshFailure } from "../pool-refresh-backoff";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
@@ -216,7 +217,7 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
     const result = await startLoginFlow("chatgpt", {
       forceLogin: true,
       ...(useDeviceFlow ? { flow: "device" as const } : {}),
-    });
+    }, { flowId });
 
     // Open the browser server-side (same pattern as /api/oauth/login in management-api.ts).
     // The GUI's window.open is popup-blocked because it runs after an await, not a direct click.
@@ -226,9 +227,12 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
     // machine. Opening it on the hub host is useless at best, and on a
     // headless host it fails. `deviceCode` is the same signal the generic
     // OAuth login route uses to make this decision.
+    // Reported to the caller rather than discarded (#5261): a login whose browser never opened
+    // is indistinguishable from one that did, so it reads as success while nothing happens.
+    let browserLaunch: "started" | "failed" | "skipped" = "skipped";
     if (result.url && !result.deviceCode && shouldOpenBrowserForLogin(body.openBrowser, runtimeConfig)) {
       const { openUrl } = await import("../../lib/open-url");
-      openUrl(result.url);
+      browserLaunch = (await openUrl(result.url)).status === "started" ? "started" : "failed";
     }
 
     (async () => {
@@ -259,9 +263,10 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
                 break;
               }
 
-              let email = cred.email || accountId;
-              let plan: string | undefined;
+              let email = cred.email?.trim() || "";
+              let plan = extractChatgptPlanType(undefined, cred.access);
               let quota: Omit<StoredAccountQuota, "updatedAt"> | null = null;
+              let policyQuota: Omit<StoredAccountQuota, "updatedAt"> | null = null;
               try {
                 const tokens = { access_token: cred.access, account_id: oauthAccountId };
                 const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
@@ -270,9 +275,10 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
                 });
                 if (resp.ok) {
                   const data = (await resp.json()) as WhamUsageResponse;
-                  email = data.email ?? email;
-                  plan = nonEmptyPlan(data.plan_type) ?? undefined;
+                  email = data.email?.trim() || email;
+                  plan = nonEmptyPlan(data.plan_type) ?? plan;
                   quota = parseUsageQuota(data);
+                  policyQuota = isValidWhamHistoryObservation(data) ? quota : null;
                 }
               } catch { /* wham fetch is non-blocking */ }
               // Reauth must refresh the same ChatGPT identity already bound to this pool slot.
@@ -317,7 +323,7 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
               }
 
               // 1.2: Duplicate check is scoped by personal vs workspace plan bucket.
-              const collision = checkAccountIdCollision(oauthAccountId, email, plan, reauth ? accountId : undefined);
+              const collision = await checkAccountIdCollision(oauthAccountId, email, plan, reauth ? accountId : undefined);
               if (collision.collision) {
                 setCodexLoginState(flowId, {
                   status: "error", error: collision.reason, doneAt: Date.now(),
@@ -325,6 +331,8 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
                 completed = true;
                 break;
               }
+
+              email ||= accountId;
 
               // A successful authenticated WHAM read can prove quota is exhausted without
               // spending an inference request. Store the account, but defer inference validation
@@ -387,7 +395,7 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
                 clearCodexPoolRefreshFailure(accountId);
                 if (warmup.validatedAt !== undefined) markCodexAccountValidated(accountId, warmup.validatedAt, generation);
                 clearAccountNeedsReauth(accountId);
-                if (quota) setAccountQuotaFromParsed(accountId, quota);
+                if (quota) setAccountQuotaFromParsed(accountId, quota, undefined, undefined, policyQuota);
                 // Keep the pool id stable; refresh display metadata after a successful login/reauth.
                 accounts[existingIdx] = withCodexAccountLogLabel({
                   ...accounts[existingIdx],
@@ -417,7 +425,7 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
               // A new quota row is generation-gated by live account ownership. Reconcile the
               // durable config owner first so a partial prior sweep cannot reject this write.
               if (newAccountPersistence?.status === "committed" && quota) {
-                setAccountQuotaFromParsed(accountId, quota);
+                setAccountQuotaFromParsed(accountId, quota, undefined, undefined, policyQuota);
               }
               const { catalogRefreshPending } = await convergeAccountNamespaceCatalog(
                 latestConfig,
@@ -465,7 +473,9 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
           });
         }
       } catch (error) {
-        const message = error instanceof ConfigMutationLockError
+        const message = error instanceof CodexCollisionReadBusyError
+          ? "Native Codex login is busy or unreadable; retry login shortly."
+          : error instanceof ConfigMutationLockError
           || error instanceof CodexCredentialRefreshLockTimeoutError
           ? "Configuration is busy; retry login shortly."
           : error instanceof CodexCredentialRefreshBusyError || error instanceof CodexCredentialRefreshStaleError
@@ -488,6 +498,8 @@ export async function handleCodexAuthLoginStart(req: Request, config: OcxConfig,
       flowId,
       url: result.url,
       instructions: result.instructions,
+      // Never fatal: the URL is still a valid thing to open by hand, and the flow stays live.
+      browserLaunch,
       // Dropped before #3366: every device-code surface renders this field,
       // so withholding it left the GUI and CLI with no code to show.
       ...(result.deviceCode ? { deviceCode: result.deviceCode } : {}),
@@ -527,11 +539,21 @@ export async function handleCodexAuthLoginCode(req: Request): Promise<Response> 
 }
 
 export async function handleCodexAuthLoginCancel(req: Request): Promise<Response> {
-  const body = (await req.json().catch(() => ({}))) as { flowId?: string };
+  const body: unknown = await req.json().catch(() => null);
+  const suppliedId = body && typeof body === "object" && !Array.isArray(body)
+    ? (body as { flowId?: unknown }).flowId : undefined;
+  const flowId = typeof suppliedId === "string" ? suppliedId.trim() : "";
+  if (!flowId) return jsonResponse({ error: "flowId required" }, 400);
   const { cancelLoginFlow } = await import("../../oauth");
-  const cancelled = cancelLoginFlow("chatgpt");
-  expireCodexAuthFlow(body.flowId ?? null);
-  return jsonResponse({ ok: true, cancelled });
+  const flow = codexAuthLoginState.get(flowId);
+  if (!flow || flow.status !== "pending") {
+    return jsonResponse({ error: "login flow expired or unknown" }, 400);
+  }
+  if (!cancelLoginFlow("chatgpt", flowId)) {
+    return jsonResponse({ error: "login flow expired or unknown" }, 400);
+  }
+  expireCodexAuthFlow(flowId);
+  return jsonResponse({ ok: true, cancelled: true });
 }
 
 export async function handleCodexAuthLoginStatus(req: Request, url: URL, config: OcxConfig): Promise<Response> {

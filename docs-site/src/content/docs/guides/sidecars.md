@@ -18,6 +18,11 @@ closed. Explicit `xai` requires a usable stored Grok OAuth account and does not 
 requires both ChatGPT login auth and an enabled `forward` provider.
 :::
 
+On file load, a retired OpenCode Free model target in global or `claudeCode` overrides of
+`visionSidecar` or `webSearchSidecar` is removed and that sidecar is explicitly disabled, retaining
+its other settings. Select a supported target before re-enabling it. Healthy targets and the defaults
+for absent sidecar sections are unchanged.
+
 ### Additional web-search backends (explicit-only)
 
 Three more web-search backends exist beyond the ChatGPT and Claude paths. Each is
@@ -45,6 +50,14 @@ When Codex requests hosted `web_search` for a non-passthrough routed model, open
    (default 3), then removes the search tool and forces a final answer. Real client tools such as
    `apply_patch` or shell finalize the turn so those calls reach Codex.
 
+When the model batches several queries into one `web_search` call, their results share one
+8,000-character tool result. The budget is divided across the queries before anything is cut, so no
+query disappears from the result. Shortened answers and unlisted sources are marked
+with their original sizes, which lets the model tell trimmed results from searches that found
+nothing. Structured-output turns receive the same information as one valid JSON document. If a call
+asks for more queries than one result can describe, opencodex lists each query's status without its
+content and counts any queries it could not list.
+
 Every routed-model iteration requests upstream `stream: true`, but by default opencodex fully
 buffers semantic events internally before deciding whether to search or return the final answer.
 Only the first iteration's final headers/status and 429 key rotations are acquired eagerly. Thus
@@ -59,6 +72,13 @@ deciding to search — which buffered mode silently drops — becomes visible an
 in the post-search answer. The Dashboard overview page exposes this as the **Stream answers live**
 toggle on the web-search sidecar card (`PUT /api/sidecar-settings` with
 `webSearch.streamRoutedModelOutput`).
+
+This option also applies to adapters that manage their own turns, including Devin and Cursor.
+When search and image/video sidecars are both eligible, search takes priority. A first-event
+OAuth 429 rotates the account on the initial request and on each post-search answer request,
+replaying the request with the search tool and the gathered results. Cancelling a request
+stops subsequent searches, and retained search-loop output shares the request's translation-buffer
+limit; exceeding that limit fails the response instead of starting another model iteration.
 
 Kiro commentary is independent of this option: commentary-phase text already streams ahead of the
 terminal event in buffered mode, and that bypass is unchanged — with or without
@@ -123,16 +143,39 @@ failures after response headers have started are delivered as `response.failed` 
 
 ## Vision sidecar
 
+Mistral's `zai-glm-5-3` is enrolled by the provider preset as text-only. With the
+vision sidecar enabled and available, OpenCodex describes attached images and
+sends their text descriptions to GLM. The Codex catalog advertises image
+attachments for this route. After an update, run `ocx sync`, then fully quit and
+relaunch the Codex desktop app or reload the VS Code window. Sync without a
+restart flag does not restart an existing Codex app-server, which can retain
+the old model list. Alternatively, use `ocx sync --restart-codex` to sync and
+restart matching Codex processes and the desktop app. Finish active work first:
+this restart ends live conversations. See the [sync and restart reference](/reference/cli/lifecycle/#ocx-sync---restart-codex---restart-app-server-only).
+After relaunch, select `mistral/zai-glm-5-3` and verify that image attachments
+are available. No model modality override is needed. Mistral documents native input in its
+[GLM 5.3 reference](https://docs.mistral.ai/models/zai-glm-5-3).
+
 Image routing is capability-aware. Before an image-bearing upstream send, opencodex resolves the selected model's effective input modalities from runtime provider evidence, explicit operator declarations, backend/registry metadata, and generated vendor metadata. A target positively known to be text-only goes through the Vision Sidecar first; the image is described **before** the main call and replaced inline with text. A target positively known to support images receives the image directly. Unknown custom models keep the existing compatibility behavior rather than being guessed text-only.
 
 For the canonical ChatGPT Codex route, opencodex uses the `openai-codex` metadata bundle rather than public OpenAI API metadata, so backend-specific modality differences are respected. The native Chat fast path uses the same gate and cannot bypass a known text-only verdict. Without an available sidecar plan, raw images are stripped before a proven text-only backend.
-Combos advertise image input only when every member accepts images, either natively or through a
+With `visionSidecar.enabled: false`, the model catalog does not add sidecar-backed image input to
+text-only models, including custom rows and combo members. Native image support and explicitly
+configured image modalities are preserved. Omitting `enabled` keeps sidecar advertisement on;
+catalog visibility does not establish that sidecar credentials or capacity are available.
+Combos advertise image input only when every member accepts images, either natively or through an enabled
 sidecar, and the combo's `imageInput` setting is not disabled, so clients such as the Codex app
 allow attachments instead of blocking them before the sidecar runs. When
 `visionSidecar.model` is absent or blank, the OpenAI execution path, Dashboard, and management API
 use the `gpt-5.6-luna` fallback. Startup still migrates an explicitly persisted legacy
 `gpt-5.4-mini` value to `gpt-5.6-luna`; that migration applies to a stored value, not to an absent
 model field.
+Saving a multimodal combo from the dashboard enrolls its non-image members automatically: the
+Combos page sends them as `visionSidecarTargets` on `PUT /api/combos`, which writes the exact
+text-only declaration on the member's provider, so no manual config edit and reload is needed.
+Enrollment never overwrites an existing image-capable declaration, and members whose modalities are
+unknown or have no text input are not enrolled — the dashboard names them and keeps the combo's
+image switch unavailable.
 The first-party DeepSeek `deepseek-flash` model is native multimodal (`text` and `image`) and does
 not use this sidecar by default. Explicit `noVisionModels` or text-only declarations remain
 authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and `deepseek-v4-flash` remain
@@ -207,9 +250,42 @@ timeout, and limit.
 omitted keys unchanged. `timeoutMs` uses the runtime integer bounds
 (1–2147483647 ms).
 
+When the effective Vision switch changes, saving also refreshes the managed Codex catalog and
+model cache. The response reports `catalogRefreshPending: true` if that refresh did not complete;
+the saved switch is retained, and catalog publication does not confirm that a running client has reloaded it.
+
+The web-search sidecar card carries the same control shape: the model picker's first row is
+**Off**. Off does two things, and the second one is the reason the row exists. OpenCodex stops
+intercepting `web_search`, and the Codex integration writes Codex's own
+`web_search = "disabled"` mode into `~/.codex/config.toml` — because Codex keeps declaring its
+native hosted `web_search` tool until its own mode says otherwise, and the tool a client
+advertises is the one the model reaches for. An operator who wants an MCP search server to be
+the only search path needs both halves; otherwise the model keeps calling the native tool.
+
+`web_search` is Codex's key with its own value space (`disabled`, `cached`, `indexed`, `live`).
+OpenCodex only ever writes `disabled` while the sidecar is off, and removes its marker-owned line
+again once the sidecar is back on — a re-enabled sidecar whose client still had the native tool
+switched off would have nothing to intercept. The write needs a managed `~/.codex/config.toml` (`ocx
+sync`); the management response reports it as `codexWebSearch`, and both surfaces that can show it
+do: the Dashboard's web-search card warns when the write did not happen, and `ocx agent sidecar web
+--enabled off` prints whether it happened. Only a save that moves the switch triggers the write, so
+the ordinary "nothing changed" answer reports `not_requested` and prints nothing extra. A root
+`web_search` line the operator set by hand is replaced while the sidecar is off, since two root keys
+of the same name are not valid TOML. Its exact text is recorded in the Codex journal and put back in
+its place when the sidecar is switched on again — including for a line added after the journal
+snapshot was taken, which `ocx restore` alone cannot cover. The same record is what still
+recognizes our own `disabled` line when the Codex app has rewritten `config.toml` and dropped the
+comment that named its owner.
+
 You can still set `enabled: false` in `config.json` if you prefer to edit the
 file directly. Anthropic-OAuth search and image description reuse the existing
 Claude Code OAuth fingerprint precedent, but should be soak-tested with the
 intended account and workload.
 
-See the [Configuration reference](/reference/configuration/#sidecars) for every field.
+See the [Configuration reference](/reference/configuration/server/#sidecars) for every field.
+
+Search responses with malformed optional fields retain valid answer text and citations. Invalid error-message values use a generic failure message.
+
+When a search answer ends with a Sources list, an unmatched list item stays in the answer instead of being removed as a citation. A title followed by its URL is still consumed as one citation. Non-HTTP URI-like text inside inline code, such as `mode:fast`, stays in the answer; code-formatted HTTP(S) URLs are still citations.
+
+Long search queries and answers are shortened without splitting a UTF-16 surrogate pair, so a single character such as 😀 is never cut in half by the result limits. A sequence of several characters, such as emoji joined with a zero-width joiner, can still be cut between its parts.

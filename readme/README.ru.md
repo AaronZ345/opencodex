@@ -1,6 +1,10 @@
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>Универсальный прокси провайдеров для OpenAI Codex, Claude Code, Claude Desktop и Grok Build</b><br>
-Две команды — и каждый из них работает на любой LLM, которую вы укажете.</p>
+<p align="center">
+  <img src="../assets/banner.png" alt="opencodex — один локальный шлюз для Codex, Claude Code, Claude Desktop, Grok Build и других инструментов" width="100%">
+</p>
+
+<h3 align="center">Один локальный шлюз для ваших инструментов программирования с ИИ и моделей.</h3>
+<p align="center"><b>Используйте выбранные модели с Codex, Claude Code, Claude Desktop и Grok Build,<br>а OpenCode, Pi, Qoder, WorkBuddy, Kilo, Cline, T3 Code и другие подключайте через управляемые конфигурации.</b><br>
+<a href="https://opencodex.me/ru/reference/client-support/">Все поддерживаемые инструменты →</a></p>
 
 <p align="center">
   <a href="https://x.com/claudeebum"><img src="https://img.shields.io/badge/%40claudeebum-000000?logo=x&logoColor=white" alt="Подписывайтесь на @claudeebum в X"></a>
@@ -13,6 +17,13 @@
 npm install -g @bitkyc08/opencodex
 ocx start
 ```
+
+<p align="center">
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/macOS-.dmg-24292f?logo=apple&logoColor=white" alt="Скачать для macOS (.dmg)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Windows-.msi-24292f?logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0zIDNoOC41djguNUgzem05LjUgMEgyMXY4LjVoLTguNXpNMyAxMi41aDguNVYyMUgzem05LjUgMEgyMVYyMWgtOC41eiIvPjwvc3ZnPg==" alt="Скачать для Windows (.msi)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.AppImage-24292f?logo=linux&logoColor=white" alt="Скачать для Linux (.AppImage)"></a>
+  <a href="https://github.com/lidge-jun/opencodex/releases/latest"><img src="https://img.shields.io/badge/Linux-.deb-24292f?logo=debian&logoColor=white" alt="Скачать для Linux (.deb)"></a>
+</p>
 
 <table>
 <tr>
@@ -69,18 +80,11 @@ Sol ведёт сессию и вызывает подагента Kimi K3.
   <a href="../README.md">English</a> · <a href="README.fr.md">Français</a> · <a href="README.ko.md">한국어</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <b>Русский</b> · <a href="README.ja.md">日本語</a> · <a href="README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/ru/"><b>Полная документация →</b></a>
 </p>
 
-opencodex — лёгкий локальный прокси, который транслирует Responses API Codex в протокол,
-понятный вашему провайдеру: потоковая передача, вызовы инструментов, токены рассуждений и
-изображения — в обе стороны. Используйте Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen,
-Ollama или любую другую LLM с Codex, Claude Code, Claude Desktop и Grok Build. Кроме того,
-он умеет управлять **пулом аккаунтов ChatGPT** для аутентификации Codex: добавляйте аккаунты,
-обновляйте их квоты в панели управления, и новые сессии будут автоматически направляться
-на работоспособный аккаунт с наименьшим использованием, а существующие треды останутся
-закреплёнными за аккаунтом, с которого они начались.
+opencodex — лёгкий локальный шлюз между вашими инструментами программирования и поставщиками моделей. Он принимает запросы API Responses, Chat Completions и Anthropic Messages и переводит их в протокол провайдера, передавая потоковые ответы, вызовы инструментов, рассуждения и изображения там, где это поддерживают клиент, модель и провайдер. Используйте Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama и других провайдеров с Codex, Claude Code, Claude Desktop, Grok Build и инструментами со [страницы поддержки клиентов](https://opencodex.me/ru/reference/client-support/). Он также управляет **пулом аккаунтов ChatGPT** для аутентификации Codex: добавляйте аккаунты и обновляйте их квоты в панели; новые сеансы автоматически направляются на исправный аккаунт с наименьшим использованием, а существующие треды остаются привязаны к исходному аккаунту.
 
 ## Быстрый старт
 
-### Личная установка
+### Личная установка (CLI)
 
 ```bash
 npm install -g @bitkyc08/opencodex   # Node 18+; рантайм Bun подключается автоматически
@@ -92,7 +96,54 @@ ocx start                         # прокси + панель управлен
 Откройте **http://localhost:10100** и настройте всё в веб-панели: добавьте провайдеров
 (40+ встроенных или любой OpenAI-совместимый endpoint), выберите модели, управляйте
 аккаунтами. `ocx gui` в любой момент снова откроет панель.
-Кроме того, он умеет управлять **пулом аккаунтов ChatGPT** для аутентификации Codex. Добавьте
+
+### Подключите свой инструмент
+
+Подключите инструмент, которым вы уже пользуетесь:
+
+| Инструмент | Как подключить |
+|---|---|
+| Codex | Включите переключатель Codex на странице **Connect** панели, затем запускайте `codex` как обычно. При локальном прослушивании встроенный провайдер Codex будет направлен на прокси. В терминале выполните `ocx init` до добавления провайдеров в панели и примите приглашение Codex. |
+| Claude Code | Установив CLI `claude`, выполните `ocx claude`. Команда при необходимости запускает прокси и запускает через него Claude Code. |
+| Claude Desktop | Выполните `ocx claude desktop`. При новой установке команда настраивает профиль шлюза для всего приложения; существующая настройка first-party сохраняется, а `ocx claude desktop apply --gateway` явно переключает режим. См. [руководство Claude Code](https://opencodex.me/ru/guides/claude-code/). После переключения полностью закройте и снова откройте Claude Desktop. |
+| Grok Build | При локальном прослушивании и включённой интеграции Grok команда `ocx start` регистрирует модели, если существует `~/.grok`; выберите модель `ocx-*` в Grok Build. Об удалённой настройке см. [руководство Grok Build](https://opencodex.me/ru/guides/grok-build/). После добавления провайдеров перезапустите прокси (или выполните `ocx ensure`, если включён автозапуск Codex), чтобы обновить список. |
+| Инструменты с управляемой интеграцией | Используйте страницу **Connect** панели или `ocx integration client enable --client <id>`. |
+| Любой другой инструмент | Укажите пользовательский базовый URL, совместимый с OpenAI: `http://localhost:10100/v1`, либо базовый URL Anthropic: `http://localhost:10100`. |
+
+На [странице поддержки клиентов](https://opencodex.me/ru/reference/client-support/) указаны способы подключения и протоколы каждого инструмента.
+
+<details>
+<summary><b>Настольное приложение (бета)</b></summary>
+
+Настольное приложение — это тот же прокси и та же панель управления в нативном окне,
+с иконкой в трее и встроенным `ocx`. Оно подключается к уже запущенному прокси либо
+запускает встроенный, а панель остаётся на порту прокси (**http://localhost:10100**,
+если вы не настроили другой). Выберите файл для своей платформы в
+[последнем релизе](https://github.com/lidge-jun/opencodex/releases/latest):
+
+| Платформа | Файл | Примечания |
+|---|---|---|
+| macOS 13+ (Apple Silicon и Intel) | `OpenCodex-<version>-macos.dmg` | Универсальная сборка, подписана Developer ID и нотариализована |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Подпись кода через SignPath Foundation внедряется ([политика подписи кода](https://opencodex.me/ru/reference/code-signing/)); пока релиз не подписан, SmartScreen спросит один раз — выберите **Подробнее → Выполнить в любом случае** |
+| Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` или `-linux-amd64.deb` | Для трея нужен рабочий стол с поддержкой AppIndicator |
+
+Рядом с каждым файлом на странице релиза есть `.sha256`. На macOS 14+ приложение также
+поставляется с расширением WidgetKit, которое показывает состояние прокси, расход за
+сегодня и квоты провайдеров; модель снимков, которую оно отображает, находится в
+[`app/`](../app) (`MenuBarCore`). Чтобы собрать приложение самостоятельно, выполните
+`bun install && bun run build:gui` в корне репозитория, затем в `desktop/` выполните
+`bun install && bun run prepare-sidecar && bun run prepare-widget && bun run build:local` на macOS
+или `bun install && bun run prepare-sidecar && bun run build:local` на Windows и Linux (шаг с виджетом
+работает только на macOS). В [руководстве по настольному приложению](https://opencodex.me/ru/guides/desktop-app/) и
+[руководстве по приложению macOS в строке меню](https://opencodex.me/ru/guides/macos-menu-bar/)
+описан первый запуск, а
+[`AGENTS_INSTALL.md`](../AGENTS_INSTALL.md#where-things-are-installed) перечисляет всё, что записывается на диск.
+
+</details>
+
+### Пул аккаунтов ChatGPT
+
+opencodex также умеет управлять **пулом аккаунтов ChatGPT** для аутентификации Codex. Добавьте
 несколько аккаунтов ChatGPT / Codex и обновляйте их квоты за 5 ч / неделю / 30 дней в панели.
 При маршрутизации по квоте новые сессии могут использовать работоспособный аккаунт с наименьшим
 использованием; round-robin и fill-first применяют свои политики. Существующие треды Codex
@@ -118,8 +169,8 @@ ocx start                         # прокси + панель управлен
 <td>Благодарим <a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme">OrcaRouter</a> за спонсорскую поддержку проекта! OrcaRouter — единый OpenAI-совместимый AI-шлюз для продакшена: адаптивная маршрутизация оценивает каждый промпт и отправляет его модели, которая проходит ваш порог, плюс автоматический failover, правила маршрутизации как код, цены провайдеров без наценки с кэшированием промптов, а также guardrails, файрвол агентов и журналы запросов на каждый вызов среди 200+ моделей. Выберите <code>OrcaRouter</code> в селекторе Add provider или выполните <code>ocx provider add orcarouter</code>; <code>orcarouter/auto</code> — адаптивный маршрутизатор.</td>
 </tr>
 <tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="../assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
-<td>Благодарим <a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a> за спонсорскую поддержку проекта! PackyCode — стабильный высокопроизводительный API-релей, предоставляющий релей-сервисы для Claude Code, Codex, Gemini и других. Автоматический failover, умная маршрутизация и неограниченная конкурентность превращают AI в настоящий инструмент продуктивности. <a href="https://www.packyapi.com/register?aff=k5KT">Зарегистрируйтесь по этой ссылке</a> и начните работу! Выберите <code>PackyCode</code> в селекторе Add provider или выполните <code>ocx provider add packycode</code>.<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
+<td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/sponsors/tokenlab-dark.png"><img src="../assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
+<td>Благодарим <a href="https://tokenlab.sh/r/OPENCODEX">TokenLab</a> за спонсорскую поддержку проекта! TokenLab даёт агентам для программирования один API-ключ для ведущих моделей с поддержкой форматов OpenAI Responses и Chat Completions, Anthropic Messages и нативного API Gemini, включая стриминг и вызов инструментов. Также доступны MCP-сервер и Skills для агентов, чтобы упростить интеграцию. Выберите режим доставки и платите по мере использования. Выберите <code>TokenLab</code> в селекторе Add provider или выполните <code>ocx provider add tokenlab</code>.<br><sub>TokenLab 为编程智能体提供统一的多模型 API，一枚 API Key 即可接入主流模型，支持 OpenAI Responses、Chat Completions、Anthropic Messages 和 Gemini 原生 API 格式，以及流式输出和工具调用。同时提供 MCP 服务器和 Agent Skills，方便接入现有工作流；交付模式可选，按量付费。</sub></td>
 </tr>
 </tbody>
 </table>
@@ -187,8 +238,9 @@ services:
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex && ~/.bun/bin/bun install
+~/.bun/bin/bun run build:gui
 ~/.bun/bin/bun run src/cli/index.ts start
 ```
 
@@ -196,8 +248,9 @@ cd opencodex && ~/.bun/bin/bun install
 
 ```powershell
 irm bun.sh/install.ps1 | iex
-git clone https://github.com/lidge-jun/opencodex.git
+git clone -b dev https://github.com/lidge-jun/opencodex.git
 cd opencodex; bun install
+bun run build:gui
 bun run src/cli/index.ts start
 ```
 
@@ -230,13 +283,13 @@ ocx init      # интерактивная настройка: пишет ~/.ope
 
 ## Поддерживаемые платформы
 
-| ОС | Статус | Менеджер служб |
-|---|---|---|
-| macOS (arm64 / x64) | Полная поддержка | launchd |
-| Linux (x64 / arm64) | Полная поддержка | systemd (пользовательский unit) |
-| Windows (x64) | Полная поддержка | Task Scheduler (скрыто) / опциональная нативная служба (`--native`, WinSW) |
+| ОС | Статус | Менеджер служб | Настольное приложение (бета) |
+|---|---|---|---|
+| macOS (arm64 / x64) | Полная поддержка | launchd | Универсальный `.dmg` |
+| Linux (x64 / arm64) | Полная поддержка | systemd (пользовательский unit) | `.AppImage` / `.deb` для x86_64 |
+| Windows (x64) | Полная поддержка | Task Scheduler (скрыто) / опциональная нативная служба (`--native`, WinSW) | `.msi` для x64 |
 
-Требуется [Node](https://nodejs.org) 18+. Рантайм Bun добавляется автоматически при `npm install` —
+Для установки CLI требуется [Node](https://nodejs.org) 18+; настольному приложению не нужны ни Node, ни Bun. Рантайм Bun добавляется автоматически при `npm install` —
 отдельно устанавливать Bun не нужно, WSL на Windows тоже не нужен. Если npm заблокировал
 скрипты установки встроенного рантайма, см. [документацию по установке](https://opencodex.me/ru/getting-started/installation/).
 
@@ -274,15 +327,16 @@ ocx init      # интерактивная настройка: пишет ~/.ope
 <details>
 <summary>Подробности владения памятью</summary>
 
-OpenCodex отслеживает 36 категорий состояния, удерживаемого процессом. У каждой есть
+OpenCodex отслеживает состояние, удерживаемое процессом, в категориях ниже. У каждой есть
 документированная граница:
 
-- **12 удерживаемых хранилищ** (журнал запросов, отладочные кольца, кэш изображений, кэш
+- **14 удерживаемых хранилищ** (журнал запросов, отладочные кольца, кэш изображений, кэш
   моделей, vision-описания, cursor-блобы, продолжение responses и т. д.) учитываются
-  в байтах и вытесняются бюджетом памяти приложения (по умолчанию 256 MiB).
+  в байтах и вытесняются бюджетом памяти приложения (по умолчанию 256 MiB), кроме
+  хранилища native control replay: оно закреплено и не вытесняется.
 - **4 наблюдаемых буфера** (аккумуляторы транслятора, хвосты image/OAuth/Grok)
   мониторятся по байтовому давлению in-flight без вытеснения.
-- **24 регистрации state-store** выполняют sweeps истечения (интервал 60 с) и сверку
+- **31 регистрация state-store** выполняет sweeps истечения (интервал 60 с) и сверку
   поколений конфигурации, чтобы удалять устаревшие ключи провайдеров и аккаунтов.
 - **Мемо пути и отпечатков** (метаданные рабочей области, усиленные идентификаторы,
   соли установки, возможности mode-hint) используют LRU-потолки в порядке вставки
@@ -312,12 +366,31 @@ codex -m "ollama/llama3" "Отрефакторьте эту функцию"
 отдаются с внутренними слэшами, заменёнными на `-`; исходная форма со всеми слэшами
 тоже продолжает работать. Подробности: [документация по маршрутизации моделей](https://opencodex.me/ru/guides/model-routing/).
 
+### Маршрутизация JEV Auto (опционально)
+
+TypeSafe JEV может выбирать первую модель и уровень рассуждения для явно включённого Combo, не меняя
+обычный выбор модели и прямые маршруты. Добавьте ключ через `ocx login jev`, в
+**Providers → TypeSafe JEV → Add API key** или через `TYPESAFE_API_KEY`/`JEV_API_KEY`. Затем откройте
+**Models → Combos → Create JEV Auto**, выберите разрешённые целевые модели и отметьте, какие уровни
+рассуждения JEV может выбрать для каждой цели. Если настройку не трогать, цель разрешает все уровни,
+которые модель сейчас объявляет.
+
+JEV вызывается только для `jev-auto` и только один раз на логический вызов модели. При отсутствии ключа,
+сетевой ошибке или некорректном решении запрос уходит на первую доступную цель (fail-open); отмена
+со стороны клиента по-прежнему отменяет запрос. Автотесты используют имитацию TypeSafe и не проверяют
+настоящий аккаунт JEV.
+
+Combo JEV может вместо этого обращаться к самостоятельно размещённой модели решений, например к
+бесключевой `tev1` в Ollama: добавьте провайдера `jev-decision`, у которого `baseUrl` — полный адрес
+`/v1/systemone`, и укажите его в `decisionProvider` Combo. Учётные данные TypeSafe туда никогда не
+отправляются. Подробнее: [самостоятельно размещённая модель решений](https://opencodex.me/ru/guides/combos/).
+
 ## Провайдеры и адаптеры
 
 <!-- sponsors:main-first-mention -->
 OpenAI (вход ChatGPT или API-ключ), Anthropic, Google Gemini, xAI, Kimi, Azure OpenAI, Ollama
 (локально + Cloud), Cursor (экспериментально) и любой OpenAI-совместимый endpoint — плюс DeepSeek,
-Groq, OpenRouter, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
+Groq, OpenRouter, OpenGateway, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
 Qwen Cloud, Qoder Global и CN (официальный PAT + CLI), SiliconFlow и другие. Полный список: `ocx init` или
 [документация по провайдерам](https://opencodex.me/ru/guides/providers/).
 
@@ -404,8 +477,8 @@ npm uninstall -g @bitkyc08/opencodex
 
 ## Разработка
 
-Разработка из исходников требует CLI `bun` в вашем `PATH`. Это отдельно от встроенного рантайма Bun
-опубликованного npm-пакета, который используют только установленные команды `ocx`.
+Разработка из исходников требует CLI `bun` в вашем `PATH`. Опубликованный npm-пакет содержит свой рантайм Bun
+для установленных команд `ocx`; скрипты пакета также могут находить Bun через эту встроенную зависимость.
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
@@ -420,6 +493,16 @@ bun run test
 Работа контрибьюторов, которая попала через перенос или реимплементацию мейнтейнером,
 если коммит не называет исходного автора, записана в
 **[CREDITS.md](../CREDITS.md)**.
+
+## Политика подписи кода (Code signing policy)
+
+Исполняемые файлы для Windows переводятся на подпись Authenticode ([#7207](https://github.com/lidge-jun/opencodex/issues/7207)). Ход внедрения, проверка подписи и полная политика описаны в [руководстве по подписи кода Windows](https://opencodex.me/ru/reference/code-signing/).
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [lidge-jun](https://github.com/lidge-jun)
+- Approvers: [lidge-jun](https://github.com/lidge-jun)
+- Privacy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## Отказ от ответственности
 

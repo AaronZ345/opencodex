@@ -15,6 +15,7 @@ mock.module("../../src/oauth", () => ({
 }));
 
 import { CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../../src/oauth/anthropic";
+import { CLAUDE_CLI_USER_AGENT } from "../../src/providers/claude-cli-identity";
 import { parseRequest } from "../../src/responses/parser";
 import { handleManagementAPI } from "../../src/server/management-api";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
@@ -207,7 +208,7 @@ describe("Anthropic vision executor", () => {
     expect(captured?.headers.get("x-app")).toBe("cli");
     expect(captured?.headers.get("x-claude-code-session-id")).toBeTruthy();
     expect(captured?.headers.get("x-client-request-id")).toBeTruthy();
-    expect(captured?.headers.get("user-agent")).toBe("@anthropic-ai/sdk/0.74.0");
+    expect(captured?.headers.get("user-agent")).toBe(CLAUDE_CLI_USER_AGENT);
 
     expect(captured?.body.model).toBe("claude-sonnet-5");
     expect(captured?.body.max_tokens).toBe(1024);
@@ -377,6 +378,7 @@ describe("Anthropic vision planning and management config", () => {
         enabled: true,
         model: "claude-sonnet-5",
         backend: "anthropic",
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
         reasoning: "low",
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,
@@ -389,11 +391,16 @@ describe("Anthropic vision planning and management config", () => {
         config,
       );
       const getBody = await get!.json() as Record<string, any>;
-      expect(getBody.webSearch).toEqual({ enabled: true, model: "claude-haiku-4-5", backend: "anthropic", streamRoutedModelOutput: false });
+      // No provider is configured, so the Pool options report Anthropic with no usable pool.
+      expect(getBody.webSearch).toEqual({
+        enabled: true, model: "claude-haiku-4-5", backend: "anthropic", streamRoutedModelOutput: false,
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
+      });
       expect(getBody.vision).toEqual({
         enabled: true,
         model: "claude-sonnet-5",
         backend: "anthropic",
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
         reasoning: "low",
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,
@@ -413,8 +420,15 @@ describe("Anthropic vision planning and management config", () => {
       );
       expect(clear.status).toBe(200);
       const clearBody = await clear.json() as Record<string, any>;
-      expect(clearBody.webSearch).toEqual({ enabled: true, model: "gpt-5.6-luna", streamRoutedModelOutput: false });
-      expect(clearBody.vision).toEqual({
+      expect(clearBody.webSearch).toEqual({
+        enabled: true, model: "gpt-5.6-luna", streamRoutedModelOutput: false,
+        anthropicPool: { mixed: false, available: [] },
+      });
+      // Clearing the backend leaves no selected pool; the derived backend label follows the default model.
+      const { anthropicPool: clearedVisionPool, ...clearedVision } = clearBody.vision;
+      expect(clearedVisionPool).toMatchObject({ mixed: false, available: [] });
+      expect(clearedVisionPool.selected).toBeUndefined();
+      expect(clearedVision).toEqual({
         enabled: true,
         model: "gpt-5.6-luna",
         reasoning: "low",

@@ -1,10 +1,17 @@
 import type { TKey } from "../i18n/shared";
 
 export type StartupStatus = "native" | "protected" | "at-risk";
-export type StartupProtection = "service" | "shim" | "none";
+export type StartupProtection = "service" | "desktop" | "shim" | "none";
 export type StartupInstallAction = "install-service" | "install-shim";
 
 export interface StartupHealthData {
+  desktop?: {
+    owned: boolean;
+    loginEnabled: boolean;
+    running: boolean;
+    viable: boolean;
+    supervisor?: { supervisorPid: number; runtimePid: number; app: string };
+  };
   status: StartupStatus;
   routingKind: "native" | "opencodex-local" | "custom-local" | "custom-remote" | "unknown";
   routingInjected: boolean;
@@ -21,9 +28,12 @@ export interface StartupHealthData {
   serviceSupported: boolean;
   shimInstalled: boolean;
   shimHealthy: boolean;
+  /** Intact PATH-overlay shim not seen active from the dashboard's PATH: show activation, not Repair. */
+  shimActivationPending?: boolean;
   shimCoverage: "full" | "cli-only" | "none";
   platform: string;
   recommendedCommand: string | null;
+  recommendedAction?: string | null;
   diagnosticStale: boolean;
   commands: {
     installService: string;
@@ -64,6 +74,7 @@ export const SUMMARY_KEYS: Record<StartupStatus, TKey> = {
 };
 
 export const PROTECTION_KEYS: Record<StartupProtection, TKey> = {
+  desktop: "startup.protection.desktop",
   service: "startup.protection.service",
   shim: "startup.protection.shim",
   none: "startup.protection.none",

@@ -29,7 +29,7 @@
  * never reported as "nothing to do". A stale picker is a much smaller problem than a
  * wrongly killed process.
  *
- * Design and audit history: devlog/_plan/260913_cross_platform_desktop_app_restart/.
+ * Design and audit history: devlog/_fin/260913_cross_platform_desktop_app_restart/.
  */
 import {
   acquireDesktopRestartLock,
@@ -40,6 +40,8 @@ import { rootShells, type DesktopAppAdapter, type DesktopExec, type DesktopProce
 import { darwinDesktopAppAdapter, darwinDefaultExec } from "./desktop-app/darwin";
 import { linuxDesktopAppAdapter, linuxDefaultExec } from "./desktop-app/linux";
 import { windowsDesktopAppAdapter, windowsDefaultExec } from "./desktop-app/windows";
+import { isTestHomeGuardArmed } from "../lib/test-home-guard";
+import { beginCodexCliSelectionParentWrite } from "./cli-update-selection-gate";
 
 export type { DesktopAppExecOptions } from "./desktop-app/types";
 
@@ -81,12 +83,15 @@ export interface DesktopAppRestartIo {
 
 export type DesktopAppRestartReason =
   | "unsupported_platform"
+  | "test_environment"
   | "package_discovery_failed"
   | "process_probe_failed"
   | "no_targets"
   | "self_ancestry"
   | "restart_in_flight"
   | "handoff_started"
+  | "relaunch_context_failed"
+  | "selection_mutation_busy"
   | "targets_survived"
   | "relaunch_failed";
 
@@ -203,6 +208,27 @@ export function listCodexDesktopAppPids(io: DesktopAppRestartIo = {}): number[] 
   return processes === null ? null : processes.map(entry => entry.pid);
 }
 
+/**
+ * Pids of the running desktop-app ROOT shells, or null when discovery or the probe failed.
+ *
+ * Read-only. The shell is the process whose renderer built the model picker, so its start
+ * time is what tells `performCodexRestart` whether the picker predates the catalog (#4761).
+ * `[]` means the probe ran and the app is not running.
+ */
+export function listCodexDesktopShellPids(io: DesktopAppRestartIo = {}): number[] | null {
+  const platform = io.platform ?? process.platform;
+  const selected = ADAPTERS[platform];
+  const adapter = io.adapter ?? selected?.adapter;
+  if (!adapter) return null;
+  const exec = io.execFile ?? selected?.exec;
+  if (!exec) return null;
+  const install = adapter.discover(exec);
+  if (!install) return null;
+  const processes = adapter.listProcesses(exec, install);
+  if (processes === null) return null;
+  return rootShells(processes, install, adapter).map(entry => entry.pid);
+}
+
 export function restartCodexDesktopApp(io: DesktopAppRestartIo = {}): DesktopAppRestartResult {
   const skipped = (reason: DesktopAppRestartReason): DesktopAppRestartResult => ({
     attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason,
@@ -213,16 +239,38 @@ export function restartCodexDesktopApp(io: DesktopAppRestartIo = {}): DesktopApp
   const adapter = io.adapter ?? selected?.adapter;
   const exec = io.execFile ?? selected?.exec;
   if (!adapter || !exec) return skipped("unsupported_platform");
+  // In an armed test process a call without an injected exec would reach the real OS (an injected
+  // adapter still execs through the platform default): on a developer Mac, `performCodexRestart`
+  // tests quit the user's ChatGPT (Codex) app and relaunched it through `/usr/bin/open` with the
+  // runner's sandbox HOME, logged out. Armed means the test preload's flag, not NODE_ENV, for the
+  // reason test-home-guard gives: a real `NODE_ENV=test ocx ...` must still restart the app.
+  if (!io.execFile && isTestHomeGuardArmed()) return skipped("test_environment");
 
   // Step 0. Two restarts at once are destructive rather than merely wasteful: the
   // first quits and relaunches, the second sees the freshly started shell as a target
   // and kills it. Own-pid reentrancy means the wp5 helper runs this same step and
   // finds the lock its caller made out to it.
-  const acquisition = acquireDesktopRestartLock(io.lock);
-  if (!acquisition.acquired) return skipped("restart_in_flight");
+  // A cli-update worker holds this gate from its final process scan through
+  // installer termination and readback, so no new shell may appear inside. The
+  // admission check runs BEFORE the restart lock and every mutation this
+  // function performs: a busy refusal must leave the app, the lock and any
+  // handoff all untouched. Held through relaunch or a failed attempt's
+  // cleanup; a handoff helper's own delayed descendants stay the documented
+  // pre-existing residual.
+  const selectionWrite = beginCodexCliSelectionParentWrite();
+  if (!selectionWrite.entered) return skipped("selection_mutation_busy");
 
   let handedOff = false;
+  // The lock attempt sits inside the protected scope too: a throw from the
+  // lock's own mkdir/write before the try would otherwise leak this
+  // process-wide gate for the rest of the process. lockHeld distinguishes
+  // "acquisition threw/refused" from "lock taken" so a failed attempt never
+  // releases a lock this call does not hold.
+  let lockHeld = false;
   try {
+    const acquisition = acquireDesktopRestartLock(io.lock);
+    if (!acquisition.acquired) return skipped("restart_in_flight");
+    lockHeld = true;
     const install = adapter.discover(exec);
     if (!install) return skipped("package_discovery_failed");
 
@@ -255,7 +303,9 @@ export function restartCodexDesktopApp(io: DesktopAppRestartIo = {}): DesktopApp
     // graphical session variables, and after termination there is nothing to read them
     // from. Ordering this wrongly works on macOS and Windows and produces a Linux app
     // that cannot reach the compositor.
-    const context = adapter.captureRelaunchContext(exec, install, processes);
+    let context: Record<string, string>;
+    try { context = adapter.captureRelaunchContext(exec, install, processes); }
+    catch { return skipped("relaunch_context_failed"); }
 
     const isAlive = io.isAlive ?? defaultIsAlive;
     const sleep = io.sleep ?? defaultSleep;
@@ -334,7 +384,7 @@ export function restartCodexDesktopApp(io: DesktopAppRestartIo = {}): DesktopApp
   } finally {
     // On the handoff path ownership was transferred to the helper, so releasing here
     // would drop a lock that is still protecting a restart about to happen.
-    if (!handedOff) releaseDesktopRestartLock(io.lock);
+    selectionWrite.exit();
+    if (lockHeld && !handedOff) releaseDesktopRestartLock(io.lock);
   }
 }
-

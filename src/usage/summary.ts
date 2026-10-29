@@ -10,7 +10,7 @@ import {
   type PersistedUsageEntry,
   type UsageStatus,
 } from "./log";
-import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, serviceTierContext, type ServiceTierContext } from "./cost";
+import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, isMeasuredStatus, serviceTierContext, type ServiceTierContext, tokensPerSecond } from "./cost";
 
 /**
  * Canonical range members. The warm-up loop in the management usage route
@@ -73,6 +73,18 @@ export interface UsageSummaryTotals {
   cacheSynthesizedRequests?: number;
   /** Rows with no cache detail at all. Not a miss, and not a zero. */
   cacheUnknownRequests?: number;
+  /**
+   * Aggregated output throughput (#6309): output tokens and wall-clock milliseconds summed over
+   * the attempts whose usage was measured, plus how many attempts qualified. The rate is the
+   * token sum over the duration sum — a time-weighted average, not a mean of per-request rates —
+   * so one fast tiny request cannot outweigh many slow large ones. Attempts without both a
+   * positive token count and a positive duration contribute nothing.
+   */
+  throughputOutputTokens?: number;
+  throughputDurationMs?: number;
+  throughputSamples?: number;
+  /** Derived at finalize time: throughputOutputTokens / throughputDurationMs * 1000. */
+  throughputTokensPerSec?: number;
 }
 
 export interface UsageDay {
@@ -118,6 +130,10 @@ export interface UsageModel {
   totalTokens: number;
   inputTokens: number;
   outputTokens: number;
+  /** Aggregate output throughput for this row (#6309): summed measured tokens over summed duration. */
+  throughputTokensPerSec?: number;
+  /** Attempts behind the throughput aggregate; absent when nothing was measured. */
+  throughputSamples?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -141,6 +157,12 @@ export interface UsageProvider {
   totalTokens: number;
   inputTokens?: number;
   outputTokens?: number;
+  /**
+   * Aggregate output throughput for this row (#6309): summed measured output tokens over summed
+   * wall-clock duration. Undefined when no attempt in the row reported both.
+   */
+  throughputTokensPerSec?: number;
+  throughputSamples?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -281,7 +303,10 @@ export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
         isPriced = true;
       }
     }
-    return { tier, estimate: null, attemptEstimates, costTotal, isPriced };
+    // An unmeasured leg that may have generated billed tokens leaves the total unknown, not short.
+    const unknownCost = entry.attempts.some((attempt, index) =>
+      !attemptEstimates[index] && (!attempt.usage || !isMeasuredStatus(attempt.usageStatus)) && !spentNothing(attempt));
+    return { tier, estimate: null, attemptEstimates, costTotal, isPriced: isPriced && !unknownCost };
   }
   const estimate = estimateRequestCost({
     ...usageModelPriceOptions(entry, entry),
@@ -406,11 +431,7 @@ function blankTotals(): UsageSummaryTotals {
   };
 }
 
-function isMeasuredStatus(status: UsageStatus): boolean {
-  return status === "reported" || status === "estimated";
-}
-
-interface UsageAttribution {
+export interface UsageAttribution {
   requestId: string;
   provider: string;
   model: string;
@@ -420,6 +441,8 @@ interface UsageAttribution {
   usageStatus: UsageStatus;
   usage?: PersistedUsageEntry["usage"];
   totalTokens?: number;
+  /** Wall-clock duration of the attempt, or of the row when it has no attempts. */
+  durationMs?: number;
   /** Attempt provenance when the row has one, else the entry's; never assumed observed. */
   cacheProvenance?: CacheTelemetryProvenance;
 }
@@ -454,7 +477,7 @@ function usageModelKey(providerKey: string, model: string): string {
   return `${providerKey}\0${model}`;
 }
 
-function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
+export function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
   if (!entry.attempts?.length) {
     return [{
       requestId: entry.requestId,
@@ -465,6 +488,7 @@ function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
       usageStatus: entry.usageStatus,
       ...(entry.usage ? { usage: entry.usage } : {}),
       ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
+      durationMs: entry.durationMs,
       ...(entry.cacheProvenance ? { cacheProvenance: entry.cacheProvenance } : {}),
     }];
   }
@@ -482,6 +506,7 @@ function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
       usageStatus: attempt.usageStatus,
       ...(attempt.usage ? { usage: attempt.usage } : {}),
       ...(attempt.totalTokens !== undefined ? { totalTokens: attempt.totalTokens } : {}),
+      durationMs: attempt.durationMs,
       ...(cacheProvenance ? { cacheProvenance } : {}),
     };
   });
@@ -495,6 +520,8 @@ function projectedComboUsage(
   let cachedInputTokens = 0;
   let cacheReadInputTokens = 0;
   let cacheCreationInputTokens = 0;
+  let cacheCreation1hInputTokens = 0;
+  let hasCacheWrite1h = false;
   let reasoningOutputTokens = 0;
   let hasUsage = false;
   let hasCacheTelemetry = false;
@@ -515,6 +542,10 @@ function projectedComboUsage(
         cacheReadInputTokens += cache.read;
       }
       if (typeof cache.creation === "number") cacheCreationInputTokens += cache.creation;
+      if (typeof attempt.usage.cacheCreation1hInputTokens === "number") {
+        hasCacheWrite1h = true;
+        cacheCreation1hInputTokens += attempt.usage.cacheCreation1hInputTokens;
+      }
       if (typeof attempt.usage.reasoningOutputTokens === "number") {
         hasReasoningTelemetry = true;
         reasoningOutputTokens += attempt.usage.reasoningOutputTokens;
@@ -534,6 +565,7 @@ function projectedComboUsage(
       inputTokens,
       outputTokens,
       ...(hasCacheTelemetry ? { cachedInputTokens, cacheReadInputTokens, cacheCreationInputTokens } : {}),
+      ...(hasCacheWrite1h ? { cacheCreation1hInputTokens } : {}),
       ...(hasReasoningTelemetry ? { reasoningOutputTokens } : {}),
       ...(estimated ? { estimated: true } : {}),
     }
@@ -611,13 +643,41 @@ function finalizeCoverage(totals: UsageSummaryTotals): void {
   totals.coverageRatio = totals.requests === 0 ? 0 : totals.measuredRequests / totals.requests;
 }
 
+/**
+ * Aggregate output throughput inputs (#6309) into the window totals. A measured attempt
+ * contributes its output tokens and duration only when both are positive, so a zero-token
+ * or zero-duration row cannot deflate or inflate the rate. Without attempts, the row-level
+ * usage and duration describe the request directly.
+ */
+function addThroughputTotals(totals: UsageSummaryTotals, entry: PersistedUsageEntry): void {
+  const samples = entry.attempts?.length
+    ? entry.attempts
+    : [{ usage: entry.usage, durationMs: entry.durationMs }];
+  for (const sample of samples) {
+    if (!sample.usage || tokensPerSecond(sample.usage.outputTokens, sample.durationMs) === null) continue;
+    totals.throughputOutputTokens = (totals.throughputOutputTokens ?? 0) + sample.usage.outputTokens;
+    totals.throughputDurationMs = (totals.throughputDurationMs ?? 0) + sample.durationMs;
+    totals.throughputSamples = (totals.throughputSamples ?? 0) + 1;
+  }
+}
+
+/** Fold the raw throughput sums into the rate the dashboard and API expose. */
+function finalizeThroughput(totals: UsageSummaryTotals): void {
+  if ((totals.throughputDurationMs ?? 0) <= 0) return;
+  totals.throughputTokensPerSec = tokensPerSecond(totals.throughputOutputTokens ?? 0, totals.throughputDurationMs!) ?? undefined;
+}
+
 function addEstimatedCost(
   totals: UsageSummaryTotals,
   entry: Pick<PersistedUsageEntry, "usageStatus" | "usage" | "attempts">,
   costInfo: EntryCostInfo,
 ): void {
-  if (entry.usageStatus === "unreported" || entry.usageStatus === "unsupported"
-    || (!entry.usage && !entry.attempts?.length)) {
+  // A row of attempts reads `unreported` when any leg lacks usage. Once one leg is measured the row
+  // is metered and the attempt-level pricing decides, matching the model and provider breakdowns.
+  const measuredAttempt = entry.attempts?.some(attempt => attempt.usage && isMeasuredStatus(attempt.usageStatus));
+  if (!measuredAttempt
+    && (entry.usageStatus === "unreported" || entry.usageStatus === "unsupported"
+      || (!entry.usage && !entry.attempts?.length))) {
     totals.unmeteredRequests += 1;
     return;
   }
@@ -670,6 +730,9 @@ interface UsageModelAccumulator {
   cacheObserved: boolean;
   /** Input tokens from attributions with OBSERVED cache detail; the hit-rate denominator. */
   cacheObservedInputTokens: number;
+  throughputOutputTokens: number;
+  throughputDurationMs: number;
+  throughputSamples: number;
   estimatedCostUsd?: number;
   requestCounts: UsageRequestCounts;
   requestFacts?: Map<number, number>;
@@ -761,14 +824,30 @@ function blankRequestCounts(): UsageRequestCounts {
   };
 }
 
+/**
+ * A usage-less attempt that provably cost nothing: it never reached upstream, or upstream refused it
+ * with an HTTP error before any output (providers do not bill a pre-generation 429/401/5xx). One
+ * whose stream began, aborted, or ended without a status may have generated billed tokens, so it
+ * stays an unknown cost. A request made only of such zeros carries neither fact and counts unpriced.
+ */
+function spentNothing(attempt: NonNullable<PersistedUsageEntry["attempts"]>[number] | undefined): boolean {
+  if (!attempt || attempt.usage) return false;
+  if (attempt.sendCount === 0 || attempt.locallyAnswered === true) return true;
+  // A 499 is the client hanging up on a send upstream may already be generating for.
+  return attempt.status >= 400 && attempt.status !== 499
+    && attempt.streamAborted !== true && attempt.firstOutputMs === undefined;
+}
+
 function bumpRequestCounts(counts: UsageRequestCounts, facts: number, amount = 1): void {
   counts.requests += amount;
   const status = statusFromRequestFacts(facts);
   if (isMeasuredStatus(status)) counts.measuredRequests += amount;
   if (status === "reported") counts.reportedRequests += amount;
   else if (status === "estimated") counts.estimatedRequests += amount;
-  if ((facts & REQUEST_PRICED) !== 0) counts.pricedRequests += amount;
-  if ((facts & REQUEST_UNPRICED) !== 0) counts.unpricedRequests += amount;
+  // Unpriced dominates: one unpriceable part makes the request's cost unknown, and counting it
+  // on both sides overstated price coverage.
+  if ((facts & REQUEST_PRICED) !== 0 && (facts & REQUEST_UNPRICED) === 0) counts.pricedRequests += amount;
+  else counts.unpricedRequests += amount;
 }
 
 function mergeRequestCounts(target: UsageRequestCounts, source: UsageRequestCounts): void {
@@ -820,6 +899,9 @@ function mergeTotals(target: UsageSummaryTotals, source: UsageSummaryTotals): vo
   target.cacheObservedRequests = mergeOptionalTotal(target.cacheObservedRequests, source.cacheObservedRequests);
   target.cacheSynthesizedRequests = mergeOptionalTotal(target.cacheSynthesizedRequests, source.cacheSynthesizedRequests);
   target.cacheUnknownRequests = mergeOptionalTotal(target.cacheUnknownRequests, source.cacheUnknownRequests);
+  target.throughputOutputTokens = mergeOptionalTotal(target.throughputOutputTokens, source.throughputOutputTokens);
+  target.throughputDurationMs = mergeOptionalTotal(target.throughputDurationMs, source.throughputDurationMs);
+  target.throughputSamples = mergeOptionalTotal(target.throughputSamples, source.throughputSamples);
 }
 
 /** Sum an optional total. Absent on one side means "not computed there", so it contributes nothing. */
@@ -849,6 +931,9 @@ function blankModelAccumulator(
     cacheCreationInputTokens: 0,
     cacheObserved: false,
     cacheObservedInputTokens: 0,
+    throughputOutputTokens: 0,
+    throughputDurationMs: 0,
+    throughputSamples: 0,
     requestCounts: blankRequestCounts(),
     ...(mode === "exact" ? { requestFacts: new Map() } : {}),
   };
@@ -877,6 +962,9 @@ function mergeModelAccumulator(target: UsageModelAccumulator, source: UsageModel
   target.cacheCreationInputTokens += source.cacheCreationInputTokens;
   target.cacheObserved ||= source.cacheObserved;
   target.cacheObservedInputTokens += source.cacheObservedInputTokens;
+  target.throughputOutputTokens += source.throughputOutputTokens;
+  target.throughputDurationMs += source.throughputDurationMs;
+  target.throughputSamples += source.throughputSamples;
   if (source.estimatedCostUsd !== undefined) {
     target.estimatedCostUsd = (target.estimatedCostUsd ?? 0) + source.estimatedCostUsd;
   }
@@ -1081,6 +1169,12 @@ function buildUsageModels(
       totalTokens: model.summaryTotalTokens,
       inputTokens: model.inputTokens,
       outputTokens: model.outputTokens,
+      ...(model.throughputDurationMs > 0
+        ? {
+            throughputTokensPerSec: tokensPerSecond(model.throughputOutputTokens, model.throughputDurationMs) ?? undefined,
+            throughputSamples: model.throughputSamples,
+          }
+        : {}),
       cachedInputTokens: model.cacheReadInputTokens,
       cacheReadInputTokens: model.cacheReadInputTokens,
       cacheCreationInputTokens: model.cacheCreationInputTokens,
@@ -1120,6 +1214,12 @@ function buildUsageProviders(
         totalTokens: provider.summaryTotalTokens,
         inputTokens: provider.inputTokens,
         outputTokens: provider.outputTokens,
+        ...(provider.throughputDurationMs > 0
+          ? {
+              throughputTokensPerSec: tokensPerSecond(provider.throughputOutputTokens, provider.throughputDurationMs) ?? undefined,
+              throughputSamples: provider.throughputSamples,
+            }
+          : {}),
         cachedInputTokens: provider.cacheReadInputTokens,
         cacheReadInputTokens: provider.cacheReadInputTokens,
         cacheCreationInputTokens: provider.cacheCreationInputTokens,
@@ -1298,6 +1398,11 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     if (attribution.usage) {
       breakdown.inputTokens += attribution.usage.inputTokens;
       breakdown.outputTokens += attribution.usage.outputTokens;
+      if (tokensPerSecond(attribution.usage.outputTokens, attribution.durationMs ?? 0) !== null) {
+        breakdown.throughputOutputTokens += attribution.usage.outputTokens;
+        breakdown.throughputDurationMs += attribution.durationMs!;
+        breakdown.throughputSamples += 1;
+      }
       const { read, creation, provenance } = cacheObservationFromUsage(
         attribution.usage,
         attribution.cacheProvenance,
@@ -1463,6 +1568,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     addTokens(partition.totals, entry);
     addSpendTotals(partition.totals, entry);
     addCacheProvenanceTotals(partition.totals, entry);
+    addThroughputTotals(partition.totals, entry);
     addEstimatedCost(partition.totals, entry, costInfo);
 
     const requestKey = this.mode === "exact" ? this.requestKey(entry.requestId) : null;
@@ -1477,7 +1583,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
         : costInfo.estimate;
       const ordinal = this.nextOrdinal++;
       const facts = requestStatusFact(attribution.usageStatus)
-        | (estimate ? REQUEST_PRICED : REQUEST_UNPRICED);
+        | (estimate ? REQUEST_PRICED : spentNothing(entry.attempts?.[index]) ? 0 : REQUEST_UNPRICED);
       const modelKey = this.addModelAttribution(partition, attribution, estimate, ordinal);
       modelFacts.set(modelKey, (modelFacts.get(modelKey) ?? 0) | facts);
       if (this.mode === "row-unique") {
@@ -1556,6 +1662,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       day.modelOverlaps.push(...partition.modelOverlaps.values());
     }
     finalizeCoverage(totals);
+    finalizeThroughput(totals);
 
     const customDates = this.window ? new Set(customWindowDates(this.window)) : null;
     const dayCount = customDates?.size ?? (range === "all" ? dayCountForAllRange(oldestTimestamp, now) : fixedDays);

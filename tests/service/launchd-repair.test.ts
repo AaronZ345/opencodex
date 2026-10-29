@@ -37,7 +37,6 @@ import {
   restartLaunchdJob,
   reusePreviousPlistPathVariable,
   runLaunchctl,
-  stableLauncherEntry,
 } from "../../src/service";
 import type {
   LaunchdLoadProbe,
@@ -143,7 +142,7 @@ function fixturePlist(): string {
 
 /** The plist `installLaunchd` will render in this process, for the byte-identical case. */
 function renderedPlist(): string {
-  return buildPlist(resolvedProxyEnv(), { launcher: stableLauncherEntry() });
+  return buildPlist(resolvedProxyEnv());
 }
 
 /** Collect `console.log` lines for the one case whose contract IS the printed line. */
@@ -214,6 +213,59 @@ describe("installLaunchd: repair must not be an outage (#4236 defect 1)", () => 
     }
   });
 
+  test("cleans stale fnm PATH and reloads the live definition", () => {
+    const plistPath = fixturePlist();
+    const originalPath = process.env.PATH;
+    try {
+      process.env.PATH = "/usr/bin:/bin";
+      const rendered = renderedPlist();
+      const stalePath = "/tmp/fnm_multishells/1/bin:/usr/bin:/bin";
+      writeFileSync(plistPath, rendered.replace(
+        /(<key>PATH<\/key><string>)[^\n]*(<\/string>)/,
+        (_match, open: string, close: string) => `${open}${stalePath}${close}`,
+      ), "utf8");
+      const { argv, launchctl } = recordingLaunchctl({ bootstrap: [ok()] });
+      const outcome = installLaunchd({ launchctl, plistPath, probe: loadedCurrent().probe, sleepSync: () => {} });
+      expect(outcome.reloaded).toBe(true);
+      expect(verbs(argv)).toContain("bootout");
+      expect(verbs(argv)).toContain("bootstrap");
+      expect(readFileSync(plistPath, "utf8")).toBe(rendered);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
+  test("a proxy change survives stale PATH cleanup and reaches the reloaded plist", () => {
+    const plistPath = fixturePlist();
+    const originalPath = process.env.PATH;
+    const originalProxy = process.env.HTTPS_PROXY;
+    try {
+      process.env.PATH = "/usr/bin:/bin";
+      delete process.env.HTTPS_PROXY;
+      let previous = renderedPlist();
+      previous = previous.replace(
+        /(<key>PATH<\/key><string>)[^\n]*(<\/string>)/,
+        (_match, open: string, close: string) => `${open}/tmp/fnm_multishells/1/bin:/usr/bin:/bin${close}`,
+      );
+      writeFileSync(plistPath, previous, "utf8");
+      process.env.HTTPS_PROXY = "http://proxy.example:8080";
+      const { argv, launchctl } = recordingLaunchctl({ bootstrap: [ok()] });
+      const outcome = installLaunchd({ launchctl, plistPath, probe: loadedCurrent().probe, sleepSync: () => {} });
+      const repaired = readFileSync(plistPath, "utf8");
+      expect(outcome.reloaded).toBe(true);
+      expect(verbs(argv)).toContain("bootstrap");
+      expect(repaired).toContain("<key>HTTPS_PROXY</key><string>http://proxy.example:8080</string>");
+      expect(repaired).not.toContain("fnm_multishells");
+      expect(reusePreviousPlistPathVariable(previous, repaired)).toBeNull();
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalProxy === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = originalProxy;
+    }
+  });
+
   test("an identical plist whose job is loaded from an OLDER command still reloads", () => {
     const plistPath = fixturePlist();
     writeFileSync(plistPath, renderedPlist(), "utf8");
@@ -276,10 +328,51 @@ describe("installLaunchd: repair must not be an outage (#4236 defect 1)", () => 
       sleepSync: ms => { delays.push(ms); },
     });
 
-    // 5 × 200 ms per evicted domain, then give up and try the bootstrap anyway — a wedged
-    // domain must reach the diagnosable throw rather than hang.
-    expect(delays).toEqual(Array.from({ length: 10 }, () => 200));
-    expect(verbs(argv).filter(v => v === "print")).toHaveLength(10);
+    // 125 × 200 ms (launchd's 20 s ExitTimeOut plus margin) per evicted domain, then give up
+    // and try the bootstrap anyway — a wedged domain must reach the diagnosable throw rather
+    // than hang.
+    expect(delays).toEqual(Array.from({ length: 250 }, () => 200));
+    expect(verbs(argv).filter(v => v === "print")).toHaveLength(250);
+  });
+
+  test("a job still draining after bootout is waited out, so repair never strands the service", () => {
+    // The stale-plist repair incident: `bootout` returns at once while the old proxy drains
+    // for several seconds. Until it exits, `print` answers 0 (`state = SIGTERMed`) and
+    // `bootstrap` fails with 5; bootstrapping into that window, then retrying and rolling
+    // back into it too, left nothing loaded once the old job finally exited.
+    const plistPath = fixturePlist();
+    writeFileSync(plistPath, "<plist>legacy launcher, KeepAlive true</plist>", "utf8");
+    let state: "old" | "exiting" | "gone" | "new" = "old";
+    let exitingPolls = 0;
+    const argv: string[][] = [];
+    const launchctl = ((args: string[]): LaunchctlResult => {
+      argv.push([...args]);
+      const [verb, target = ""] = args;
+      const gui = target.startsWith("gui/");
+      if (state === "exiting" && ++exitingPolls > 30) state = "gone"; // ~6 s of drain
+      if (verb === "bootout") {
+        if (gui && (state === "old" || state === "new")) { state = "exiting"; return ok(); }
+        return fail(3, "Boot-out failed: 3: No such process");
+      }
+      if (verb === "print") return gui && state !== "gone" ? ok() : fail(113, "Could not find service");
+      if (verb === "bootstrap") {
+        if (state !== "gone") return fail(5, "Bootstrap failed: 5: Input/output error");
+        state = "new";
+        return ok();
+      }
+      return ok();
+    }) as typeof runLaunchctl;
+    const probe = ((): LaunchdLoadProbe => state === "new"
+      ? { state: "loaded-current", domain: "gui/501" }
+      : state === "gone" ? { state: "not-loaded" } : { state: "loaded-stale", domain: "gui/501" }
+    ) as typeof probeLaunchdLoadState;
+
+    const outcome = installLaunchd({ launchctl, plistPath, probe, sleepSync: () => {} });
+
+    expect(outcome.reloaded).toBe(true);
+    expect(state).toBe("new");
+    expect(verbs(argv).filter(v => v === "bootstrap")).toHaveLength(1);
+    expect(readFileSync(plistPath, "utf8")).toBe(renderedPlist());
   });
 
   test("a bootout that evicted nothing is not settled", () => {
@@ -992,7 +1085,7 @@ describe("the surfaces around the repair (#4236 defects 1f, 1h, 2)", () => {
     // Without the catch, a throw escaped through src/cli/dispatch.ts to the top level and
     // the one command that can evict a hub never reached its own serving check.
     expect(branch).toContain("try {");
-    expect(branch).toContain("await repairService({ verb });");
+    expect(branch).toContain("await repairService({ verb, supervisionLatch });");
     expect(branch).toContain("} catch (error) {");
     expect(branch).toContain('await reportServiceServing(verb === "restart" ? "restarted" : "repaired", {}, repairError);');
     // ONE outcome (#4914). The failure text has to reach the report, because printing it in
@@ -1052,7 +1145,10 @@ describe("the surfaces around the repair (#4236 defects 1f, 1h, 2)", () => {
     expect(filter).toContain("isProtectedHomeUnderTest(dirname(path))");
     expect(filter).toContain("paths.filter(");
     expect(filter).toContain("refusing to write service install state");
-    expect(slice(state, "function writeServiceInstallState(", "function readServiceInstallState("))
+    // The fail-loud path resolution moved into the compare-and-swap writer when ownership
+    // became a preserved field. Same invariant, one layer down: nothing commits the record
+    // without resolving the write paths that refuse to write nowhere.
+    expect(slice(state, "export function swapServiceInstallState(", "/** The recorded owner of ONE"))
       .toContain("serviceStateWritePaths()");
   });
 
@@ -1089,17 +1185,18 @@ describe("the surfaces around the repair (#4236 defects 1f, 1h, 2)", () => {
   });
 
   /**
-   * Review nit 8. `stableLauncherEntry` is shared with `installSystemd`, so "the recorded
-   * launcher wins over a fresh PATH walk" changed Linux too. The behavioural half lives in
-   * `tests/service/service.test.ts`; this pins that the two installers really do call the
-   * same resolver, which is what makes that coverage transferable.
+   * Review nit 8, updated for the launchd pinning change. `stableLauncherEntry` remains
+   * the systemd resolver — "the recorded launcher wins over a fresh PATH walk" is a
+   * Linux-only contract now: launchd deliberately never resolves one, because a mutable
+   * PATH shim would inherit the service token and proxy environment. The behavioural
+   * halves live in `tests/service/service.test.ts`; this pins the split itself.
    */
-  test("the recorded-launcher preference is shared with the systemd installer (nit 8)", () => {
+  test("the recorded-launcher preference is systemd-only — launchd resolves none (nit 8)", () => {
     const systemdInstall = slice(systemd, "function installSystemd()", "function startSystemd(");
     expect(systemdInstall).toContain("stableLauncherEntry()");
     expect(systemdInstall).toContain("buildUnit(resolvedProxyEnv(), { launcher })");
     expect(slice(launchd, "export function installLaunchd(", " * Deps are named for the layer they replace"))
-      .toContain("stableLauncherEntry()");
+      .not.toContain("stableLauncherEntry");
   });
 });
 

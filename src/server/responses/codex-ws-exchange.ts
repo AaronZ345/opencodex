@@ -1,3 +1,4 @@
+import { NativeSteeringError } from "./native-steering";
 import { mergeSteeringContinuation } from "./native-steering-settings";
 import { markNativeControlResponse } from "./native-response-control";
 import type { NativeResponseControl } from "./native-response-control";
@@ -7,10 +8,13 @@ import { CodexWsMetadata, type CodexWsQuotaObserver } from "./codex-ws-metadata"
 import { CODEX_RESPONSES_HTTP_URL, type PreparedCodexWsRequest } from "./codex-ws-request";
 import { CodexWsCorrelation } from "./codex-ws-correlation";
 import type { CodexWsSession } from "./codex-ws-session";
-import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES,
-  MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
+import { UPGRADE_DEADLINE_MS, CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS,
+  CODEX_WS_COMMITTED_SILENT_INTERVALS, MAX_CODEX_WS_FRAME_BYTES,
+  MAX_CODEX_WS_QUEUE_BYTES, markCodexWsResponse, markCodexWsPreludeProjection, normalizeResponsesWsRelayEvent, closedBeforeTerminalMessage,
   codexWsCreateFrameExceedsLimit, codexWsFailureDetail, codexWsPreResponseFailure, markCodexWsStage, codexWsOcxVersion,
-  type CodexWsFailureStage, type CodexWsStageRecord } from "./codex-ws-wire";
+  markCodexWsSocketDeath, codexWsWrapperStatus, isCodexWsTerminalEvent, type CodexWsFailureStage, type CodexWsStageRecord,
+  type CodexWsTerminalEvent, codexWsPreOutputRefusalStatus, isEmptyCodexWsLifecycleEvent, codexWsFrameResponseIds,
+  markCodexWsPreOutputRefusal, type CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
 
 interface ExchangeOptions {
   nativeControl?: NativeResponseControl;
@@ -22,8 +26,16 @@ interface ExchangeOptions {
   sseFallback: typeof globalThis.fetch;
   onQuota?: CodexWsQuotaObserver;
   beforeDispatch?: (headers: Headers) => void;
+  onPhysicalDispatch?: () => void;
   /** Bun version string the caller gated on; stamped onto the stage record. */
   bunVersion?: string;
+  /**
+   * Opt-in (#6969): how long empty lifecycle frames may be held so an authoritative upstream
+   * refusal that follows them, before any output, can settle as a replayable gateway status instead
+   * of a committed 200. Absent or zero keeps the exchange exactly as it was. Ignored on native
+   * control exchanges and on transports without the metadata channel.
+   */
+  preOutputRefusalHold?: CodexWsPreOutputRefusalHold;
 }
 
 const HTTP_HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9a-z-]+$/i;
@@ -43,7 +55,8 @@ function rejectionHeaders(source: Record<string, unknown>, prelude: Headers): He
     }
   }
   // Reuse the metadata owner's count/value/family budgets and window freshness
-  // rules, without publishing quota twice. The unmarked HTTP response owns it.
+  // rules, without publishing quota twice. Pool bookkeeping consumes the HTTP
+  // projection; plain-main publication belongs only to the WS observer.
   const projected = new CodexWsMetadata();
   try {
     for (const values of [Object.fromEntries(prelude), source]) {
@@ -72,6 +85,8 @@ function rejectionHeaders(source: Record<string, unknown>, prelude: Headers): He
  * responses_websocket.rs accepts status/status_code and scalar header values;
  * unlike its native client, this relay converts only precommit 4xx. Returning a
  * post-send 5xx or fetch rejection could cause the outer retry wrapper to resend.
+ * The one 5xx exception is the opt-in pre-output refusal below (#6969): a structured upstream
+ * refusal with nothing relayed but empty lifecycle frames, which the caller may replay.
  */
 function wrappedRejectionResponse(payload: Record<string, unknown>, prelude: Headers): Response | null {
   if (payload.type !== "error" || payload.stream_id !== undefined) return null;
@@ -89,9 +104,20 @@ function wrappedRejectionResponse(payload: Record<string, unknown>, prelude: Hea
   }), { status, headers });
 }
 
+/** The client-facing error of a pre-output refusal projection, from the refusal's own error object. */
+function refusalErrorBody(source: unknown): Record<string, string> {
+  const error = record(source) ? source : {};
+  return {
+    type: typeof error.type === "string" ? error.type : "server_error",
+    ...(typeof error.code === "string" ? { code: error.code } : {}),
+    message: typeof error.message === "string" ? error.message : "Upstream declined the request before any output",
+  };
+}
+
 /** The sole SSE exchange state machine for both one-shot and retained sockets. */
 export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
-  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation } = options;
+  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation,
+    preOutputRefusalHold } = options;
   const { frameText, headers } = prepared;
   const signal = init.signal ?? undefined;
   return new Promise<Response>((resolve, reject) => {
@@ -113,9 +139,13 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
     let pongs = 0;
     let sentAt: number | null = null;
     let firstFrameAt: number | null = null;
+    let firstResponseAt: number | null = null;
     // Numeric close code for the durable stage record; the reason string stays
     // out of it on purpose (#4191 content-free contract).
     let closeCode: number | null = null;
+    // #6740: which terminal frame the upstream itself sent, before any synthetic tail.
+    let terminalEvent: CodexWsTerminalEvent | null = null;
+    let terminalErrorStatus: number | null = null;
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
     const encoder = new TextEncoder();
     const metadata = url === CODEX_RESPONSES_HTTP_URL ? new CodexWsMetadata(onQuota) : null;
@@ -126,11 +156,26 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
     // Liveness while waiting for the first response event (metadata path only): the
     // silence timer is re-armed by every inbound frame or pong; the pinger runs on a fixed
     // interval so a peer that answers pings can never trip the silence bound while alive.
+    // After the commit, each ping tick checks whether any frame or pong arrived since the last.
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
     let pingTimer: ReturnType<typeof setTimeout> | undefined;
+    let inboundAtLastTick = 0;
+    let silentIntervals = 0;
     // The resolved 200, retained so a later body failure can replace its
     // success-shaped stage record with the failure-shaped one (#4191).
     let committedResponse: Response | null = null;
+    // #6969: the pre-output refusal hold. While it is open, empty lifecycle frames are queued on the
+    // not-yet-exposed stream without resolving it. Every settle other than an eligible refusal
+    // commits first (deferredCommit), so the outcome is exactly what the exchange produced before.
+    const holdEnabled = (preOutputRefusalHold?.maxMs ?? 0) > 0 && metadata !== null && !nativeControl;
+    // Drops for good on any identity the exchange cannot tie to one response: a stream id, two
+    // different ids in one frame, or an id that differs from the first one seen. Independent of
+    // socket reuse, so a cold one-shot socket is held to the same rule as a pooled one.
+    let refusalEligible = holdEnabled;
+    let refusalResponseId: string | null = null;
+    let heldHeaders: Headers | null = null;
+    let deferredCommit = false;
+    let holdTimer: ReturnType<typeof setTimeout> | undefined;
     const stream = new ReadableStream<Uint8Array>({
       start(c) { controller = c; },
       cancel() {
@@ -145,6 +190,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       clearTimeout(upgradeTimer);
       clearTimeout(silenceTimer);
       clearTimeout(pingTimer);
+      clearTimeout(holdTimer);
       signal?.removeEventListener("abort", onAbort);
       metadata?.finish();
       correlation?.finish();
@@ -169,6 +215,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       controlFrames,
       relayedEvents,
       firstFrameMs: sentAt !== null && firstFrameAt !== null ? Math.max(0, firstFrameAt - sentAt) : null,
+      firstResponseMs: sentAt !== null && firstResponseAt !== null ? Math.max(0, firstResponseAt - sentAt) : null,
       elapsedMs: sentAt !== null ? Math.max(0, Date.now() - sentAt) : null,
       pings,
       pongs,
@@ -187,6 +234,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       controlFrames,
       relayedEvents,
       firstFrameMs: sentAt !== null && firstFrameAt !== null ? Math.max(0, firstFrameAt - sentAt) : null,
+      firstResponseMs: sentAt !== null && firstResponseAt !== null ? Math.max(0, firstResponseAt - sentAt) : null,
       elapsedMs: sentAt !== null ? Math.max(0, Date.now() - sentAt) : null,
       pings,
       pongs,
@@ -194,14 +242,20 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       reused: session.reused,
       ocxVersion: codexWsOcxVersion(),
       bunVersion: bunVersion ?? "unknown",
+      terminalEvent,
+      terminalErrorStatus,
     });
 
     const commitResponse = () => {
       if (responseCommitted) return;
       responseCommitted = true;
+      deferredCommit = false;
+      clearTimeout(holdTimer);
       clearTimeout(silenceTimer);
       clearTimeout(pingTimer);
-      const responseHeaders = metadata?.snapshot() ?? new Headers();
+      // A held preamble froze the prelude headers at the first Responses event, which is the moment
+      // they were frozen before the hold existed.
+      const responseHeaders = heldHeaders ? new Headers(heldHeaders) : metadata?.snapshot() ?? new Headers();
       responseHeaders.set("content-type", "text/event-stream; charset=utf-8");
       const response = new Response(stream, { status: 200, headers: responseHeaders });
       metadata?.commit();
@@ -210,16 +264,81 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       markCodexWsStage(response, stageRecord(null));
       committedResponse = response;
       resolve(response);
+      startCommittedLiveness();
     };
 
-    const failStream = (error: unknown, status: 502 | 504 = 502) => {
+    /**
+     * Open the hold at the first empty lifecycle frame: freeze the prelude and bound the wait by
+     * both the hold's own maximum and its absolute end. False when no time is left, so the frame
+     * commits exactly as it would without the hold.
+     */
+    const beginHold = (): boolean => {
+      if (heldHeaders) return true;
+      if (!metadata || !preOutputRefusalHold) return false;
+      const waitMs = Math.min(preOutputRefusalHold.maxMs, preOutputRefusalHold.until - Date.now());
+      if (waitMs <= 0) return false;
+      heldHeaders = metadata.snapshot();
+      metadata.commit();
+      holdTimer = setTimeout(() => {
+        if (!terminal && !responseCommitted) commitResponse();
+      }, waitMs);
+      return true;
+    };
+
+    const noteRefusalIdentity = (payload: Record<string, unknown>) => {
+      const ids = codexWsFrameResponseIds(payload);
+      if (payload.stream_id !== undefined || ids === null || ids.length > 1) {
+        refusalEligible = false;
+        return;
+      }
+      const id = ids[0];
+      if (id === undefined) return;
+      if (refusalResponseId === null) refusalResponseId = id;
+      else if (id !== refusalResponseId) refusalEligible = false;
+    };
+
+    /**
+     * Settle an authoritative pre-output refusal (#6969) as the gateway status the upstream stated,
+     * without the non-replayable marker: nothing but empty lifecycle frames was relayed, and the
+     * upstream ended that response itself. The caller's transient ladder and pool move may send the
+     * turn again; if neither does, the registered restore hands the client the original stream,
+     * which is already complete on `stream`.
+     */
+    const resolveRefusal = (status: number, payload: Record<string, unknown>, headers: Headers, prelude: Headers) => {
+      responseCommitted = true;
+      deferredCommit = false;
+      clearTimeout(holdTimer);
+      const stage = stageRecord(null);
+      const source = payload.type === "error"
+        ? payload.error
+        : record(payload.response) ? payload.response.error : undefined;
+      const projection = new Response(JSON.stringify({ error: refusalErrorBody(source) }), { status, headers });
+      markCodexWsPreludeProjection(projection);
+      markCodexWsStage(projection, stage);
+      const observed = Boolean(metadata && onQuota);
+      markCodexWsPreOutputRefusal(projection, () => {
+        const restoredHeaders = new Headers(prelude);
+        restoredHeaders.set("content-type", "text/event-stream; charset=utf-8");
+        const restored = new Response(stream, { status: 200, headers: restoredHeaders });
+        markCodexWsResponse(restored, observed);
+        // The same record object, so the attempt that adopted it keeps reading one stage.
+        markCodexWsStage(restored, stage);
+        return restored;
+      });
+      resolve(projection);
+    };
+
+    const failStream = (error: unknown, status: 502 | 504 = 502, { socketDied = false } = {}) => {
       if (terminal) return;
       terminal = true;
+      // A held preamble or refusal was a commit deferred, not avoided: settle as the committed
+      // body failure it would have been, never as a new pre-response gateway status.
+      if (deferredCommit) commitResponse();
       if (sent && !responseCommitted && metadata) {
         // Nothing has been promised to the client yet, so the honest answer is a gateway
         // status, not a 200 whose body then fails. The frame may already be executing
-        // upstream: the response is marked non-replayable so no layer of this process sends
-        // it again, and the client applies its own retry policy as it would on the direct
+        // upstream: the response is marked non-replayable so no retry layer of this process
+        // sends it again, and the client applies its own retry policy as it would on the direct
         // path. Same settle order as a refused create: snapshot, detach, close, dispose.
         const prelude = metadata.snapshot();
         // Claim the commit slot so no later path can resolve a second, 200 Response.
@@ -229,7 +348,14 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         session.dispose();
         const message = error instanceof Error ? error.message : String(error);
         const failureResponse = codexWsPreResponseFailure(status, message, prelude);
-        markCodexWsStage(failureResponse, stageRecord(Buffer.byteLength(frameText, "utf8")));
+        const stage = failureStage();
+        markCodexWsStage(failureResponse, stageRecord(stage.requestBytes));
+        // #4191: a socket that died under the send is the one settle the dispatch may replace,
+        // once, and only under the operator's `retryOnReset` grant. Native steering and injection
+        // are left out: their channel may already have sent continuation frames on this socket, so
+        // the create frame alone no longer describes the turn.
+        if (socketDied && !nativeControl) markCodexWsSocketDeath(failureResponse, stage);
+        markCodexWsPreludeProjection(failureResponse);
         resolve(failureResponse);
         return;
       }
@@ -256,17 +382,39 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS,
       );
     };
-    /** Ping on a fixed interval until the response starts; a socket without ping() is never pinged. */
+    const pingable = () => typeof (ws as WebSocket & { ping?: unknown }).ping === "function";
+    /** False when ping() threw. It may also close the socket and settle the exchange. */
+    const sendPing = (): boolean => {
+      if (!pingable()) return false;
+      try { (ws as WebSocket & { ping: (data?: string) => void }).ping(); } catch { return false; }
+      pings += 1;
+      return true;
+    };
+    /** Ping on a fixed interval for the life of the exchange; a socket without ping() is never pinged. */
     const schedulePing = () => {
-      const ping = (ws as WebSocket & { ping?: (data?: string) => void }).ping;
-      if (typeof ping !== "function" || responseCommitted || terminal) return;
+      if (!pingable() || terminal) return;
       pingTimer = setTimeout(() => {
-        if (responseCommitted || terminal) return;
-        try { ping.call(ws); } catch { return; }
-        pings += 1;
-        // ping() may close the socket synchronously and settle the exchange; re-check.
+        if (terminal) return;
+        if (responseCommitted && pongs > 0) {
+          const inbound = upstreamFrames + pongs;
+          silentIntervals = inbound === inboundAtLastTick ? silentIntervals + 1 : 0;
+          inboundAtLastTick = inbound;
+          if (silentIntervals >= CODEX_WS_COMMITTED_SILENT_INTERVALS) {
+            failStream(`codex websocket stopped answering after the response started${codexWsFailureDetail(failureStage())}`);
+            return;
+          }
+        }
+        sendPing();
         if (!terminal) schedulePing();
       }, CODEX_WS_LIVENESS_PING_INTERVAL_MS);
+    };
+    /** Only a peer that has ponged is judged by its silence, so probe again if none has yet. */
+    const startCommittedLiveness = () => {
+      if (!metadata || terminal || !pingable()) return;
+      inboundAtLastTick = upstreamFrames + pongs;
+      silentIntervals = 0;
+      if (pongs === 0) sendPing();
+      if (!terminal) schedulePing();
     };
     const onPong = () => {
       if (terminal) return;
@@ -292,7 +440,7 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         reject(reason);
         return;
       }
-      if (!responseCommitted && metadata) {
+      if (!responseCommitted && metadata && !deferredCommit) {
         // Sent, unacknowledged. The proxy's own connect deadline is an origin-silence
         // verdict and settles like one; a caller abort is the caller's decision, so the
         // exchange rejects with that reason and disposing the socket cancels the turn.
@@ -337,6 +485,9 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         return;
       }
       if (terminal || settledPreOpen || signal?.aborted) return;
+      // New sockets have just validated their upgrade; retained sockets carry the
+      // same connection signal into a fresh exchange, never its predecessor's frames.
+      metadata?.seed(session.upgradeHeaders());
       sent = true;
       try {
         if (nativeControl) {
@@ -345,11 +496,11 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
           // the first create frame.
           let base: Record<string, unknown> | undefined;
           detachSteering = nativeControl.attach(frame => {
-            const sendControl = () => {
-              if (terminal || signal?.aborted || session.closed || ws.readyState !== WebSocket.OPEN) {
-                throw new Error("Native steering connection is no longer available");
-              }
-              beforeDispatch?.(new Headers(headers));
+            // Build, serialize and bound-check the reconstructed frame synchronously in the
+            // channel callback: a typed refusal must reach the channel's synchronous rollback
+            // (continuation slot released, journal unwritten) rather than the asynchronous
+            // failStream path, so a corrected continuation can still retry on this channel.
+            const prepare = () => {
               let outgoing = frame;
               if (frame.type === "response.create") {
                 // Generation overrides have passed route policy; identity/tools remain pinned.
@@ -361,11 +512,20 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
                   : { ...continuationBase, input: frame.input, previous_response_id: frame.previous_response_id };
               }
               const text = JSON.stringify(outgoing);
+              nativeControl.assertOutboundFrame?.(text);
               if (codexWsCreateFrameExceedsLimit(text)) {
                 throw new Error("Native steering frame exceeds the transport byte limit");
               }
-              if (frame.type === "response.create") continuationBase = outgoing;
-              try { ws.send(text); } catch {
+              return { outgoing, text };
+            };
+            const prepared = prepare();
+            const sendControl = () => {
+              if (terminal || signal?.aborted || session.closed || ws.readyState !== WebSocket.OPEN) {
+                throw new Error("Native steering connection is no longer available");
+              }
+              beforeDispatch?.(new Headers(headers));
+              if (frame.type === "response.create") continuationBase = prepared.outgoing;
+              try { ws.send(prepared.text); } catch {
                 // A send failure has unknown delivery. Never replay or fall back.
                 failStream("Native steering send failed; delivery is unknown");
                 throw new Error("Native steering send failed; delivery is unknown");
@@ -374,7 +534,13 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
             if (frame.type === "response.create" && beforeContinuation) {
               // Explicit tool-result continuations are physical request starts;
               // they keep provider pacing and revalidate auth AFTER the wait.
-              void beforeContinuation().then(sendControl).catch(() => failStream("Native steering continuation could not be dispatched; do not automatically replay queued input"));
+              // A typed pre-send refusal (e.g. the configured upstream body limit) is a
+              // known non-delivery and keeps its own message; every other failure keeps
+              // the unknown-delivery wording.
+              void beforeContinuation().then(sendControl).catch(error => failStream(
+                error instanceof NativeSteeringError ? error
+                  : new Error("Native steering continuation could not be dispatched; do not automatically replay queued input"),
+              ));
             } else sendControl();
           }, error => failStream(error));
         }
@@ -384,6 +550,17 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         // fallback here would silently degrade a multi-agent turn into an ordinary
         // one. Fail the turn visibly instead.
         failStream(error);
+        return;
+      }
+      try { options.onPhysicalDispatch?.(); } catch (error) {
+        // Admission refused before the frame left. This is a pre-open rejection,
+        // not a transport failure and not an authorization to replay over SSE.
+        settledPreOpen = true;
+        sent = false;
+        terminal = true;
+        cleanup();
+        session.dispose();
+        reject(error);
         return;
       }
       try {
@@ -409,7 +586,10 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       if (!metadata) commitResponse();
       else if (!responseCommitted && !terminal) {
         armSilence();
-        schedulePing();
+        // Probe now, not one interval in: the path can die seconds after the send, before a
+        // held commit, and the committed check needs a pong from before that.
+        sendPing();
+        if (!terminal) schedulePing();
       }
     };
 
@@ -458,15 +638,23 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
       }
       if (!controlFrame && !type.startsWith("response.") && type !== "error") return;
       let steeringEnded = false;
+      let refusalStatus: number | undefined;
+      let refusalHeaders: Headers | undefined;
+      let refusalPrelude: Headers | undefined;
       if (!controlFrame) {
+        firstResponseAt ??= Date.now();
         try {
           if (nativeControl) steeringEnded = nativeControl.observe(normalized.payload);
           else correlation?.accept(normalized.payload);
         } catch (error) { failStream(error); return; }
+        const holdOpen = refusalEligible && sent && !responseCommitted;
+        if (holdOpen) noteRefusalIdentity(normalized.payload);
         // Correlation must run first: a reused socket's foreign-stream error settles as a
         // non-replayable 502 above, never as the refused-create 4xx projection below, which
         // is the one status family that could authorize an account replay.
-        if (metadata && sent && !responseCommitted && type === "error") {
+        // Only before anything was held: after an empty preamble a 4xx frame keeps today's
+        // in-body delivery, so a held 429 can never become a quota rotation it was not before.
+        if (metadata && sent && !responseCommitted && !deferredCommit && type === "error") {
           let rejection: Response | null;
           try { rejection = wrappedRejectionResponse(normalized.payload, metadata.snapshot()); }
           catch (error) { failStream(error); return; }
@@ -475,11 +663,35 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
             cleanup();
             try { controller.close(); } catch { /* unused stream already closed */ }
             session.dispose();
+            markCodexWsPreludeProjection(rejection);
             resolve(rejection);
             return;
           }
         }
-        commitResponse();
+        let holdFrame = false;
+        if (holdOpen && refusalEligible) {
+          refusalStatus = codexWsPreOutputRefusalStatus(normalized.payload);
+          if (refusalStatus !== undefined) {
+            // Built before anything settles: a refusal whose metadata cannot be projected within the
+            // header bounds is delivered the way it was before, in the committed body.
+            try {
+              refusalPrelude = heldHeaders ?? metadata?.snapshot() ?? new Headers();
+              const declared = normalized.payload.headers;
+              refusalHeaders = rejectionHeaders(record(declared) ? declared : {}, refusalPrelude);
+            } catch {
+              refusalStatus = undefined;
+            }
+          }
+          holdFrame = refusalStatus === undefined && isEmptyCodexWsLifecycleEvent(normalized.payload) && beginHold();
+        }
+        if (refusalStatus === undefined && !holdFrame) commitResponse();
+        else deferredCommit = true;
+        // Record the terminal the upstream sent as soon as it is accepted, before the relay-size and
+        // queue checks below: a body failure that follows is still an exchange that received it.
+        if (!nativeControl && isCodexWsTerminalEvent(type)) {
+          terminalEvent = type;
+          terminalErrorStatus = type === "error" ? (codexWsWrapperStatus(normalized.payload) ?? null) : null;
+        }
       }
       const prefix = encoder.encode(`event: ${type}\ndata: `);
       const suffix = encoder.encode("\n\n");
@@ -517,6 +729,9 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
           markCodexWsStage(committedResponse, stageRecord(null));
         }
         session.release(completedId);
+        if (refusalStatus !== undefined && refusalHeaders && refusalPrelude && !responseCommitted) {
+          resolveRefusal(refusalStatus, normalized.payload, refusalHeaders, refusalPrelude);
+        }
       }
     };
 
@@ -533,7 +748,9 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         resolve(sseFallback(url, init));
         return;
       }
-      if (sent && !terminal) failStream(closedBeforeTerminalMessage(event, failureStage()));
+      if (sent && !terminal) {
+        failStream(closedBeforeTerminalMessage(event, failureStage()), 502, { socketDied: true });
+      }
     };
 
     const onError = () => {
@@ -544,7 +761,10 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         cleanup();
         session.dispose();
         resolve(sseFallback(url, init));
-      } else failStream(`codex websocket transport error${codexWsFailureDetail(failureStage())}`);
+      } else {
+        const message = `codex websocket transport error${codexWsFailureDetail(failureStage())}`;
+        failStream(message, 502, { socketDied: true });
+      }
     };
     detachOwner = session.bindOwner(reason => cancelExchange(reason));
     ws.addEventListener("open", onOpen);

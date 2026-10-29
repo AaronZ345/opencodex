@@ -76,6 +76,16 @@ describe("upsertOAuthProvider credential preservation", () => {
     expect(provider.authMode).toBe("key");
   });
 
+  test("keeps Copilot context tiers across an OAuth upsert without sharing the old map", () => {
+    const config = configWithKey("github-copilot", "openai-chat", "https://api.githubcopilot.com");
+    const tiers = { "gpt-5.6-luna": "long_context" } as const;
+    config.providers["github-copilot"]!.modelContextTiers = { ...tiers };
+    const before = config.providers["github-copilot"]!.modelContextTiers;
+    upsertOAuthProvider(config, "github-copilot");
+    expect(config.providers["github-copilot"]!.modelContextTiers).toEqual(tiers);
+    expect(config.providers["github-copilot"]!.modelContextTiers).not.toBe(before);
+  });
+
   test("carries user-configured modelCosts across a re-login upsert", () => {
     const config = configWithKey("xai", "openai-chat", "https://api.x.ai/v1");
     const costs = { "grok-4": { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0 } };
@@ -139,7 +149,7 @@ describe("upsertOAuthProvider credential preservation", () => {
     }
   });
 
-  test("falls back to OAuth at routing time when the proxy cannot resolve the active key", () => {
+  test("preserves explicit key mode at routing time when the proxy cannot resolve the active key", () => {
     const config = configWithKey("xai", "openai-chat", "https://api.x.ai/v1");
     config.providers.xai!.apiKey = "${OCX_TEST_XAI_API_KEY_MISSING}";
     config.providers.xai!.apiKeyPool = [{ id: "env-key", key: "${OCX_TEST_XAI_API_KEY_MISSING}" }];
@@ -150,7 +160,7 @@ describe("upsertOAuthProvider credential preservation", () => {
     delete process.env.OCX_TEST_XAI_API_KEY_MISSING;
     try {
       const routed = routeModel(config, "xai/grok-4.5").provider;
-      expect(routed.authMode).toBe("oauth");
+      expect(routed.authMode).toBe("key");
       expect(routed.apiKey).toBeUndefined();
       expect(config.providers.xai!.authMode).toBe("key");
     } finally {
@@ -179,33 +189,35 @@ describe("upsertOAuthProvider credential preservation", () => {
     }
   });
 
-  test("CLI and proxy env visibility can diverge without rewriting stored authMode", () => {
+  test("CLI and proxy env visibility can diverge without changing explicit key mode", () => {
     const config = configWithKey("xai", "openai-chat", "https://api.x.ai/v1");
     config.providers.xai!.apiKey = "${OCX_TEST_XAI_SPLIT_ENV}";
     config.providers.xai!.apiKeyPool = [{ id: "env-key", key: "${OCX_TEST_XAI_SPLIT_ENV}" }];
     const previous = process.env.OCX_TEST_XAI_SPLIT_ENV;
 
-    // Login CLI sees the secret; upsert still records key intent, not CLI resolution.
-    process.env.OCX_TEST_XAI_SPLIT_ENV = "cli-only-secret";
-    upsertOAuthProvider(config, "xai");
-    expect(config.providers.xai!.authMode).toBe("key");
+    try {
+      // Login CLI sees the secret; upsert still records key intent, not CLI resolution.
+      process.env.OCX_TEST_XAI_SPLIT_ENV = "cli-only-secret";
+      upsertOAuthProvider(config, "xai");
+      expect(config.providers.xai!.authMode).toBe("key");
 
-    // Running proxy lacks the env var: route on OAuth without touching stored mode.
-    delete process.env.OCX_TEST_XAI_SPLIT_ENV;
-    const oauthFallback = routeModel(config, "xai/grok-4.5").provider;
-    expect(oauthFallback.authMode).toBe("oauth");
-    expect(oauthFallback.apiKey).toBeUndefined();
-    expect(config.providers.xai!.authMode).toBe("key");
+      // A missing proxy env var leaves the explicit key lane without a credential.
+      delete process.env.OCX_TEST_XAI_SPLIT_ENV;
+      const unresolvedKeyRoute = routeModel(config, "xai/grok-4.5").provider;
+      expect(unresolvedKeyRoute.authMode).toBe("key");
+      expect(unresolvedKeyRoute.apiKey).toBeUndefined();
+      expect(config.providers.xai!.authMode).toBe("key");
 
-    // Proxy later gains the env var: key billing resumes without a config rewrite.
-    process.env.OCX_TEST_XAI_SPLIT_ENV = "proxy-secret";
-    const keyRoute = routeModel(config, "xai/grok-4.5").provider;
-    expect(keyRoute.authMode).toBe("key");
-    expect(keyRoute.apiKey).toBe("proxy-secret");
-    expect(config.providers.xai!.authMode).toBe("key");
-
-    if (previous === undefined) delete process.env.OCX_TEST_XAI_SPLIT_ENV;
-    else process.env.OCX_TEST_XAI_SPLIT_ENV = previous;
+      // Proxy later gains the env var: key billing resumes without a config rewrite.
+      process.env.OCX_TEST_XAI_SPLIT_ENV = "proxy-secret";
+      const keyRoute = routeModel(config, "xai/grok-4.5").provider;
+      expect(keyRoute.authMode).toBe("key");
+      expect(keyRoute.apiKey).toBe("proxy-secret");
+      expect(config.providers.xai!.authMode).toBe("key");
+    } finally {
+      if (previous === undefined) delete process.env.OCX_TEST_XAI_SPLIT_ENV;
+      else process.env.OCX_TEST_XAI_SPLIT_ENV = previous;
+    }
   });
 
   test("inserts a missing active key into the pool so listing matches routing", () => {
@@ -479,7 +491,7 @@ describe("upsertOAuthProvider credential preservation", () => {
     const provider = config.providers.anthropic!;
     const preset = OAUTH_PROVIDERS.anthropic!.providerConfig;
     expect(provider.models).toEqual(preset.models);
-    expect(provider.contextWindow).toBe(preset.contextWindow);
+    expect(provider.contextWindow).toBe(1);
     expect(provider.defaultModel).toBe(preset.defaultModel);
     expect(provider.disabled).toBe(true);
     expect(provider.note).toBe("operator-note");

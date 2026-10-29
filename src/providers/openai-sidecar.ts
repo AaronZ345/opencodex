@@ -1,4 +1,5 @@
 import { resolveProviderApiKey } from "./key-store";
+import { createOpenAiSidecarCreditGuard } from "./openai-sidecar-credit";
 import {
   CodexPoolAuthenticationError,
   headersForCodexAuthContext,
@@ -11,6 +12,7 @@ import {
   type CodexAuthPolicyConfig,
 } from "../codex/auth-context";
 import { recordCodexUpstreamOutcome, type CodexUpstreamOutcome } from "../codex/routing";
+import { codexFailureWindowOutcomeMeta } from "../codex/routing/failure-window";
 import { inspectChatGptDomainClaim } from "../oauth/chatgpt";
 import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential, type DataPlaneAdmission } from "../server/auth-cors";
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig } from "../types";
@@ -31,6 +33,7 @@ export interface OpenAiForwardSidecarCandidate {
 export interface ResolvedOpenAiForwardSidecar extends OpenAiForwardSidecarCandidate {
   authContext: CodexAuthContext;
   headers: Headers;
+  beforeDispatch?: () => void;
   recordOutcome?: (outcome: CodexUpstreamOutcome) => void;
   /** Hand back an acquired recovery probe when no sidecar request reached upstream. */
   releaseProbeLease?: () => void;
@@ -123,6 +126,37 @@ function directSidecarHeaders(
   return selected;
 }
 
+/**
+ * The caller's own ChatGPT credential for a call the caller created itself.
+ *
+ * A V3 `existingCall` sideband join attaches to a WebRTC call that ChatGPT voice or Codex Desktop
+ * created with the caller's login, so only that login can join it; a Pool-selected account is a
+ * different ChatGPT account and the upstream refuses the handshake. This hands the join the same
+ * caller-owned headers Codex Direct mode forwards: an explicit bearer whose token claim matches
+ * its `chatgpt-account-id`, never the proxy admission secret, materialized through the same main
+ * policy (hard lock, credits), whose refusals surface as `CodexAccountCooldownError`.
+ * Returns undefined when the caller presents no such credential.
+ */
+export function resolveCallerOwnedOpenAiSidecar(
+  candidates: readonly OpenAiForwardSidecarCandidate[],
+  incomingHeaders: Headers,
+  config: OcxConfig,
+  options: { admission?: Pick<DataPlaneAdmission, "source">; codexAuthPolicy?: CodexAuthPolicyConfig } = {},
+): ResolvedOpenAiForwardSidecar | undefined {
+  const candidate = candidates[0];
+  if (!candidate) return undefined;
+  try {
+    validateForwardAdmissionCredential(incomingHeaders, config);
+  } catch (error) {
+    if (error instanceof ForwardAdmissionCredentialError) return undefined;
+    throw error;
+  }
+  if (!hasCallerCodexBearer(incomingHeaders)) return undefined;
+  const headers = directSidecarHeaders(incomingHeaders, options.codexAuthPolicy ?? config, options.admission);
+  if (!headers) return undefined;
+  return { ...candidate, authContext: { kind: "main", accountId: null }, headers };
+}
+
 export async function resolveFirstUsableOpenAiSidecar(
   candidates: readonly OpenAiForwardSidecarCandidate[],
   incomingHeaders: Headers,
@@ -172,10 +206,12 @@ export async function resolveFirstUsableOpenAiSidecar(
         releaseCodexAuthContextProbeLease(authContext);
         throw new CodexPoolAuthenticationError("Selected Codex account is unavailable");
       }
+      const windowMeta = codexFailureWindowOutcomeMeta(authContext);
       return {
         ...candidate,
         authContext,
         headers: selectedHeaders,
+        beforeDispatch: createOpenAiSidecarCreditGuard(authContext, policy),
         recordOutcome: (outcome: CodexUpstreamOutcome) => recordCodexUpstreamOutcome(
           config,
           authContext.accountId,
@@ -186,6 +222,7 @@ export async function resolveFirstUsableOpenAiSidecar(
             probeLeaseId: authContext.probeLeaseId,
             probeQuotaScope: authContext.probeQuotaScope,
             writerGeneration: authContext.writerGeneration,
+            ...windowMeta,
             // 401/403 here is evidence about this exact stored credential; without the generation a
             // replacement inherits the quarantine (#2892 gap 4).
             ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
@@ -222,10 +259,12 @@ export async function resolveFirstUsableOpenAiSidecar(
       releaseCodexAuthContextProbeLease(authContext);
       continue;
     }
+    const windowMeta = codexFailureWindowOutcomeMeta(authContext);
     return {
       ...candidate,
       authContext,
       headers: selectedHeaders,
+      beforeDispatch: createOpenAiSidecarCreditGuard(authContext, policy),
       ...(authContext.kind === "pool" || authContext.kind === "main-pool"
         ? {
           recordOutcome: (outcome: CodexUpstreamOutcome) => recordCodexUpstreamOutcome(
@@ -236,6 +275,7 @@ export async function resolveFirstUsableOpenAiSidecar(
               threadId: authContext.affinityKey,
               probeLeaseId: authContext.probeLeaseId,
               writerGeneration: authContext.writerGeneration,
+              ...windowMeta,
               // Same fence as the exact-account recorder above (#2892 gap 4).
               ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
             },

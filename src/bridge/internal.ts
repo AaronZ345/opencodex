@@ -1,5 +1,6 @@
 import type {
   AdapterEvent,
+  AnthropicServerBlocks,
   OcxMessagePhase,
   OcxProviderContinuationState,
   OcxProviderOpaqueToolCallMetadata,
@@ -15,10 +16,16 @@ import {
   type OcxErrorPayload,
 } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
+import { formatRetryAfterAdvice } from "../lib/retry-delay";
 import { usageDisplayTotalTokens } from "../usage/totals";
 
 export function uuid(): string {
   return crypto.randomUUID().replace(/-/g, "");
+}
+
+/** The client-visible id of a hosted search cell: the producer's `ws_` id when well-formed, else a fresh one. */
+export function webSearchCellItemId(candidate: string | undefined): string {
+  return typeof candidate === "string" && /^ws_[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : `ws_${uuid()}`;
 }
 
 /** Test-only: bound the abandoned-owned-budget watchdog delay (null restores). */
@@ -62,7 +69,7 @@ export function responsesUsage(usage: OcxUsage | undefined): Record<string, unkn
   // normalized contract).
   const rawInputDetails = isRecord(raw.input_tokens_details)
     ? Object.fromEntries(Object.entries(raw.input_tokens_details as Record<string, unknown>)
-      .filter(([key]) => key !== "cache_write_tokens"))
+      .filter(([key]) => key !== "cache_write_tokens" && key !== "cache_write_1h_tokens"))
     : {} as Record<string, unknown>;
   const rawOutputDetails = isRecord(raw.output_tokens_details)
     ? raw.output_tokens_details as Record<string, unknown>
@@ -90,6 +97,11 @@ export function responsesUsage(usage: OcxUsage | undefined): Record<string, unkn
       usage.cacheCreationInputTokens,
       Math.max(0, inputTokens - cacheRead),
     );
+    // The 1-hour-TTL share of the write (Anthropic cache_creation split), only when reported,
+    // so a translated Messages client can price it at the 1h rate.
+    if (usage.cacheCreation1hInputTokens !== undefined) {
+      inputDetails.cache_write_1h_tokens = Math.min(usage.cacheCreation1hInputTokens, inputDetails.cache_write_tokens as number);
+    }
   }
   out.input_tokens_details = inputDetails;
   out.output_tokens_details = { ...rawOutputDetails, reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
@@ -114,6 +126,26 @@ export function toolCallArgumentsUsable(args: string): boolean {
   }
 }
 
+/**
+ * Whether an in-progress function-call argument buffer could still become valid JSON.
+ * The first non-whitespace byte must be one that can begin a JSON value. A stream that
+ * already lost its leading `{"` (observed from coding-agent CLIs as `code":"…}`) can only
+ * fail `toolCallArgumentsUsable` at completion, so streaming those fragments publishes
+ * bytes a failed item cannot take back — the same #765 rule that refuses completion.
+ */
+export function toolCallArgumentsCouldBeJson(args: string): boolean {
+  const first = args.trimStart().charAt(0);
+  if (first === "") return true;
+  return first === "{"
+    || first === "["
+    || first === "\""
+    || first === "-"
+    || (first >= "0" && first <= "9")
+    || first === "t"
+    || first === "f"
+    || first === "n";
+}
+
 export function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "error" }>): { httpStatus: number; error: OcxErrorPayload } {
   const message = redactSecretString(event.message);
   if (event.status === undefined && event.errorType === undefined && event.code === undefined) {
@@ -124,6 +156,17 @@ export function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "er
   const error = classifyError(httpStatus, event.errorType ?? fallback.error.type, message);
   if (event.errorType !== undefined) error.type = event.errorType;
   if (event.code !== undefined) error.code = event.code;
+  // Codex only parses a streamed retry delay for these canonical rate-limit codes.
+  // Preserve other typed verdicts (quota, auth, local send budgets) verbatim.
+  if (httpStatus === 429 && error.type === "rate_limit_error"
+    && ["resource_exhausted", "rate_limit_exceeded", "slow_down"].includes(error.code ?? "")) {
+    // Without a usable delay, retain the original code and existing client behavior.
+    const advice = formatRetryAfterAdvice(message);
+    if (advice !== undefined) {
+      error.code = "rate_limit_exceeded";
+      error.message = advice;
+    }
+  }
   // Codex maps cyber_policy on HTTP 400 (body) or mid-stream code; never leave it as 502.
   if (isCyberPolicyCode(error.code) || isCyberPolicyCode(event.code)) {
     error.code = CYBER_POLICY_ERROR_CODE;
@@ -154,7 +197,12 @@ export function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "er
  * This fixes items created from here on. History recorded before it is repaired at the
  * replay boundary by `backfillWebSearchQueries()` in the Responses adapter.
  */
-export function webSearchAction(queries: string[]): Record<string, unknown> {
+export function webSearchAction(queries: string[], anthropic?: AnthropicServerBlocks): Record<string, unknown> {
+  // Anthropic's server-side web_fetch opens one page instead of searching.
+  if (anthropic?.use.name === "web_fetch") {
+    const url = (anthropic.result.content as { url?: unknown } | undefined)?.url ?? (anthropic.use.input as { url?: unknown }).url;
+    return { type: "open_page", url: typeof url === "string" ? url : "" };
+  }
   const first = queries[0] ?? "";
   return { type: "search", query: first, queries: queries.length > 0 ? queries : [first] };
 }

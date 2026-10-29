@@ -1,4 +1,8 @@
+import { CODEX_INTERNAL_OPENAI_MODELS } from "./codex/control-plane-models";
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig } from "./types";
+import { createHash } from "node:crypto";
+import { peekAuthStore } from "./oauth/store";
+import { resolveDevinApiBaseUrl, validateDevinApiBaseUrl } from "./oauth/devin/api-base";
 import {
   getCombo,
   isComboTargetInCooldown,
@@ -9,24 +13,17 @@ import {
 } from "./combos";
 import type { NormalizedComboConfig } from "./combos/types";
 import { hasOwnProvider } from "./config/provider-name";
-import { providerUsesKeyAuthOverride, resolveProviderApiKey } from "./providers/key-store";
-import { captureProviderApiKeySelection } from "./providers/api-key-selection-capture";
+import { anthropicInstanceRowShapeMatches } from "./providers/anthropic-instance-id";
+import { reconcileRouterWarningMemos, routedProviderConfig } from "./providers/routed-config";
 import { assertProviderDestinationAllowed } from "./lib/destination-policy";
-import { redactSecretString, redactUrlForLog } from "./lib/redact";
 import {
   PROVIDER_REGISTRY,
   providerCodexAccountMode,
-  registryEntryForProviderDestination,
 } from "./providers/registry";
 // Imported from the module directly rather than through the registry facade, which is at its
 // file-size cap.
 import { registryModelIdKeys } from "./providers/registry/model-ids";
-import { applyDirectReasoningEffortContracts, hasLegacyClinePassReasoningEfforts } from "./providers/derive";
-import { cloneFastWire } from "./providers/fastwire";
-import {
-  providerMatchesRegistryTransportWithStaticGuards,
-  providerSupportsLiveModelDiscovery,
-} from "./providers/static-model-discovery";
+import { providerMatchesRegistryTransportWithStaticGuards } from "./providers/static-model-discovery";
 import {
   isCanonicalOpenAiForwardProvider,
   LEGACY_CHATGPT_PROVIDER_ID,
@@ -36,7 +33,8 @@ import {
 import { decodeRoutedModelIdOrThrow, encodeRoutedModelId } from "./providers/slug-codec";
 import { effectiveProviderAliasDecision, resolveModelAlias } from "./providers/default-aliases";
 import { resolveBlockedModelRedirect } from "./lib/shadow-call";
-import { getStaleCached } from "./codex/model-cache";
+import { workBuddyCatalogIdentity } from "./providers/workbuddy";
+import { getRoutingCached } from "./codex/model-cache";
 import { codexAccountNamespaceEntries } from "./codex/account-namespaces";
 import {
   buildRouteDecisionTrace,
@@ -48,6 +46,14 @@ import { getRoutingProfile, resolvePolicyProfileId, POLICY_NAMESPACE } from "./r
 import { evaluatePolicyProfile, type PolicyRequestEvidence } from "./routing/evaluator";
 import { assemblePolicyCandidateEvidence } from "./routing/compatibility/assemble";
 import { resolveModelPolicy, type ResolvedModelPolicy } from "./providers/resolved-model-policy";
+
+/** Explicit Pool 2 admission refusal; ingress must not recover it through default routing. */
+export class AnthropicSecondaryInstanceUnavailableError extends Error {
+  constructor() {
+    super("Anthropic Pool 2 requires an enabled configured provider with valid OAuth ownership");
+    this.name = "AnthropicSecondaryInstanceUnavailableError";
+  }
+}
 
 export class UnknownRoutingPolicyError extends Error {
   constructor(readonly profileId: string) {
@@ -85,6 +91,18 @@ export interface RouteResult {
   combo?: ComboPick;
   /** Bounded route-decision trace (RI-01); never contains secrets. */
   routeDecision?: RouteDecisionTraceV1;
+  /**
+   * Full eligible provider/model membership from a policy evaluation, keyed
+   * "provider\u0000model". The trace's candidate list is bounded; fallback
+   * redirect checks need membership for eligible rows that were truncated out.
+   */
+  policyEligibility?: ReadonlySet<string>;
+  /**
+   * Set when a blocked-model redirect moved the request to a different
+   * provider. Caller credentials addressed to the source route must not follow
+   * it, exactly as for combo and policy routes.
+   */
+  credentialDomainRewrite?: true;
 }
 
 export function captureRouteStaticPolicy(
@@ -149,87 +167,32 @@ export function knownModelIdsForProvider(
   // only in a map this function forgot is no longer undecodable, and a new model-keyed field
   // fails typecheck until its keys are given a meaning.
   for (const id of registry ? registryModelIdKeys(registry) : []) ids.add(id);
-  for (const cached of getStaleCached(provName) ?? []) ids.add(cached.id);
+  const cachedModels = getRoutingCached(provName, () => {
+    // This callback runs only for a scoped entry, not for each provider in an alias scan.
+    const routed = routedProviderConfig(provName, prov);
+    let key = routed.apiKey;
+    let destination = routed.baseUrl;
+    if (routed.authMode === "oauth") {
+      const set = peekAuthStore()[provName];
+      const account = set?.accounts.find(row => row.id === set.activeAccountId);
+      if (!account || account.needsReauth || !Number.isFinite(account.credential.expires)
+        || account.credential.expires <= Date.now()) return undefined;
+      key = account.credential.access;
+      if (provName === "workbuddy-ai") return workBuddyCatalogIdentity(key, account.credential.workbuddy);
+      if (routed.adapter === "devin") destination = validateDevinApiBaseUrl(account.credential.apiBaseUrl) ?? routed.baseUrl;
+    }
+    if (!key) return undefined;
+    return createHash("sha256")
+      .update(routed.adapter === "devin"
+        ? JSON.stringify([key, resolveDevinApiBaseUrl(destination)])
+        : key)
+      .digest("hex");
+  });
+  for (const cached of cachedModels ?? []) ids.add(cached.id);
   for (const model of config?.customModels ?? []) {
     if (model.provider === provName && model.modelId) ids.add(model.modelId);
   }
   return [...ids];
-}
-
-/** Same endpoint modulo surrounding space and trailing slashes — matches `matchBaseUrlChoice`. */
-function isSameEndpoint(a: string, b: string): boolean {
-  return a.trim().replace(/\/+$/, "") === b.trim().replace(/\/+$/, "");
-}
-
-/**
- * Origin of a user-configured URL, with the path withheld.
- *
- * A configured `baseUrl` is user-controlled and its path may itself be the credential — an
- * account-scoped route token such as `https://proxy.example/v1/8fK2mP7qR4nV6x` is opaque and
- * high-entropy, so it matches none of the prefix patterns in `redactSecretString`. Pattern
- * redaction cannot be trusted for this value, so no path segment is logged at all. `URL.origin`
- * also excludes userinfo, query and fragment.
- *
- * `…/…` marks that a path was present without revealing it, so a reader can tell an origin-only
- * config apart from one whose path was dropped.
- */
-function configuredOriginForLog(url: string): string {
-  try {
-    const parsed = new URL(url.trim());
-    // "null" is what URL.origin yields for non-special schemes; treat it as unusable.
-    if (!parsed.origin || parsed.origin === "null") return "(unloggable URL)";
-    const hasPath = parsed.pathname !== "" && parsed.pathname !== "/";
-    return hasPath ? `${parsed.origin}/…` : parsed.origin;
-  } catch {
-    return "(unparseable URL)";
-  }
-}
-
-// `routedProviderConfig` runs per request, so warn once per (provider, discarded, effective) triple.
-// Keyed by the URLs too: editing config.json to a different wrong value warns again.
-const discardedBaseUrlWarnings = new Set<string>();
-let lastWarningReconciledGeneration = 0;
-
-export function reconcileRouterWarningMemos(generation: number): number {
-  if (generation <= lastWarningReconciledGeneration) return 0;
-  const removed = discardedBaseUrlWarnings.size;
-  discardedBaseUrlWarnings.clear();
-  lastWarningReconciledGeneration = generation;
-  return removed;
-}
-
-/**
- * A pinned registry entry — non-template `baseUrl`, no `allowBaseUrlOverride` — outranks a saved
- * `baseUrl`. Dropping it silently is a footgun: requests go to an endpoint the user never
- * configured, and a wrong-region or wrong-account URL then surfaces only as a 401 with nothing
- * pointing back at the discarded setting.
- *
- * Warns rather than throws. The effective route is exactly what it was before, so a hard error
- * here would break configs that route fine today (a stale `baseUrl` left over from an earlier
- * provider is harmless whenever it names the same endpoint the registry pins).
- */
-function warnIfBaseUrlDiscarded(providerName: string, userBaseUrl: string, effectiveBaseUrl: string): void {
-  if (isSameEndpoint(userBaseUrl, effectiveBaseUrl)) return;
-  // Asymmetric on purpose. Past the guard above, `effectiveBaseUrl` is necessarily
-  // `registryEntry.baseUrl`: the caller passes the resolved URL, and whenever that resolution
-  // kept the user's value the two are equal and we have already returned. So the effective side
-  // is a constant from this repo's registry and safe to print in full — it is also the useful
-  // half, naming the endpoint requests will actually use. The configured side is untrusted.
-  const discarded = configuredOriginForLog(userBaseUrl);
-  const effective = redactSecretString(redactUrlForLog(effectiveBaseUrl));
-  // Key off the logged forms: no raw credential is retained for the process lifetime, and
-  // rotating a key embedded in the URL no longer re-warns about the same endpoint mismatch.
-  // Coarser than the raw URLs — two bad paths on one host warn once, which is the right grain.
-  const key = `${providerName} | ${discarded} | ${effective}`;
-  if (discardedBaseUrlWarnings.has(key)) return;
-  discardedBaseUrlWarnings.add(key);
-  console.warn(
-    // Routing is what this warning speaks for: an adapter may adjust the endpoint again
-    // downstream (kiro re-derives the region), so do not promise where the request lands.
-    `⚠️  config.json provider "${providerName}": configured baseUrl ${discarded} is ignored`
-    + ` because this provider's endpoint is fixed at ${effective}. A URL saved for a different`
-    + ` account or region is a common cause of 401s here — drop it, or use the provider whose endpoint matches.`,
-  );
 }
 
 /**
@@ -251,230 +214,23 @@ export function resetCompactionFallbackWarningsForTests(): void {
   compactionFallbackWarnings.clear();
 }
 
-function usableResolvedApiKey(apiKey: string | undefined): string | undefined {
-  const resolved = resolveProviderApiKey(apiKey);
-  return typeof resolved === "string" && resolved.trim().length > 0 ? resolved : undefined;
-}
+// `routedProviderConfig` and its warning memo moved to `providers/routed-config.ts`: the
+// request-time resolver needs no routing state, and `providers/api-key-selection.ts` importing
+// it through this file created an import cycle (router -> quota -> api-keys -> api-key-selection).
+export { reconcileRouterWarningMemos, routedProviderConfig } from "./providers/routed-config";
 
-export function routedProviderConfig(providerName: string, provider: OcxProviderConfig): OcxProviderConfig {
-  provider = { ...provider, _apiKeyAttempt: provider._apiKeyAttempt ?? captureProviderApiKeySelection(provider) };
-  const registryEntry = PROVIDER_REGISTRY.find(entry => entry.id === providerName);
-  if (!registryEntry || !providerMatchesRegistryTransportWithStaticGuards(providerName, provider)) {
-    assertProviderDestinationAllowed(providerName, provider);
-    // A row whose adapter no longer matches its registry entry still reaches the Responses
-    // adapter when one model opts in through `modelAdapters` — a Volcengine Coding Plan config
-    // saved on Chat, for instance. The replay-drop flag belongs to the DESTINATION rather than
-    // to the provider-wide wire, so it is filled here too; without it that continuation forwards
-    // the reasoning item the upstream answers 400 to. Destination matching refuses templated and
-    // overridable base URLs, so this cannot follow a retargeted row, and an explicit value wins.
-    const destination = registryEntryForProviderDestination(provider);
-    return {
-      ...provider,
-      apiKey: usableResolvedApiKey(provider.apiKey),
-      ...(provider.dropResponsesReasoningItems === undefined && destination?.dropResponsesReasoningItems !== undefined
-        ? { dropResponsesReasoningItems: destination.dropResponsesReasoningItems }
-        : {}),
-    };
-  }
-  const resolvedApiKey = usableResolvedApiKey(provider.apiKey);
-  const staticModelCatalog = !providerSupportsLiveModelDiscovery(providerName, provider);
-  const repairLegacyMimoFreeAuth = providerName === "mimo-free"
-    && staticModelCatalog
-    && (provider.authMode === undefined || provider.authMode === "local");
-  const explicitKeyOverride = providerUsesKeyAuthOverride(registryEntry, provider, resolvedApiKey);
-  const canonicalAuthMode = explicitKeyOverride
-    ? "key"
-    : repairLegacyMimoFreeAuth
-      ? "key"
-      : registryEntry.authKind === "forward" || registryEntry.authKind === "oauth"
-        ? registryEntry.authKind
-        : provider.authMode === "forward" ? undefined : provider.authMode;
-  const staticPolicy = resolveModelPolicy({
-    providerName,
-    modelId: "__provider_static__",
-    provider,
-    registryEntry,
-    transportMatchedRegistry: true,
-    ...(canonicalAuthMode ? { effectiveAuth: { authMode: canonicalAuthMode } } : {}),
-  }).provider;
-  const reasoningEffortMap = staticPolicy.reasoningEffortMap;
-  const modelReasoningEffortMap = staticPolicy.modelReasoningEffortMap;
-  const modelReasoningEfforts = staticPolicy.modelReasoningEfforts;
-  const modelDefaultReasoningEfforts = staticPolicy.modelDefaultReasoningEfforts;
-  const modelContextWindows = staticPolicy.modelContextWindows;
-  const modelInputModalities = staticPolicy.modelInputModalities;
-  // Registry static headers are documented as applying to every upstream request, so they are
-  // filled at resolve time rather than only at seed time: a config written before a header
-  // existed, or one carrying any header of its own, would otherwise never receive it. User
-  // headers win, matched case-insensitively so an override replaces rather than duplicates.
-  const headers = staticPolicy.headers;
-  const modelMaxInputTokens = staticPolicy.modelMaxInputTokens;
-  const modelMaxOutputTokens = staticPolicy.modelMaxOutputTokens;
-  const modelSupportsServiceTier = staticPolicy.modelSupportsServiceTier;
-  const modelSupportsVerbosity = staticPolicy.modelSupportsVerbosity;
-  const noVisionModels = staticPolicy.noVisionModels;
-  const noReasoningModels = staticPolicy.noReasoningModels;
-  const noTemperatureModels = staticPolicy.noTemperatureModels;
-  const noTopPModels = staticPolicy.noTopPModels;
-  const noPenaltyModels = staticPolicy.noPenaltyModels;
-  const noJsonSchemaModels = staticPolicy.noJsonSchemaModels;
-  const autoToolChoiceOnlyModels = staticPolicy.autoToolChoiceOnlyModels;
-  const preserveReasoningContentModels = staticPolicy.preserveReasoningContentModels;
-  const requiresReasoningPlaceholderModels = staticPolicy.requiresReasoningPlaceholderModels;
-  const reasoningSplitModels = staticPolicy.reasoningSplitModels;
-  const reasoningDetailsModels = staticPolicy.reasoningDetailsModels;
-  const thinkingToggleModels = staticPolicy.thinkingToggleModels;
-  const thinkingBudgetModels = staticPolicy.thinkingBudgetModels;
-  const registryBaseUrlIsTemplate = /\{[^}]*\}/.test(registryEntry.baseUrl);
-  const userBaseUrl = typeof provider.baseUrl === "string" ? provider.baseUrl.trim() : "";
-  const userBaseUrlIsResolved = userBaseUrl.length > 0 && !/\{[^}]*\}/.test(userBaseUrl);
-  if (registryEntry.allowBaseUrlOverride && !userBaseUrlIsResolved) {
-    throw new Error(`Invalid baseUrl for provider "${providerName}": expected a nonblank URL without unresolved placeholders`);
-  }
-  // Registry template URLs are presets; local/self-hosted entries opt in explicitly.
-  const baseUrl = (registryBaseUrlIsTemplate || registryEntry.allowBaseUrlOverride) && userBaseUrlIsResolved
-    ? userBaseUrl
-    : registryEntry.baseUrl;
-  if (userBaseUrlIsResolved) warnIfBaseUrlDiscarded(providerName, userBaseUrl, baseUrl);
-  assertProviderDestinationAllowed(providerName, { baseUrl, allowPrivateNetwork: provider.allowPrivateNetwork });
-
-  const resolved: OcxProviderConfig = {
-    ...provider,
-    adapter: registryEntry.adapter,
-    baseUrl,
-    ...(provider.responsesPath === undefined && registryEntry.responsesPath !== undefined
-      ? { responsesPath: registryEntry.responsesPath }
-      : {}),
-    ...(provider.chatCompletionsPath === undefined && registryEntry.chatCompletionsPath !== undefined
-      ? { chatCompletionsPath: registryEntry.chatCompletionsPath }
-      : {}),
-    ...(provider.requiresAdjacentResponsesToolResults === undefined
-      && registryEntry.requiresAdjacentResponsesToolResults !== undefined
-      ? { requiresAdjacentResponsesToolResults: registryEntry.requiresAdjacentResponsesToolResults }
-      : {}),
-    ...(provider.requiresPairedResponsesToolResults === undefined
-      && registryEntry.requiresPairedResponsesToolResults !== undefined
-      ? { requiresPairedResponsesToolResults: registryEntry.requiresPairedResponsesToolResults }
-      : {}),
-    ...(provider.annotateEmptyToolOutputs === undefined
-      && registryEntry.annotateEmptyToolOutputs !== undefined
-      ? { annotateEmptyToolOutputs: registryEntry.annotateEmptyToolOutputs }
-      : {}),
-    ...(provider.fastWire === undefined && registryEntry.fastWire !== undefined
-      ? {
-        fastWire: cloneFastWire(registryEntry.fastWire),
-      }
-      : {}),
-    ...(provider.supportsServiceTier === undefined && registryEntry.supportsServiceTier !== undefined
-      ? { supportsServiceTier: registryEntry.supportsServiceTier }
-      : {}),
-    // Registry-only web-search capability: without this backfill a saved provider row reaches
-    // the Responses adapter with the flag `undefined`, so the capability gate added in #2262
-    // reads "unclassified" and forwards Codex's OpenAI-only `web_search` config fields. xAI
-    // rejects the whole request before inference ("Argument not supported:
-    // external_web_access"), which killed every routed Grok turn on the Responses lane.
-    // enrichProviderFromRegistry() already fills this, but the request path resolves through
-    // routedProviderConfig() and never called it.
-    ...(provider.supportsOpenAiWebSearchToolFields === undefined
-      && registryEntry.supportsOpenAiWebSearchToolFields !== undefined
-      ? { supportsOpenAiWebSearchToolFields: registryEntry.supportsOpenAiWebSearchToolFields }
-      : {}),
-    ...(provider.supportsResponsesCustomTools === undefined && registryEntry.supportsResponsesCustomTools !== undefined
-      ? { supportsResponsesCustomTools: registryEntry.supportsResponsesCustomTools }
-      : {}),
-    ...(provider.preserveResponsesReasoningContent === undefined && registryEntry.preserveResponsesReasoningContent !== undefined
-      ? { preserveResponsesReasoningContent: registryEntry.preserveResponsesReasoningContent }
-      : {}),
-    ...(provider.dropResponsesReasoningItems === undefined && registryEntry.dropResponsesReasoningItems !== undefined
-      ? { dropResponsesReasoningItems: registryEntry.dropResponsesReasoningItems }
-      : {}),
-    // The request path resolves through routedProviderConfig() and never calls
-    // enrichProviderFromRegistry(), so a saved provider row written before the
-    // registry learned this flag must be backfilled here or route.provider never
-    // carries it and the showThinkingSummary opt-in stays dead.
-    ...(provider.showThinkingSummary === undefined && registryEntry.showThinkingSummary !== undefined
-      ? { showThinkingSummary: registryEntry.showThinkingSummary }
-      : {}),
-    // Registry-only client-facing repair policy (#938): fill only when the
-    // saved provider has no explicit policy; clone so runtime never aliases
-    // the registry constant.
-    ...(provider.responsesItemIdRepair === undefined && registryEntry.responsesItemIdRepair
-      ? {
-        responsesItemIdRepair: {
-          ...(registryEntry.responsesItemIdRepair.message ? { message: [...registryEntry.responsesItemIdRepair.message] } : {}),
-          ...(registryEntry.responsesItemIdRepair.reasoning ? { reasoning: [...registryEntry.responsesItemIdRepair.reasoning] } : {}),
-          ...(registryEntry.responsesItemIdRepair.repairMissingTerminalIds !== undefined
-            ? { repairMissingTerminalIds: registryEntry.responsesItemIdRepair.repairMissingTerminalIds }
-            : {}),
-          ...(registryEntry.responsesItemIdRepair.repairInvalidIds !== undefined
-            ? { repairInvalidIds: registryEntry.responsesItemIdRepair.repairInvalidIds }
-            : {}),
-        },
-      }
-      : {}),
-    authMode: canonicalAuthMode,
-    apiKey: resolvedApiKey,
-    ...(staticModelCatalog ? { liveModels: false } : {}),
-    ...(headers ? { headers } : {}),
-    // Backfill the Google wire mode + Vertex project/location from the registry when the user
-    // config omits them, so a minimal `google-vertex`/`google-antigravity` entry still routes
-    // through the correct branch (CCA/Vertex) instead of falling back to AI Studio.
-    ...(provider.googleMode === undefined && registryEntry.googleMode !== undefined ? { googleMode: registryEntry.googleMode } : {}),
-    ...(provider.project === undefined && registryEntry.project !== undefined ? { project: registryEntry.project } : {}),
-    ...(provider.location === undefined && registryEntry.location !== undefined ? { location: registryEntry.location } : {}),
-    ...(provider.contextWindow === undefined && registryEntry.contextWindow !== undefined ? { contextWindow: registryEntry.contextWindow } : {}),
-    ...((provider.reasoningEfforts === undefined || hasLegacyClinePassReasoningEfforts(providerName, provider))
-      && registryEntry.reasoningEfforts !== undefined
-      ? { reasoningEfforts: [...registryEntry.reasoningEfforts] }
-      : {}),
-    ...(provider.escapeBuiltinToolNames === undefined && registryEntry.escapeBuiltinToolNames !== undefined ? { escapeBuiltinToolNames: registryEntry.escapeBuiltinToolNames } : {}),
-    ...(provider.keyOptional === undefined && registryEntry.keyOptional !== undefined ? { keyOptional: registryEntry.keyOptional } : {}),
-    ...(provider.modelSuffixBracketStrip === undefined && registryEntry.modelSuffixBracketStrip !== undefined ? { modelSuffixBracketStrip: registryEntry.modelSuffixBracketStrip } : {}),
-    // Scalar backfill: a persisted config created before the flag shipped inherits the registry
-    // opt-in, while an explicit user `false` keeps overriding registry `true`.
-    ...(provider.parallelToolCalls === undefined && registryEntry.parallelToolCalls !== undefined ? { parallelToolCalls: registryEntry.parallelToolCalls } : {}),
-    ...(provider.promptCacheKey === undefined && registryEntry.promptCacheKey !== undefined ? { promptCacheKey: registryEntry.promptCacheKey } : {}),
-    ...(provider.chatServiceTier === undefined && registryEntry.chatServiceTier !== undefined ? { chatServiceTier: registryEntry.chatServiceTier } : {}),
-    ...(provider.openaiChatEofTolerance === undefined && registryEntry.openaiChatEofTolerance !== undefined
-      ? { openaiChatEofTolerance: registryEntry.openaiChatEofTolerance }
-      : {}),
-    ...(provider.reasoningWireFormat === undefined && registryEntry.reasoningWireFormat !== undefined
-      ? { reasoningWireFormat: registryEntry.reasoningWireFormat }
-      : {}),
-    ...(provider.defaultMaxOutputTokens === undefined && registryEntry.defaultMaxOutputTokens !== undefined
-      ? { defaultMaxOutputTokens: registryEntry.defaultMaxOutputTokens }
-      : {}),
-    ...(modelContextWindows ? { modelContextWindows } : {}),
-    ...(modelInputModalities ? { modelInputModalities } : {}),
-    ...(modelMaxInputTokens ? { modelMaxInputTokens } : {}),
-    ...(modelMaxOutputTokens ? { modelMaxOutputTokens } : {}),
-    ...(modelSupportsServiceTier ? { modelSupportsServiceTier } : {}),
-    ...(modelSupportsVerbosity ? { modelSupportsVerbosity } : {}),
-    ...(modelReasoningEfforts ? { modelReasoningEfforts } : {}),
-    ...(modelDefaultReasoningEfforts ? { modelDefaultReasoningEfforts } : {}),
-    ...(reasoningEffortMap ? { reasoningEffortMap } : {}),
-    ...(modelReasoningEffortMap ? { modelReasoningEffortMap } : {}),
-    ...(noVisionModels ? { noVisionModels } : {}),
-    ...(noReasoningModels ? { noReasoningModels } : {}),
-    ...(noTemperatureModels ? { noTemperatureModels } : {}),
-    ...(noTopPModels ? { noTopPModels } : {}),
-    ...(noPenaltyModels ? { noPenaltyModels } : {}),
-    ...(noJsonSchemaModels ? { noJsonSchemaModels } : {}),
-    ...(autoToolChoiceOnlyModels ? { autoToolChoiceOnlyModels } : {}),
-    ...(preserveReasoningContentModels ? { preserveReasoningContentModels } : {}),
-    ...(requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels } : {}),
-    ...(reasoningSplitModels ? { reasoningSplitModels } : {}),
-    ...(reasoningDetailsModels ? { reasoningDetailsModels } : {}),
-    ...(thinkingToggleModels ? { thinkingToggleModels } : {}),
-    ...(thinkingBudgetModels ? { thinkingBudgetModels } : {}),
-  };
-  applyDirectReasoningEffortContracts(registryEntry, resolved, provider);
-  return resolved;
-}
-
+/**
+ * Rows eligible for bare-model inference (configured default model, model list, model alias).
+ *
+ * The marked builtin Pool 2 row is excluded: it seeds the same catalog as `anthropic`, so letting it
+ * compete would move a bare `claude-*` request onto Pool 2 by insertion order, or make a shared alias
+ * ambiguous. Pool 2 is reached only through `anthropic2/<model>`, its provider alias, or an explicit
+ * `defaultProvider`. An unmarked custom row named `anthropic2` keeps its ordinary custom meaning.
+ */
 function activeProviderEntries(config: OcxConfig): [string, OcxProviderConfig][] {
   return Object.entries(config.providers)
-    .filter(([name, provider]) => name !== LEGACY_CHATGPT_PROVIDER_ID && provider.disabled !== true);
+    .filter(([name, provider]) => name !== LEGACY_CHATGPT_PROVIDER_ID && provider.disabled !== true
+      && !(name === "anthropic2" && anthropicInstanceRowShapeMatches(name, provider)));
 }
 
 export class NoEnabledOpenAiProviderError extends Error {
@@ -515,11 +271,47 @@ export function comboRouteDecisionTrace(
   });
 }
 
-// Codex uses a small number of control-plane model ids that are not part of the public GPT/o
-// naming families. Keep this exact: a broad `codex-*` rule could capture a third-party model.
-const CODEX_INTERNAL_OPENAI_MODELS = new Set(["codex-auto-review"]);
+const MAX_BLOCKED_MODEL_REDIRECT_EDGES = 5;
 
-function isBareOpenAiFamilyModel(modelId: string): boolean {
+interface BlockedModelRedirectState {
+  visited: Set<string>;
+  edges: number;
+}
+
+function crossProviderRedirectTarget(config: OcxConfig, providerName: string, value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const slash = value.indexOf("/");
+  if (slash <= 0) return undefined;
+  const targetProvider = value.slice(0, slash);
+  if (targetProvider === providerName || !hasOwnProvider(config.providers, targetProvider)) return undefined;
+  const configured = config.providers[targetProvider];
+  if (configured.disabled === true) return undefined;
+  try {
+    const effective = routedProviderConfig(targetProvider, configured);
+    const registry = providerMatchesRegistryTransportWithStaticGuards(targetProvider, configured)
+      ? PROVIDER_REGISTRY.find(entry => entry.id === targetProvider)
+      : undefined;
+    const authMode = effective.authMode ?? registry?.authKind ?? "key";
+    if (authMode === "forward") return undefined; // The source caller bearer is stripped on a redirect.
+    if (authMode === "oauth") {
+      if (registry?.authKind !== "oauth") return undefined;
+      const usable = peekAuthStore()[targetProvider]?.accounts.some(account =>
+        account.paused !== true && account.needsReauth !== true
+        && (account.credential.expires > Date.now()
+          ? Boolean(account.credential.access.trim())
+          : Boolean(account.credential.refresh.trim()))
+      );
+      return usable ? value : undefined;
+    }
+    return authMode === "local" || effective.keyOptional === true || Boolean(effective.apiKey?.trim())
+      ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Exported for the main-account hard-lock fallback: only this family is ever redirected. */
+export function isBareOpenAiFamilyModel(modelId: string): boolean {
   return !modelId.includes("/")
     && (/^(?:gpt-|o1-|o3-|o4-)/.test(modelId) || CODEX_INTERNAL_OPENAI_MODELS.has(modelId));
 }
@@ -531,8 +323,35 @@ function routeResult(
   modelId: string,
   routeKind: RouteDecisionKind,
   routeReason: string,
+  redirectState: BlockedModelRedirectState,
 ): RouteResult {
-  const redirected = resolveBlockedModelRedirect(config, modelId);
+  if (providerName === "anthropic2" && provider.authMode === "oauth" && !anthropicInstanceRowShapeMatches(providerName, provider)) {
+    throw new AnthropicSecondaryInstanceUnavailableError();
+  }
+  const qualified = resolveBlockedModelRedirect(config, `${providerName}/${modelId}`);
+  const bare = resolveBlockedModelRedirect(config, modelId);
+  const crossTarget = config && (
+    crossProviderRedirectTarget(config, providerName, qualified)
+    ?? crossProviderRedirectTarget(config, providerName, bare)
+  );
+  if (crossTarget && config) {
+    if (routeKind === "explicit-account") {
+      throw new Error("Blocked model redirect cannot leave a pinned account route");
+    }
+    const source = `${providerName}/${modelId}`;
+    if (redirectState.visited.has(source)) {
+      throw new Error(`Blocked model redirect cycle detected: ${source}`);
+    }
+    if (redirectState.edges >= MAX_BLOCKED_MODEL_REDIRECT_EDGES) {
+      throw new Error(`Blocked model redirect exceeded maximum redirect depth (${MAX_BLOCKED_MODEL_REDIRECT_EDGES})`);
+    }
+    redirectState.visited.add(source);
+    redirectState.edges += 1;
+    const targetRoute = routeModelInternal(config, crossTarget, true, undefined, false, false, redirectState);
+    return { ...targetRoute, routeReason: "blocked-model-redirect", credentialDomainRewrite: true };
+  }
+  // Existing bare mappings remain one post-resolution, same-provider substitution.
+  const redirected = bare;
   const effectiveModelId = redirected ?? modelId;
   const effectiveRouteReason = redirected ? "blocked-model-redirect" : routeReason;
   const codexAccountMode = providerCodexAccountMode(providerName, provider);
@@ -596,6 +415,8 @@ function routeModelInternal(
   bypassCombos: boolean,
   policyEvidence?: PolicyRequestEvidence,
   allowCompactionNativeFallback = false,
+  preview = false,
+  redirectState: BlockedModelRedirectState = { visited: new Set<string>(), edges: 0 },
 ): RouteResult {
   const slash = modelId.indexOf("/");
   // Policy namespace is system-reserved: an explicit `policy/<id>` or a
@@ -622,12 +443,28 @@ function routeModelInternal(
     }
     const selected = evaluation.candidates[evaluation.selectedIndex]!;
     const concrete = `${selected.provider}/${selected.model}`;
-    const routed = routeModelInternal(config, concrete, true);
+    const routed = routeModelInternal(config, concrete, true, undefined, false, preview, redirectState);
+    if (routed.routeReason === "blocked-model-redirect" && !evaluation.candidates.some(candidate =>
+      candidate.provider === routed.providerName && candidate.model === routed.modelId && candidate.eligible
+    )) {
+      throw new NoEligiblePolicyCandidateError(policyId, evaluation.trace);
+    }
     return {
       ...routed,
       routeKind: "policy" as const,
-      routeReason: "policy-selected",
-      routeDecision: evaluation.trace,
+      routeReason: routed.routeReason === "blocked-model-redirect" ? "blocked-model-redirect" : "policy-selected",
+      policyEligibility: new Set(evaluation.candidates
+        .filter(candidate => candidate.eligible)
+        .map(candidate => candidate.provider + "\u0000" + candidate.model)),
+      routeDecision: {
+        ...evaluation.trace,
+        selected: {
+          ...evaluation.trace.selected,
+          provider: routed.providerName,
+          model: routed.modelId,
+          reason: routed.routeReason === "blocked-model-redirect" ? "blocked-model-redirect" : evaluation.trace.selected.reason,
+        },
+      },
     };
   }
   if (slash > 0) {
@@ -651,8 +488,12 @@ function routeModelInternal(
       if (!isCanonicalOpenAiForwardProvider(providerForCanonicalCheck)) {
         throw new NoEnabledOpenAiProviderError(nativeModelId);
       }
+      const accountQualified = resolveBlockedModelRedirect(config, modelId);
+      if (crossProviderRedirectTarget(config, OPENAI_CODEX_PROVIDER_ID, accountQualified)) {
+        throw new Error("Blocked model redirect cannot leave a pinned account route");
+      }
       return {
-        ...routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, nativeModelId, "explicit-account", "account-namespace"),
+        ...routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, nativeModelId, "explicit-account", "account-namespace", redirectState),
         // Exact account injection uses the pool credential machinery even when the canonical
         // provider is globally Direct. The fixed id bypasses pool selection entirely.
         codexAccountMode: "pool",
@@ -663,13 +504,13 @@ function routeModelInternal(
   }
 
   if (!bypassCombos && !preservesPhysicalComboProvider(config)) {
-    const combo = tryPickComboModel(config, modelId);
+    const combo = tryPickComboModel(config, modelId, preview);
     if (combo) {
       const concrete = `${combo.target.provider}/${combo.target.model}`;
       // The selected target is already a concrete provider/model reference. Resolve it without
       // consulting combo aliases again, otherwise an alias that shadows the target can recurse.
-      const routed = routeModelInternal(config, concrete, true, undefined);
-      return { ...routed, combo, routeKind: "combo" as const, routeReason: "combo-pick" };
+      const routed = routeModelInternal(config, concrete, true, undefined, false, preview, redirectState);
+      return { ...routed, combo, routeKind: "combo" as const, routeReason: routed.routeReason === "blocked-model-redirect" ? "blocked-model-redirect" : "combo-pick" };
     }
   }
 
@@ -680,6 +521,11 @@ function routeModelInternal(
   if (slash > 0) {
     const requestedProvider = modelId.slice(0, slash);
     const requestedLower = requestedProvider.toLowerCase();
+    // Literal B is a reserved instance selector even before its row exists. Keep other
+    // qualifiers, including exact uppercase custom keys, on the ordinary routing path.
+    if (requestedProvider === "anthropic2" && !hasOwnProvider(config.providers, requestedProvider)) {
+      throw new AnthropicSecondaryInstanceUnavailableError();
+    }
     let provName: string | undefined;
 
     if (hasOwnProvider(config.providers, requestedProvider)) {
@@ -729,7 +575,7 @@ function routeModelInternal(
       // itself a known model (e.g. orcarouter/auto). Route it whole instead of stripping to the
       // remainder, which would send a bare `auto` the upstream cannot resolve.
       if (known.includes(modelId)) {
-        return routeResult(config, provName, prov, modelId, "explicit-provider", "explicit-provider-namespace");
+        return routeResult(config, provName, prov, modelId, "explicit-provider", "explicit-provider-namespace", redirectState);
       }
       // Codex-facing alias ids (`provider/vendor-model`) decode back to the native
       // slash id via an exact known-id lookup; raw full-slash selectors keep working.
@@ -745,6 +591,7 @@ function routeModelInternal(
         nativeModel,
         "explicit-provider",
         "explicit-provider-namespace",
+        redirectState,
       );
     }
     }
@@ -753,7 +600,7 @@ function routeModelInternal(
   if (isBareOpenAiFamilyModel(modelId)) {
     const provider = config.providers[OPENAI_CODEX_PROVIDER_ID];
     if (provider && provider.disabled !== true) {
-      return routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, modelId, "native", "native-family");
+      return routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, modelId, "native", "native-family", redirectState);
     }
     // Codex chooses a bare native model for compaction even when the operator's
     // ordinary route is a third-party provider. Keep the native reservation
@@ -774,6 +621,7 @@ function routeModelInternal(
           modelId,
           "default-provider",
           "compaction-default-provider",
+          redirectState,
         );
       }
     }
@@ -783,18 +631,18 @@ function routeModelInternal(
   for (const [provName, prov] of activeProviderEntries(config)) {
     if (prov.defaultModel === modelId
       || (typeof prov.defaultModel === "string" && encodeRoutedModelId(prov.defaultModel) === modelId)) {
-      return routeResult(config, provName, prov, prov.defaultModel as string, "explicit-provider", "configured-default-model");
+      return routeResult(config, provName, prov, prov.defaultModel as string, "explicit-provider", "configured-default-model", redirectState);
     }
   }
 
-  const patternRoute = routeByKnownModelPattern(config, modelId);
+  const patternRoute = routeByKnownModelPattern(config, modelId, redirectState);
   if (patternRoute) return patternRoute;
 
   for (const [provName, prov] of activeProviderEntries(config)) {
     if (prov.models && Array.isArray(prov.models)) {
       const hit = (prov.models as string[]).find(id => id === modelId || encodeRoutedModelId(id) === modelId);
       if (hit !== undefined) {
-        return routeResult(config, provName, prov, hit, "explicit-provider", "configured-model-list");
+        return routeResult(config, provName, prov, hit, "explicit-provider", "configured-model-list", redirectState);
       }
     }
   }
@@ -814,7 +662,7 @@ function routeModelInternal(
   }
   if (aliasMatches[0]) {
     const match = aliasMatches[0];
-    return routeResult(config, match.provider, config.providers[match.provider], match.model, "explicit-provider", "model-alias");
+    return routeResult(config, match.provider, config.providers[match.provider], match.model, "explicit-provider", "model-alias", redirectState);
   }
 
   if (config.defaultProvider === LEGACY_CHATGPT_PROVIDER_ID) {
@@ -823,7 +671,7 @@ function routeModelInternal(
   if (hasOwnProvider(config.providers, config.defaultProvider)) {
     const defaultProv = config.providers[config.defaultProvider];
     if (defaultProv.disabled === true) throw new Error(`Default provider is disabled: ${config.defaultProvider}`);
-    return routeResult(config, config.defaultProvider, defaultProv, modelId, "default-provider", "default-provider");
+    return routeResult(config, config.defaultProvider, defaultProv, modelId, "default-provider", "default-provider", redirectState);
   }
 
   throw new Error(`No provider configured for model: ${modelId}`);
@@ -863,6 +711,11 @@ export function routeModel(
   return routeWithDecisionTrace(config, modelId, route);
 }
 
+/** Resolve a route for capability inspection without creating combo selection state. */
+export function previewRouteModel(config: OcxConfig, modelId: string): RouteResult {
+  return routeWithDecisionTrace(config, modelId, routeModelInternal(config, modelId, false, undefined, false, true));
+}
+
 /**
  * Route a client-selected compaction model. Codex may send a bare native model
  * even when its ordinary turns are configured for another provider; in that
@@ -884,7 +737,7 @@ export function routeConcreteModel(config: OcxConfig, modelId: string): RouteRes
   return routeModelInternal(config, modelId, true, undefined);
 }
 
-function routeByKnownModelPattern(config: OcxConfig, modelId: string): RouteResult | undefined {
+function routeByKnownModelPattern(config: OcxConfig, modelId: string, redirectState: BlockedModelRedirectState): RouteResult | undefined {
   for (const { providerNames, prefixes } of MODEL_PROVIDER_PATTERNS) {
     if (prefixes.some(prefix => modelId.startsWith(prefix))) {
       const matchingProvider = Object.entries(config.providers).find(
@@ -892,7 +745,7 @@ function routeByKnownModelPattern(config: OcxConfig, modelId: string): RouteResu
       );
       if (matchingProvider) {
         const [provName, prov] = matchingProvider;
-        return routeResult(config, provName, prov, modelId, "explicit-provider", "model-pattern");
+        return routeResult(config, provName, prov, modelId, "explicit-provider", "model-pattern", redirectState);
       }
       // Deliberately no "first provider with an Anthropic adapter" fallback here. Picking by
       // object insertion order, without checking `models`, `selectedModels`, `disabledModels` or

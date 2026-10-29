@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { configureApiTargets, fetchAudioUpload, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
+import { bootstrapApiSession, configureApiTargets, fetchAudioUpload, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
 import { targetsFromMachineStatus, type MachineStatusV1 } from "../src/api-targets";
 
 const LEGACY_TOKEN_KEY = "opencodex-api-token";
@@ -147,7 +147,7 @@ test("validates prompted tokens with a safe read before retrying the failed requ
     const url = new URL(input instanceof Request ? input.url : String(input), "http://localhost/");
     const key = new Headers(init?.headers).get("X-OpenCodex-API-Key");
     seenRequests.push([url.pathname, key]);
-    if (url.pathname === "/api/settings" && key === "fresh-token") {
+    if (url.pathname === "/api/combos" && key === "fresh-token") {
       return new Response("{}", { status: 200 });
     }
     if (url.pathname === "/api/config" && key === "fresh-token") {
@@ -159,8 +159,8 @@ test("validates prompted tokens with a safe read before retrying the failed requ
 
   expect((await fetch("/api/config")).status).toBe(200);
   expect(validationResults).toEqual(["rejected", "accepted"]);
-  expect(seenRequests).toContainEqual(["/api/settings", "wrong-token"]);
-  expect(seenRequests).toContainEqual(["/api/settings", "fresh-token"]);
+  expect(seenRequests).toContainEqual(["/api/combos", "wrong-token"]);
+  expect(seenRequests).toContainEqual(["/api/combos", "fresh-token"]);
   expect(seenRequests).not.toContainEqual(["/api/config", "wrong-token"]);
   expect(sessionStorage.length).toBe(0);
 });
@@ -511,6 +511,7 @@ test("a session minted for another origin is rejected and the prompt fallback st
 });
 
 test("a renewed two-origin session attaches only to its bound server and carries browser origin plus CSRF", async () => {
+  window.localStorage.setItem("opencodex.dashboard-device-proof", `ocx_proof_${"A".repeat(43)}`);
   injectSessionMeta("ocx_session_stale", "stale-csrf", "http://localhost");
   const status: MachineStatusV1 = {
     mode: "client", connected: true, machineBase: "http://localhost",
@@ -530,6 +531,7 @@ test("a renewed two-origin session attaches only to its bound server and carries
     const url = new URL(input instanceof Request ? input.url : String(input), "http://localhost/");
     const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
     if (url.origin === "https://hub.example.test" && url.pathname === "/opencodex-session") {
+      expect(headers.has("X-OpenCodex-Device-Proof")).toBe(false);
       return htmlResponseAt(
         sessionDocumentHtml("ocx_session_remote", "remote-csrf", "http://localhost", "https://hub.example.test"),
         "https://hub.example.test/opencodex-session",
@@ -555,9 +557,14 @@ test("a renewed two-origin session attaches only to its bound server and carries
   const evilHeaders = seen.get("https://evil.example.test")?.[0];
   expect(evilHeaders?.get("X-OpenCodex-API-Key")).toBeNull();
   expect(evilHeaders?.get("X-OpenCodex-GUI-Origin")).toBeNull();
+  for (const entries of seen.values()) for (const headers of entries) expect(headers.has("X-OpenCodex-Device-Proof")).toBe(false);
 });
 
 test("relay requests carry independent shared and machine sessions without cross-target leakage", async () => {
+  window.localStorage.setItem("opencodex.dashboard-device-proof", `ocx_proof_${"A".repeat(43)}`);
+  let proofReads = 0;
+  const storageGet = window.localStorage.getItem.bind(window.localStorage);
+  Object.defineProperty(window.localStorage, "getItem", { configurable: true, value: (key: string) => { if (key === "opencodex.dashboard-device-proof") proofReads++; return storageGet(key); } });
   injectSessionMeta("ocx_session_machine", "machine-csrf", "http://localhost");
   const seen = new Map<string, Headers>();
   const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -573,6 +580,7 @@ test("relay requests carry independent shared and machine sessions without cross
     connectedAt: "2026-08-28T00:00:00.000Z", hubReachability: "unknown",
   };
   configureApiTargets(targetsFromMachineStatus("", relayStatus));
+  expect(await bootstrapApiSession("shared")).toBe(false);
   expect(installApiSessionFromHtml("shared", sessionDocumentHtml(
     "ocx_session_hub", "hub-csrf", "http://localhost", "https://hub.example.test",
   ))).toBe(true);
@@ -592,6 +600,8 @@ test("relay requests carry independent shared and machine sessions without cross
   const unknown = seen.get("/api/config")!;
   expect(unknown.get("x-opencodex-api-key")).toBeNull();
   expect(unknown.get("x-opencodex-machine-session")).toBeNull();
+  for (const headers of seen.values()) expect(headers.has("X-OpenCodex-Device-Proof")).toBe(false);
+  expect(proofReads).toBe(0);
 });
 
 test("a mismatched bootstrap response/server origin clears every in-memory session field", async () => {

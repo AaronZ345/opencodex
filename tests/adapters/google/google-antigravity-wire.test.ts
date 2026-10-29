@@ -76,17 +76,14 @@ describe("antigravity CCA envelope", () => {
     expect(req.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
   });
 
-  test("exposes Gemini 3.8 and 3.7 Flash while retired Flash ids resolve to 3.7", async () => {
-    // Collapsed picker: base models only. 3.8 leads because CCA ranks it first in the
-    // Recommended sort; 3.7 stays because Google still serves it.
+  test("exposes the 3.8 / 4 / 5.5 / 5.5 lineup while retired Flash ids still resolve to 3.7", async () => {
+    // Collapsed picker: base models only, the static lineup confirmed 2026-10-14. Older models
+    // reach the picker only through live discovery.
     expect(ANTIGRAVITY_MODELS).toEqual([
       "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.1-pro",
-      "gemini-3.1-flash-image",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gpt-oss-120b-medium",
+      "gemini-4-argon",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
     ]);
     for (const hidden of [
       "gemini-3.6-flash",
@@ -193,11 +190,7 @@ describe("antigravity CCA envelope", () => {
       "future-flash-low",
       "future-flash-medium",
       "future-flash-high",
-    ]))?.map(model => model.id)).toEqual([
-      "future-flash-low",
-      "future-flash-medium",
-      "future-flash-high",
-    ]);
+    ]))?.map(model => model.id)).toEqual(["future-flash"]);
     expect(parseAntigravityAvailableModels(payload([
       "future-flash-low",
       "future-flash-high",
@@ -928,6 +921,48 @@ describe("isLikelyRealThoughtSignature", () => {
     expect(isLikelyRealThoughtSignature("short")).toBe(false);
     expect(isLikelyRealThoughtSignature("has spaces in it here")).toBe(false);
     expect(isLikelyRealThoughtSignature(undefined)).toBe(false);
+    expect(isLikelyRealThoughtSignature("skip_thought_signature_validator")).toBe(false);
+    expect(isLikelyRealThoughtSignature("context_engineering_is_the_way_to_go")).toBe(false);
+  });
+  test("antigravitySessionId isolates session ids per accountScope or _reasoningReplayScope credential identity while preserving single-arg fallback", () => {
+    const p = parsed("hello world");
+    const base = antigravitySessionId(p);
+    const projA = antigravitySessionId(p, "proj-alpha");
+    const projB = antigravitySessionId(p, "proj-beta");
+    expect(projA).toBe(antigravitySessionId(p, "  proj-alpha  "));
+    expect(projA).not.toBe(projB);
+    expect(projA).not.toBe(base);
+    expect(antigravitySessionId(p, "")).toBe(base);
+    const scopedA = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-a",
+          credentialDurableIdentity: "durable-cred-a",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    const scopedB = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-b",
+          credentialDurableIdentity: "durable-cred-b",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    expect(antigravitySessionId(scopedA)).not.toBe(antigravitySessionId(scopedB));
+    expect(antigravitySessionId(scopedA)).not.toBe(base);
   });
   test("accepts an opaque base64/base64url signature blob", () => {
     expect(isLikelyRealThoughtSignature("CisBVKhc7+abcDEF0123456789/xyz==")).toBe(true);

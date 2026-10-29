@@ -2,11 +2,14 @@ import { CodexStaleBanner } from "../components/codex-stale-banner";
 import ModelCatalogSettingsPanels from "../components/ModelCatalogSettingsPanels";
 import ModelDisplayNameDialog from "../components/ModelDisplayNameDialog";
 import ModelPriceDialog from "../components/ModelPriceDialog";
+import ModelSettingsDialog from "../components/ModelSettingsDialog";
 import { fetchCodexAppServerState } from "../codex-app-server-state";
 import type { AppServerStateOutcome } from "../codex-app-server-state";
 import { useCodexRestart } from "../use-codex-restart";
+import { confirmAction } from "../action-dialogs";
+import { editModelAlias, editProviderAlias } from "./models-alias-editing";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Switch, Notice, EmptyState, Select, Tooltip } from "../ui";
+import { Switch, Notice, EmptyState, Select, Tooltip, type NoticeTone } from "../ui";
 import { IconChevron, IconBoxes, IconInfo, IconCheck, IconAlert, IconRefresh, IconPencil } from "../icons";
 import { useT } from "../i18n/shared";
 import type { TFn, TKey } from "../i18n/shared";
@@ -23,6 +26,7 @@ import {
   type ModelPickerOrderMode, type PickerOrderSettings, type PickerOrderSaved, type ModelPickerUsage,
 } from "../model-picker-order";
 import { startVisibilityPoll } from "../visibility-poll";
+import { useModelVisibility } from "../use-model-visibility";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
 import ErrorBoundary from "../components/ErrorBoundary";
@@ -30,6 +34,7 @@ import Combos from "./Combos";
 import RoutingProfiles from "./RoutingProfiles";
 import CompatibilityMatrix from "./CompatibilityMatrix";
 import { ModelsTabStrip } from "./models-tab-strip";
+import { ProviderFastRow } from "./models-fast-row";
 import {
   modelsPanelDomId,
   modelsTabDomId,
@@ -44,8 +49,7 @@ import {
 } from "../models-groups";
 import {
   fetchSelectedModels,
-  modelVisible,
-  putModelVisibility,
+  modelVisible as savedModelVisible,
   clientCatalogRefreshFailures,
   type ClientCatalogRefreshFailure,
   shouldApplyLoadGeneration,
@@ -58,12 +62,14 @@ import {
   CAP_OPTION_SET,
   CAP_OPTIONS,
   collectDisabledNamespaced,
+  childCountToThreadLimit,
   CUSTOM_OPTION,
   fmtK,
   NATIVE_CAP_OPTIONS,
   NATIVE_CAP_OPTION_SET,
   PAGE,
   readCollapsedProviders,
+  threadLimitToChildCount,
   THREAD_OPTION_SET,
   THREAD_OPTIONS,
   writeCollapsedProviders,
@@ -72,17 +78,23 @@ import {
   freeOnlyInForce,
   modelPricingKnown,
   REASONING_EFFORT_LEVELS,
+  routedModelOptions,
+  parseContextWindowDraft,
+  type ModelPresetView,
   type ModelRow,
   type ProviderContextCapsResponse,
-  type ShadowCallData,
   type V2Status,
 } from "./models-shared";
 import { DiscoveryDependencyHint, EmptyProviderHint } from "./models-provider-hints";
 import SubagentSurfaceWarningModal from "../components/SubagentSurfaceWarningModal";
 import { SUBAGENT_SURFACE_GUIDE_URL, readSubagentSurfaceAdvisory } from "../subagent-surface";
 import { shadowCallModelOptions } from "./dashboard-shared";
-import { shadowSourceModelBadge, shadowSourceModelLabel } from "./shadow-call-source";
-import { ModelCatalogStateSummary } from "./models-catalog-state";
+import { ShadowCallSettingsRow } from "./shadow-call-settings-row";
+import { ModelCatalogDelivery } from "./models-catalog-state";
+import { CustomModelsSummary, InfoHint, ModelsSettingsPanel, SettingsRow } from "./models-settings-panel";
+import { modelsSettingsSummary } from "./models-settings-summary";
+import { useAutoReviewSettings } from "./use-auto-review-settings";
+import { useShadowCallSettings } from "./use-shadow-call-settings";
 
 type CachedModelsPage = {
   models: ModelRow[];
@@ -102,32 +114,6 @@ const SUBTITLE_TKEY: Record<ModelsTab, TKey> = {
   compatibility: "models.subtitle.compatibility",
 };
 
-/**
- * Parse a context-window field: a number, `null` for "unset", or `undefined` when the text is
- * not usable. Separators are cosmetic, so "64,000" and "64_000" and "64000" are one value.
- *
- * Safe-integer rather than integer: `Number.isInteger(1e100)` is true, the server rejects it,
- * and accepting it here would turn a typo into a round-trip error instead of inline feedback.
- *
- * Module scope because it closes over nothing — rebuilding it every render is wasted work.
- */
-function parseContextWindowDraft(raw: string): number | null | undefined {
-  const normalized = raw.replace(/[_,\s]/g, "");
-  if (!normalized) return null;
-  const value = Number(normalized);
-  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
-}
-
-/** #2465 per-provider model-preset view, as `GET /api/model-presets` returns it. */
-interface ModelPresetView {
-  mode: "preset" | "all" | "custom";
-  appliedVersion?: number;
-  availableVersion: number;
-  presetIds: string[];
-  presetCount: number;
-  totalCount: number;
-  fallback?: string;
-}
 interface ModelDiscoveryView {
   policy: "on" | "off";
   providers: Record<string, "on" | "off" | "inherit">;
@@ -140,7 +126,7 @@ interface AliasView {
   defaults: { global: boolean; providers: Record<string, boolean> };
 }
 
-export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: { apiBase: string; restartEpoch?: number; catalogSyncedAt?: string }) {
+export default function Models({ apiBase, restartEpoch = 0, connected = false, catalogSyncedAt, reportRestart }: { apiBase: string; restartEpoch?: number; connected?: boolean; catalogSyncedAt?: string; reportRestart: (message: string, tone: NoticeTone) => void }) {
   // Codex app-server staleness (devlog/_fin/260815_gui_codex_restart). Named
   // appServerState, not catalogState: this file already binds that name to the
   // model-catalog resource state, which is an unrelated concept. (Spelling the
@@ -188,6 +174,10 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   // this page, and a restart succeeding there must still clear the banner here.
   const { restarting: codexRestarting, restart: handleCodexRestart } = useCodexRestart(apiBase, {
     onSettled: () => { void reloadAppServerState(); },
+    // Reported through the shell, not this page's toast: a restart takes up to 30s and
+    // outlives a navigation away, and an outcome that says app-servers are still running
+    // must not be discarded because the user moved on while waiting for it.
+    report: reportRestart,
   });
 
   useEffect(() => {
@@ -290,9 +280,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
       pickerFlight.current?.controller.abort();
       pickerFlight.current?.clear();
       pickerFlight.current = null;
-      cancelAppServerRead();
     };
-  }, [apiBase, catalogActive, cancelAppServerRead]);
+  }, [apiBase, catalogActive]);
   useLayoutEffect(() => {
     // Pin inferred Custom before any late GET can switch mode and unmount its draft.
     if (catalogActive && pickerDraft === null && pickerMode === "custom") setPickerDraft("custom");
@@ -317,6 +306,14 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     setStatus(message);
     setFeedbackGen(g => g + 1);
   }, []);
+  // Reviewer override settings publish through the same toast channel.
+  const { data: autoReview, saving: autoReviewSaving, load: loadAutoReview, save: saveAutoReview } =
+    useAutoReviewSettings(apiBase, t, publishFeedback);
+  useEffect(() => {
+    if (catalogActive) return;
+    // A hidden mounted panel may still hold the previous server's reviewer settings.
+    void loadAutoReview();
+  }, [apiBase, catalogActive, loadAutoReview]);
   // Transient action feedback as a fixed toast: appearing or auto-clearing it never shifts
   // the workspace below (the old inline Notice pushed the whole model grid down by its
   // height on every apply). The timer itself just clears the status again.
@@ -331,6 +328,18 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   const catalogMutationRef = useRef(false);
   const loadGenerationRef = useRef(0);
   const loadPendingRef = useRef(false);
+  const visibility = useModelVisibility(apiBase, {
+    onQueued: () => { ++loadGenerationRef.current; setStatus(""); },
+    onBusy: value => { ++loadGenerationRef.current; loadPendingRef.current = false; catalogMutationRef.current = value; busyRef.current = value; setBusy(value); },
+    onResponse: body => {
+      const failures = clientCatalogRefreshFailures(body);
+      if (failures !== undefined) setIntegrationFailures(failures);
+    },
+    refresh: signal => load(true, signal),
+    onSettled: error => { setOk(!error); setStatus(t(error ?? "models.applied")); },
+  });
+  const modelVisible = (selected: ProviderModelMap, provider: string, id: string, native: boolean, blocked: boolean) =>
+    visibility.visible(provider, id, native, savedModelVisible(selected, provider, id, native, blocked));
   // multi_agent_v2 / ultra gate. null = endpoint unavailable (older proxy build) -> section hidden.
   const [v2, setV2] = useState<V2Status | null>(null);
   // #2465: per-provider model-preset state. Keyed by provider so one card's busy state cannot
@@ -344,6 +353,11 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   const [v2Busy, setV2Busy] = useState(false);
   const [v2Note, setV2Note] = useState("");
   const v2BusyRef = useRef(false);
+  // Freshness for /api/v2 reads: readSeq makes the latest issued GET the only one
+  // allowed to apply; writeSeq bumps on every PUT so a response read in flight
+  // across a completed write is discarded instead of reverting the fresher state.
+  const v2ReadSeqRef = useRef(0);
+  const v2WriteSeqRef = useRef(0);
   const [threadsCustom, setThreadsCustom] = useState("");
   const [showThreadsCustom, setShowThreadsCustom] = useState(false);
   const [v2HelpOpen, setV2HelpOpen] = useState(false);
@@ -353,6 +367,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   const [displayNameModel, setDisplayNameModel] = useState<ModelRow | null>(null);
   const [priceModel, setPriceModel] = useState<ModelRow | null>(null);
   const priceTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const [settingsModel, setSettingsModel] = useState<ModelRow | null>(null);
   const [displayNameSaving, setDisplayNameSaving] = useState(false);
   const [displayNameRequestError, setDisplayNameRequestError] = useState<string | null>(null);
   const [displayNameRecovery, setDisplayNameRecovery] = useState<{
@@ -380,29 +395,11 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     return () => controller.abort();
   }, [reloadAliases]);
 
-  const saveProviderAlias = async (provider: string) => {
-    const entered = window.prompt(t("models.aliasPrompt"), aliases.providers[provider] ?? "");
-    if (entered === null) return;
-    const response = await fetch(`${apiBase}/api/providers/${encodeURIComponent(provider)}/alias`, {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ alias: entered.trim() || null }),
-    });
-    if (!response.ok) { publishFeedback(false, t("models.aliasConflict")); return; }
-    await reloadAliases();
-    publishFeedback(true, t("models.aliasSaved"));
-  };
-
-  const saveModelAlias = async (provider: string, model: string) => {
-    const current = aliases.models[provider]?.[model]?.alias ?? "";
-    const entered = window.prompt(t("models.modelAliasPrompt"), current);
-    if (entered === null) return;
-    const body = entered.trim() ? { set: { [model]: entered.trim() } } : { remove: [model] };
-    const response = await fetch(`${apiBase}/api/providers/${encodeURIComponent(provider)}/model-aliases`, {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-    });
-    if (!response.ok) { publishFeedback(false, t("models.aliasConflict")); return; }
-    await reloadAliases();
-    publishFeedback(true, t("models.aliasSaved"));
-  };
+  const aliasEditingDeps = { apiBase, t, reloadAliases, publishFeedback };
+  const saveProviderAlias = (provider: string) =>
+    editProviderAlias(provider, aliases.providers[provider] ?? "", aliasEditingDeps);
+  const saveModelAlias = (provider: string, model: string) =>
+    editModelAlias(provider, model, aliases.models[provider]?.[model]?.alias ?? "", aliasEditingDeps);
 
   const setDefaultAliases = async (enabled: boolean, provider?: string) => {
     const response = await fetch(`${apiBase}/api/default-aliases`, {
@@ -447,8 +444,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   const [contextError, setContextError] = useState("");
   const [hoveredModel, setHoveredModel] = useState<{ namespaced: string; rect: DOMRect } | null>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [shadowCall, setShadowCall] = useState<ShadowCallData | null>(null);
-  const [shadowCallSaving, setShadowCallSaving] = useState(false);
+  const { shadowCall, shadowCallSaving, loadShadowCall, saveShadowCall } = useShadowCallSettings({ apiBase, publishFeedback, t });
 
   // App owns the in-session view mode; fallback to persisted mode for isolated renders/tests.
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
@@ -470,24 +466,26 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     );
   }, [models, shadowCall?.model, shadowCall?.sourceModels, shadowModelOptions]);
 
-  const loadShadowCall = useCallback(async () => {
-    const bounded = createBoundedFetch(15_000);
-    try {
-      const r = await fetch(`${apiBase}/api/shadow-call-settings`, { signal: bounded.signal });
-      const data = await readJsonIfOk<ShadowCallData>(r);
-      if (data) setShadowCall(data);
-    } catch { /* old server / network: keep the section disabled */ }
-    finally { bounded.clear(); }
-  }, [apiBase]);
+  const autoReviewOptions = useMemo(
+    () => [{ value: "", label: "—" }, ...routedModelOptions(shadowModelOptions, models, autoReview?.model)],
+    [models, shadowModelOptions, autoReview?.model],
+  );
 
   const loadV2 = useCallback(async () => {
     // Never let a toggle in flight be clobbered by the poll (same single-flight rule as models).
     if (v2BusyRef.current) return;
+    const readSeq = ++v2ReadSeqRef.current;
+    const writeSeq = v2WriteSeqRef.current;
+    // Checked before every apply below: a write landing while this GET was in
+    // flight already adopted fresher state, so the stale response is dropped.
+    const fresh = () => readSeq === v2ReadSeqRef.current && writeSeq === v2WriteSeqRef.current;
     const bounded = createBoundedFetch(15_000);
     try {
       const r = await fetch(`${apiBase}/api/v2`, { signal: bounded.signal });
+      if (!fresh()) return;
       if (!(r.headers.get("content-type") ?? "").includes("application/json")) { setV2(null); return; }
       const data = await readJsonIfOk<V2Status>(r);
+      if (!fresh()) return;
       if (!data || typeof data.enabled !== "boolean") { setV2(null); return; }
       setV2({
         enabled: data.enabled,
@@ -497,7 +495,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
         keepNativeChatGptOnV1: data.keepNativeChatGptOnV1 === true,
       });
     } catch {
-      setV2(null); // old server / network: hide the section instead of guessing
+      if (fresh()) setV2(null); // old server / network: hide the section instead of guessing
     } finally {
       bounded.clear();
       setV2Loading(false);
@@ -505,6 +503,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   }, [apiBase]);
 
   const fetchCatalog = useCallback(async (signal: AbortSignal): Promise<CachedModelsPage> => {
+    const generation = loadGenerationRef.current;
     const [modelsRes, capsRes, providersRes, selectionData] = await Promise.all([
       // Every request carries the resource signal, so leaving the catalog tab cancels
       // the work rather than only discarding its result.
@@ -536,7 +535,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
       contextCapValues: capsData.values ?? capsData.caps ?? {},
       contextCapValue: nextCapValue,
     } satisfies CachedModelsPage;
-    writeSessionListCache(cacheKey, next);
+    if (generation === loadGenerationRef.current) writeSessionListCache(cacheKey, next);
     return next;
   }, [apiBase, cacheKey]);
 
@@ -560,11 +559,12 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     cacheKey,
     [apiBase],
     async (signal) => {
+      const generation = loadGenerationRef.current;
       const next = await fetchCatalog(signal);
       // A manual mutation refresh may have invalidated this request while its JSON was decoding.
       // Do not let the aborted catalog repaint controls after the newer result is applied.
       if (signal.aborted) throw new Error("models request aborted");
-      applyCatalog(next);
+      if (!catalogMutationRef.current && generation === loadGenerationRef.current) applyCatalog(next);
       return next;
     },
     // Gated on the catalog tab: a 10-second poll that keeps running while the user
@@ -716,6 +716,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     if (!catalogActive) return;
     const timeout = window.setTimeout(() => {
       void loadShadowCall();
+      void loadAutoReview();
       void loadV2();
       // Preset previews belong to the same tab. Loaded once rather than polled: the rules are
       // shipped code and the catalog poll above already refreshes the rows they describe.
@@ -741,7 +742,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     // gui/.oxlintrc.json (override) and gui/doctor.config.json (ignore.overrides). An in-file
     // react-doctor-disable comment was tried and removed - it changed nothing, and
     // react/react-compiler penalises a component for carrying suppressions at all.
-  }, [catalogActive, loadShadowCall, loadV2]);
+  }, [catalogActive, loadShadowCall, loadAutoReview, loadV2]);
 
   const groups = useMemo(
     () => buildProviderModelGroups(models, providers),
@@ -896,7 +897,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
       model.native === true,
       disabled.has(model.namespaced),
     )).length;
-  }, [disabled, models, selectedModels]);
+  }, [disabled, models, selectedModels, visibility.overrides]);
 
   /*
    * Quiet per-tab counts. A count is omitted, never zeroed, while it is unknown: the
@@ -918,35 +919,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     targets: ModelVisibilityTarget[],
     enabled: boolean,
   ) => {
-    if (catalogMutationRef.current) return;
-    catalogMutationRef.current = true;
-    ++loadGenerationRef.current;
-    setBusy(true);
-    busyRef.current = true;
-    setStatus("");
-    let errorKey: "models.saveFailed" | "models.networkError" | null = null;
-    try {
-      const response = await putModelVisibility(apiBase, scope, provider, targets, enabled);
-      if (!response.ok) errorKey = "models.saveFailed";
-      else {
-        const failures = clientCatalogRefreshFailures(await response.json());
-        if (failures !== undefined) setIntegrationFailures(failures);
-      }
-    } catch {
-      errorKey = "models.networkError";
-    } finally {
-      const refreshed = await load(true);
-      if (errorKey) {
-        setOk(false);
-        setStatus(t(errorKey));
-      } else if (refreshed) {
-        setOk(true);
-        setStatus(t("models.applied"));
-      }
-      setBusy(false);
-      busyRef.current = false;
-      catalogMutationRef.current = false;
-    }
+    if (busyRef.current && !visibility.isRunning()) return;
+    visibility.enqueue(scope, provider, targets, enabled);
   };
 
   const toggleProviderCap = async (provider: string) => {
@@ -1090,21 +1064,6 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
 
   const setAll = () => { void putCap({ setAll: !allCapped }); };
 
-  const saveShadowCall = async (patch: Partial<ShadowCallData>) => {
-    if (!shadowCall || shadowCallSaving) return;
-    setShadowCallSaving(true);
-    setShadowCall({ ...shadowCall, ...patch });
-    try {
-      await fetch(`${apiBase}/api/shadow-call-settings`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
-      });
-    } finally {
-      setShadowCallSaving(false);
-    }
-  };
-
   /**
    * Both v2 surface writes adopt the response directly instead of calling
    * `loadV2()`. `loadV2` returns early while `v2BusyRef` is still held by the
@@ -1116,6 +1075,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     if (!v2 || v2BusyRef.current) return;
     setV2Busy(true);
     v2BusyRef.current = true;
+    v2WriteSeqRef.current++;
     setV2Note("");
     setStatus("");
     try {
@@ -1196,7 +1156,12 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     await Promise.all([loadModelDiscovery(), load()]);
   };
 
-  const applyPreset = async (provider: string, mode: "preset" | "all") => {
+  const applyPreset = async (provider: string, mode: "preset" | "all", replacing?: { presetCount: number }) => {
+    // Consent lives with the write, not with the button, so every caller is gated.
+    if (replacing && !(await confirmAction({
+      message: t("models.presetConfirmReplace", { count: String(replacing.presetCount) }),
+      tone: "danger",
+    }))) return;
     if (catalogMutationRef.current) return;
     catalogMutationRef.current = true;
     setPresetBusy(provider);
@@ -1239,22 +1204,28 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     await putV2Setting({ keepNativeChatGptOnV1: next });
   };
 
+  // The API reports the limit in the active backend's units; the control edits the
+  // logical child count, so the V2 storage case (total incl. the root slot) converts.
+  const v2ThreadsChildren = v2?.maxConcurrentThreadsPerSession != null
+    ? threadLimitToChildCount(v2.maxConcurrentThreadsPerSession, v2.enabled)
+    : null;
+
   const putV2Threads = async (value: number) => {
-    // Same guards as the flag toggle: single-flight + server-side idempotence
-    // (setMaxConcurrentThreads no-ops on equal value), so a re-selected current
-    // value or a double click can never double-write config.toml.
+    // Validate both child and backend units before the single-flight write.
     if (!v2 || v2BusyRef.current) return;
-    if (!Number.isInteger(value) || value < 1) { publishFeedback(false, t("models.v2ThreadsInvalid")); return; }
-    if (v2.maxConcurrentThreadsPerSession === value) return;
+    const threadLimit = childCountToThreadLimit(value, v2.enabled);
+    if (!Number.isSafeInteger(value) || value < 1 || !Number.isSafeInteger(threadLimit)) { publishFeedback(false, t("models.v2ThreadsInvalid")); return; }
+    if (v2ThreadsChildren === value) return;
     setV2Busy(true);
     v2BusyRef.current = true;
+    v2WriteSeqRef.current++;
     setV2Note("");
     setStatus("");
     try {
       const r = await fetch(`${apiBase}/api/v2`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ maxConcurrentThreadsPerSession: value }),
+        body: JSON.stringify({ maxConcurrentThreadsPerSession: threadLimit }),
       });
       try {
         const data = await readJsonOrThrow<V2Status & { warnings?: string[] }>(r, t("models.saveFailed"));
@@ -1286,7 +1257,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
   };
 
   const onSelectThreads = (raw: string) => {
-    if (raw === CUSTOM_OPTION) { setShowThreadsCustom(true); setThreadsCustom(String(v2?.maxConcurrentThreadsPerSession ?? "")); return; }
+    if (raw === CUSTOM_OPTION) { setShowThreadsCustom(true); setThreadsCustom(String(v2ThreadsChildren ?? "")); return; }
     setShowThreadsCustom(false);
     void putV2Threads(Number(raw));
   };
@@ -1367,7 +1338,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     }
   };
 
-  const deleteCustomModel = async (id: string) => {
+  const deleteCustomModel = async (id: string, name: string) => {
+    if (!(await confirmAction({ message: t("models.customDeleteConfirm", { name }), confirmLabel: t("common.delete"), tone: "danger" }))) return;
     try {
       const r = await fetch(`${apiBase}/api/custom-models/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (r.ok) {
@@ -1553,13 +1525,11 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                            color: preset.mode === mode ? undefined : "var(--muted)",
                          }}
                          disabled={busy || busyHere || selectionPending}
-                         onClick={(e) => {
-                           e.stopPropagation();
-                           // Switching from a custom selection destroys it, so confirm first.
-                           if (mode === "preset" && preset.mode === "custom"
-                             && !confirm(t("models.presetConfirmReplace", { count: String(preset.presetCount) }))) return;
-                           void applyPreset(provider, mode);
-                         }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Switching from a custom selection destroys it, so consent first.
+                          void applyPreset(provider, mode, mode === "preset" && preset.mode === "custom" ? preset : undefined);
+                        }}
                        >
                          {t(`models.presetMode_${mode}` as TKey)}
                        </button>
@@ -1593,8 +1563,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                  </>
                );
              })()}
-             <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOn || selectionPending} onClick={() => bulkToggle(true)}>{t("models.allOn")}</button>
-            <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOff || selectionPending} onClick={() => bulkToggle(false)}>{t("models.allOff")}</button>
+             <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={(busy && !visibility.pending) || allOn || selectionPending} onClick={() => bulkToggle(true)}>{t("models.allOn")}</button>
+            <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={(busy && !visibility.pending) || allOff || selectionPending} onClick={() => bulkToggle(false)}>{t("models.allOff")}</button>
             <div className="models-cap-cluster">
               {/* The label names the FUNCTION. It used to be `models.capValue` -
                   "기본 128k" - which is a value masquerading as a name: even a
@@ -1686,6 +1656,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                 </div>
               </div>
             )}
+            {!nativeProviderGroup && <ProviderFastRow summary={providers.find(p => p.name === provider)} apiBase={apiBase}
+              onSaved={(saved, message) => { publishFeedback(saved, message); if (saved) void load(true); }} />}
             {rows.length === 0 && (
               <EmptyProviderHint liveModels={liveModels} discovery={discovery} showFailureBadge={false} />
             )}
@@ -1732,7 +1704,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                    }}
                  >
                    <div className="row models-model-row">
-                     <Switch on={!off} onClick={() => void applyVisibility("models", provider, [{ id: m.id, native: m.native === true }], off)} disabled={busy || m.initialSelectionPending} label={m.native ? m.id : m.namespaced} />
+                     <Switch on={!off} onClick={() => void applyVisibility("models", provider, [{ id: m.id, native: m.native === true }], off)} disabled={(busy && !visibility.pending) || m.initialSelectionPending} label={m.native ? m.id : m.namespaced} />
                     {m.initialSelectionPending && <span className="models-chip muted" role="status">{t("models.initialSelectionPending")}</span>}
                     {/* #1711: listed and selectable, but every usable target is out of credit.
                         Not a visibility change and not the operator's disable flag — the row is
@@ -1790,6 +1762,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                          </button>
                        </>
                      )}
+                     {!m.native && !m.custom && m.provider !== "combo" && <button type="button" className="btn btn-ghost btn-sm text-caption models-display-name-trigger" aria-haspopup="dialog" aria-label={t("models.settingsTitle", { model: m.namespaced })} onClick={() => setSettingsModel(m)}>{t("models.customEdit")}</button>}
                      {!m.custom && recentIds.has(m.id) && <span className="badge badge-amber">{t("models.newBadge")}</span>}
                      {m.contextCapped && <span className="models-chip muted mono text-caption">{t("models.contextCappedValue", { value: fmtK(m.contextCap ?? contextCapValue) })}</span>}
                    </div>
@@ -1867,12 +1840,13 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
                                type="button"
                                className="btn btn-ghost btn-sm text-caption"
                                style={{ color: "var(--red)" }}
-                               onClick={() => {
-                                 if (window.confirm(t("models.customDeleteConfirm", { name: m.displayName ?? m.id }))) {
-                                   void deleteCustomModel(m.customId!);
-                                 }
-                                 setHoveredModel(null);
-                               }}
+                              onClick={() => {
+                                // Hover is cleared AFTER the dialog closes, not before it
+                                // opens: dropping it first unmounts this button, and the
+                                // dialog then has nothing to return focus to.
+                                void deleteCustomModel(m.customId!, m.displayName ?? m.id)
+                                  .finally(() => setHoveredModel(null));
+                              }}
                              >{t("models.customDelete")}</button>
                            </div>
                          )}
@@ -1962,27 +1936,25 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
     <>
       <div className="models-control-top-row">
         {modelDiscovery && (
-          <div className="models-shadow-row row muted text-control">
-            <span className="models-shadow-label">{t("models.newPolicyGlobal")}</span>
+          <SettingsRow label={t("models.newPolicyGlobal")}>
             <Switch on={modelDiscovery.policy === "off"} onClick={() => void saveModelDiscovery(modelDiscovery.policy === "off" ? "on" : "off")} label={t("models.newPolicyGlobal")} />
-          </div>
+          </SettingsRow>
         )}
-        <div className="row">
+        <SettingsRow label={t("models.useDefaultAliasesGlobal")}>
           <Switch on={aliases.defaults.global} onClick={() => void setDefaultAliases(!aliases.defaults.global)} label={t("models.useDefaultAliasesGlobal")} />
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowAliases(value => !value)}>{t("models.aliases")}</button>
-        </div>
-        <div className="models-shadow-row row muted text-control" aria-busy={!shadowCall || undefined}>
-          <span className="models-shadow-label">{t("models.shadowCallIntercept")} <Tooltip content={t("models.shadowCallInterceptHint", { models: shadowSourceModelLabel(shadowCall?.sourceModels) })} side="top" maxWidth={320}><span style={{ cursor: "help" }} aria-label={t("models.shadowCallInterceptHint", { models: shadowSourceModelLabel(shadowCall?.sourceModels) })}>ⓘ</span></Tooltip></span>
-          <code className="text-caption models-shadow-warning" style={{ opacity: 0.6 }}>{t("models.shadowCallOriginal", { models: shadowSourceModelBadge(shadowCall?.sourceModels) })}</code>
-          <Switch on={shadowCall?.enabled ?? false} onClick={() => void saveShadowCall({ enabled: !shadowCall?.enabled })} disabled={!shadowCall || shadowCallSaving} label={t("models.shadowCallIntercept")} />
+        </SettingsRow>
+        <ShadowCallSettingsRow shadowCall={shadowCall} saving={shadowCallSaving} modelOptions={shadowCallOptions} onSave={patch => void saveShadowCall(patch)} />
+
+        <SettingsRow label={t("models.autoReviewOverride")} hint={<Tooltip content={t("models.autoReviewOverrideHint")} side="top" maxWidth={320}><span style={{ cursor: "help" }} aria-label={t("models.autoReviewOverrideHint")}>ⓘ</span></Tooltip>} busy={!autoReview}>
+          <Switch on={autoReview?.enabled ?? false} onClick={() => void saveAutoReview({ enabled: !autoReview?.enabled })} disabled={!autoReview || autoReviewSaving} label={t("models.autoReviewOverride")} />
           <div className="models-shadow-model-slot">
-            <Select value={shadowCall?.model ?? ""} options={shadowCallOptions} onChange={v => { setShadowCall(c => c ? { ...c, model: v } : c); void saveShadowCall({ model: v }); }} disabled={!shadowCall || shadowCallSaving || !shadowCall.enabled} label={t("models.shadowCallIntercept")} />
+            <Select value={autoReview?.model ?? ""} options={autoReviewOptions} onChange={v => void saveAutoReview({ model: v })} disabled={!autoReview || autoReviewSaving || !autoReview.enabled} label={t("models.autoReviewOverride")} />
           </div>
-        </div>
+        </SettingsRow>
 
         {(v2Loading || v2) && (
-          <div className="models-v2-mode-row row">
-            <span className="muted text-control">{t("models.v2Label")}</span>
+          <SettingsRow label={t("models.v2Label")}>
             <div className="segmented models-segmented" role="radiogroup" aria-label={t("models.v2Label")}>
               {(["v1", "default", "v2"] as const).map(mode => (
                 <button
@@ -2010,7 +1982,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
             >
               <IconInfo width={14} height={14} aria-hidden="true" />
             </button>
-          </div>
+          </SettingsRow>
         )}
         {v2 && v2.multiAgentMode === "v2" && (
           <div className="models-v2-keep-native-row">
@@ -2043,48 +2015,43 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
         )}
       </div>
 
-      {v2 && (v2.enabled || v2.agentsMaxThreadsConflict || v2Note) && (
+      {v2 && (
         <div className="models-v2-detail-row row">
-          {v2.enabled && (
+          <span className="muted text-control">{t("models.v2ThreadsLabel")}</span>
+          <Select
+            value={showThreadsCustom
+              ? CUSTOM_OPTION
+              : (v2ThreadsChildren !== null
+                ? (THREAD_OPTION_SET.has(v2ThreadsChildren) ? String(v2ThreadsChildren) : CUSTOM_OPTION)
+                : "")}
+            options={[
+              ...(v2ThreadsChildren === null
+                ? [{ value: "", label: t("models.v2ThreadsDefault") }] : []),
+              ...(v2ThreadsChildren !== null && !THREAD_OPTION_SET.has(v2ThreadsChildren) && !showThreadsCustom
+                ? [{ value: CUSTOM_OPTION, label: String(v2ThreadsChildren) }] : []),
+              ...THREAD_OPTIONS.map(v => ({ value: String(v), label: String(v) })),
+              { value: CUSTOM_OPTION, label: t("models.custom") },
+            ]}
+            onChange={v => onSelectThreads(v)}
+            disabled={v2Busy}
+            label={t("models.v2ThreadsLabel")}
+          />
+          {showThreadsCustom && (
             <>
-              <span className="muted text-control">{t("models.v2ThreadsLabel")}</span>
-              <Select
-                value={showThreadsCustom
-                  ? CUSTOM_OPTION
-                  : (v2.maxConcurrentThreadsPerSession !== null && v2.maxConcurrentThreadsPerSession !== undefined
-                    ? (THREAD_OPTION_SET.has(v2.maxConcurrentThreadsPerSession) ? String(v2.maxConcurrentThreadsPerSession) : CUSTOM_OPTION)
-                    : "")}
-                options={[
-                  ...(v2.maxConcurrentThreadsPerSession === null || v2.maxConcurrentThreadsPerSession === undefined
-                    ? [{ value: "", label: t("models.v2ThreadsDefault") }] : []),
-                  ...(v2.maxConcurrentThreadsPerSession !== null && v2.maxConcurrentThreadsPerSession !== undefined
-                    && !THREAD_OPTION_SET.has(v2.maxConcurrentThreadsPerSession) && !showThreadsCustom
-                    ? [{ value: CUSTOM_OPTION, label: String(v2.maxConcurrentThreadsPerSession) }] : []),
-                  ...THREAD_OPTIONS.map(v => ({ value: String(v), label: String(v) })),
-                  { value: CUSTOM_OPTION, label: t("models.custom") },
-                ]}
-                onChange={v => onSelectThreads(v)}
+              <input
+                className="input"
+                style={{ width: 100 }}
+                inputMode="numeric"
+                value={threadsCustom}
+                onChange={e => setThreadsCustom(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") void putV2Threads(Number(threadsCustom.replace(/[_,\s]/g, ""))); }}
                 disabled={v2Busy}
-                label={t("models.v2ThreadsLabel")}
+                aria-label={t("models.v2ThreadsLabel")}
               />
-              {showThreadsCustom && (
-                <>
-                  <input
-                    className="input"
-                    style={{ width: 100 }}
-                    inputMode="numeric"
-                    value={threadsCustom}
-                    onChange={e => setThreadsCustom(e.target.value)}
-                    onKeyDown={e => { if (e.key === "Enter") void putV2Threads(Number(threadsCustom.replace(/[_,\s]/g, ""))); }}
-                    disabled={v2Busy}
-                    aria-label={t("models.v2ThreadsLabel")}
-                  />
-                  <button type="button" className="btn btn-sm" disabled={v2Busy}
-                    onClick={() => { void putV2Threads(Number(threadsCustom.replace(/[_,\s]/g, ""))); }}>
-                    {t("models.v2ThreadsApply")}
-                  </button>
-                </>
-              )}
+              <button type="button" className="btn btn-sm" disabled={v2Busy}
+                onClick={() => { void putV2Threads(Number(threadsCustom.replace(/[_,\s]/g, ""))); }}>
+                {t("models.v2ThreadsApply")}
+              </button>
             </>
           )}
           {v2.enabled && v2.agentsMaxThreadsConflict && (
@@ -2125,7 +2092,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
           </>
         )}
         <Switch on={allCapped} onClick={setAll} disabled={busy} label={t("models.setAll")} />
-        <span className="muted text-label leading-body">{t("models.setAllHint", { value: fmtK(contextCapValue) })}</span>
+        <InfoHint text={t("models.setAllHint", { value: fmtK(contextCapValue) })} />
       </div>
 
       <div className="row models-cap-row" aria-busy={pickerBusy || pickerResource.state.refreshing}>
@@ -2154,31 +2121,28 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
             {t("models.pickerOrder.retry")}
           </button>
         </>}
-        <span className="muted text-label leading-body">{t("models.pickerOrder.hint")}</span>
+        <InfoHint text={t("models.pickerOrder.hint")} />
       </div>
       <ModelCatalogSettingsPanels showOrderEditor={pickerMode === "custom"} apiBase={apiBase} active={catalogActive}
         identities={models} onBusyChange={setPickerBusy} onAccepted={data => acceptPickerOrder(data, true)} onSaved={() => catalogResource.refresh()} />
-
-
-      {(() => {
-        const customCount = models.filter(m => m.custom).length;
-        if (customCount === 0) return null;
-        return (
-          <div className="row muted text-label models-custom-summary">
-            <span className="models-chip mono text-caption">
-              {t("models.customSummary", { count: customCount })}
-            </span>
-          </div>
-        );
-      })()}
-
-      <div className="row muted text-label leading-body models-order-hint">
-        <IconInfo width={15} height={15} aria-hidden="true" />
-        <span>{t("models.orderHint")}</span>
-      </div>
+      {showAliases && (
+        <div className="card models-aliases-card" aria-label={t("models.aliasesTable")}>
+          <div className="row group-head"><strong>{t("models.aliases")}</strong></div>
+          {Object.entries(aliases.models).flatMap(([provider, rows]) => Object.entries(rows).map(([model, value]) => (
+            <div className="row models-model-row" key={`${provider}/${model}`}>
+              <code className="mono text-caption" style={{ flex: 1 }}>{provider}/{model}</code>
+              <strong className="mono text-control">{value.alias}</strong>
+              <span className="models-chip muted text-caption">{value.source === "builtin" ? t("models.aliasAuto") : t("models.aliasUser")}</span>
+              {value.stale && <span className="badge badge-amber">{t("models.aliasStale")}</span>}
+              <button type="button" className="btn btn-ghost btn-sm" aria-label={t("models.editModelAlias")} onClick={() => void saveModelAlias(provider, model)}><IconPencil style={{ width: 13, height: 13 }} /></button>
+            </div>
+          )))}
+        </div>
+      )}
     </>
   );
 
+  const customCount = models.filter(m => m.custom).length;
   const collapseControls = (
     <div className="row models-collapse-controls">
       <button type="button" className="btn btn-ghost btn-sm text-caption" onClick={() => setAllCollapsed(true)} disabled={busy}>
@@ -2187,6 +2151,8 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
       <button type="button" className="btn btn-ghost btn-sm text-caption" onClick={() => setAllCollapsed(false)} disabled={busy}>
         <IconChevron width={12} height={12} aria-hidden="true" style={{ transform: "rotate(90deg)" }} /> {t("models.expandAll")}
       </button>
+      <InfoHint text={t("models.orderHint")} />
+      <CustomModelsSummary count={customCount} label={t("models.customSummary", { count: customCount })} />
     </div>
   );
 
@@ -2562,7 +2528,15 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
           </li>)}</ul>
         </Notice>
       </div>}
-      <div className="models-workspace-root" aria-busy={catalogState.refreshing || undefined}>
+      <ModelsSettingsPanel title={t("models.settingsPanel.title")} attentionLabel={t("models.settingsPanel.attention")}
+        warn={!!(v2?.enabled && v2.agentsMaxThreadsConflict) || v2Note !== "" || pickerResource.state.showError}
+        summary={modelsSettingsSummary(t, { multiAgentMode: v2?.multiAgentMode, v2Threads: v2ThreadsChildren, keepNativeOnV1: v2?.keepNativeChatGptOnV1 === true,
+          shadowEnabled: shadowCall?.enabled === true, shadowModel: shadowCall?.model, windowOn: allCapped, windowValue: contextCapValue, newModelsOff: modelDiscovery?.policy === "off", aliasesOn: aliases.defaults.global,
+          autoReviewEnabled: autoReview?.enabled === true, autoReviewModel: autoReview?.model,
+          pickerMode: modelPickerOrderMode(pickerSettings?.pickerAvailable ?? [], pickerSettings?.pickerOrder ?? [], pickerSettings?.pickerOrderMode) })}>
+        {controlsBlock}
+      </ModelsSettingsPanel>
+      <div className="models-workspace-root" aria-busy={visibility.pending || catalogState.refreshing || undefined}>
         <aside className="models-workspace-rail" aria-label={t("nav.models")}>
           <div className="models-workspace-rail-header">
             <span className="models-workspace-rail-title">{t("models.workspace.providers")}</span>
@@ -2604,22 +2578,7 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
           </div>
         </aside>
         <section className="models-workspace-main" aria-label={t("models.workspace.mainAria")}>
-          {controlsBlock}
           {collapseControls}
-          {showAliases && (
-            <div className="card" aria-label={t("models.aliasesTable")}>
-              <div className="row group-head"><strong>{t("models.aliases")}</strong></div>
-              {Object.entries(aliases.models).flatMap(([provider, rows]) => Object.entries(rows).map(([model, value]) => (
-                <div className="row models-model-row" key={`${provider}/${model}`}>
-                  <code className="mono text-caption" style={{ flex: 1 }}>{provider}/{model}</code>
-                  <strong className="mono text-control">{value.alias}</strong>
-                  <span className="models-chip muted text-caption">{value.source === "builtin" ? t("models.aliasAuto") : t("models.aliasUser")}</span>
-                  {value.stale && <span className="badge badge-amber">{t("models.aliasStale")}</span>}
-                  <button type="button" className="btn btn-ghost btn-sm" aria-label={t("models.editModelAlias")} onClick={() => void saveModelAlias(provider, model)}><IconPencil style={{ width: 13, height: 13 }} /></button>
-                </div>
-              )))}
-            </div>
-          )}
           <div className="models-provider-list">
             {
               // eslint-disable-next-line react-hooks/refs, react/react-compiler -- The hover ref is only read by row event handlers nested in this renderer.
@@ -2652,10 +2611,11 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
       />
       <ModelsTabStrip tab={tab} onSelect={selectTab} meta={tabMeta} />
       {/*
-        One summary for the active tab. The catalog also names its delivery states;
-        other tabs keep the compact subtitle so their workspaces stay in view.
+        One subtitle for the active tab. The catalog adds its delivery process folded to one
+        line, rendered here rather than in the panel because hidden panels stay mounted.
       */}
-      <ModelCatalogStateSummary subtitleKey={SUBTITLE_TKEY[tab]} catalogSyncedAt={catalogSyncedAt} />
+      <p className="page-sub">{t(SUBTITLE_TKEY[tab])}</p>
+      {tab === "catalog" && <ModelCatalogDelivery connected={connected} catalogSyncedAt={catalogSyncedAt} />}
 
       {/*
         Panels mount lazily and then stay mounted, hidden — a half-typed combo draft
@@ -2784,6 +2744,11 @@ export default function Models({ apiBase, restartEpoch = 0, catalogSyncedAt }: {
             }, 0);
           }}
         />
+      )}
+      {settingsModel && (
+        <ModelSettingsDialog key={`${apiBase}/${settingsModel.namespaced}`} row={settingsModel} apiBase={apiBase}
+          onRefresh={signal => load(true, signal)} onFeedback={publishFeedback}
+          onClose={() => setSettingsModel(null)} />
       )}
     </>
   );

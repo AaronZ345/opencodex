@@ -4,7 +4,7 @@ import { withClientLifecycleSync } from "../../src/client/lifecycle-lock";
 import { applyRemoteDesktopStore } from "../../src/claude/desktop-remote-store";
 import type { OcxConfig } from "../../src/types";
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import {
@@ -24,6 +24,7 @@ import {
   writeRemoteDesktop3pConfig,
   type Desktop3pModelEntry,
 } from "../../src/claude/desktop-3p";
+import { assertDesktopLibraryTextSize, MAX_DESKTOP_PROFILE_FILE_BYTES } from "../../src/claude/desktop-3p-library";
 import { moveDesktopRoute, reconcileDesktopProfile, setDesktopFamilyDefault } from "../../src/claude/desktop-profile";
 import { resolveInboundModel } from "../../src/claude/inbound";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -212,19 +213,18 @@ describe("Claude Desktop 3P models", () => {
   });
 
   test("an openai context cap reaches the Desktop writer, not just the dashboard", () => {
-    // No surviving native advertises a 1M window (gpt-5.4 was the last). Sol's
-    // opt-in ceiling is 922k, so even a 1M provider cap must not invent
-    // supports1m — nativeOpenAiContextWindow clamps it under the threshold.
-    // A 272k cap has to take the same path, or the written Desktop config
-    // would promise a window the proxy will not serve (#854's effective-window
+    // Sol's default window is 272k: no 1M. A 1M provider cap opts it into its 922k
+    // ceiling, a long window, so the written config now offers and prefers 1M; an
+    // overflow comes back as `prompt is too long`, which Claude compacts on (261009 020).
+    // A 272k cap has to take the same path as the default (#854's effective-window
     // contract).
     const uncapped = generateDesktop3pModels(["gpt-5.6-sol"], []);
     expect(uncapped[0]!.supports1m).toBeUndefined();
     expect(uncapped[0]!.prefer1m).toBeUndefined();
 
     const optedIn = generateDesktop3pModels(["gpt-5.6-sol"], [], undefined, 1_000_000);
-    expect(optedIn[0]!.supports1m).toBeUndefined();
-    expect(optedIn[0]!.prefer1m).toBeUndefined();
+    expect(optedIn[0]!.supports1m).toBe(true);
+    expect(optedIn[0]!.prefer1m).toBe(true);
 
     const capped = generateDesktop3pModels(["gpt-5.6-sol"], [], undefined, 272_000);
     expect(capped[0]!.supports1m).toBeUndefined();
@@ -370,18 +370,147 @@ describe("Claude Desktop 3P models", () => {
     expect(resolveDesktop3pAlias("claude-opus-4-ncb")).toBe("native/gpt-5.6-sol");
   });
 
-  test("renders persisted family/date assignments and installs their decode registry", () => {
+  test("deduplicates repeated real Anthropic ids without a profile", () => {
+    const id = "claude-opus-4-6";
+    const rendered = generateDesktop3pModels([], [
+      { provider: "anthropic", id },
+      { provider: "anthropic", id },
+    ]);
+    expect(rendered.map(model => model.name)).toEqual([id]);
+    expect(resolveDesktop3pAlias(id)).toBeNull();
+    expect(resolveInboundModel(id)).toBe(id);
+  });
+
+  test("keeps real Anthropic ids authoritative without a profile", () => {
+    const currentCollision = { provider: "test", id: "model-14753" };
+    const currentAlias = desktop3pAlias(currentCollision.provider, currentCollision.id);
+    expect(currentAlias).toBe("claude-opus-4-8-a00");
+
+    const legacyCollision = { provider: "native", id: "gpt-5.6-sol" };
+    const legacyAlias = legacyDesktop3pAlias(legacyCollision.provider, legacyCollision.id);
+    expect(legacyAlias).toBe("claude-opus-4-ncb");
+
+    const rendered = generateDesktop3pModels([], [
+      currentCollision,
+      legacyCollision,
+      { provider: "anthropic", id: currentAlias },
+      { provider: "anthropic", id: legacyAlias },
+    ]);
+    const legacyCurrentAlias = desktop3pAlias(legacyCollision.provider, legacyCollision.id);
+    expect(rendered.map(model => model.name).sort()).toEqual([
+      currentAlias,
+      legacyAlias,
+      legacyCurrentAlias,
+    ].sort());
+    expect(resolveDesktop3pAlias(currentAlias)).toBeNull();
+    expect(resolveDesktop3pAlias(legacyAlias)).toBeNull();
+    expect(resolveInboundModel(currentAlias)).toBe(currentAlias);
+    expect(resolveInboundModel(legacyAlias)).toBe(legacyAlias);
+  });
+
+  test("profile wire ids do not rebind existing three-character aliases", () => {
+    const staleRoute = { provider: "test", id: "model-14753" };
+    const staleAlias = desktop3pAlias(staleRoute.provider, staleRoute.id);
+    expect(staleAlias).toBe("claude-opus-4-8-a00");
+    generateDesktop3pModels([], [staleRoute]);
+    expect(resolveDesktop3pAlias(staleAlias)).toBe("test/model-14753");
+
+    const profile = {
+      version: 1 as const,
+      assignments: {
+        "other/current": { family: "opus" as const, alias: "claude-opus-4-8-20260101" },
+      },
+      defaults: { opus: "other/current", fable: null, sonnet: null, haiku: null },
+    };
+    const rendered = generateDesktop3pModels([], [staleRoute, { provider: "other", id: "current" }], profile);
+    expect(rendered.find(model => model.labelOverride.includes("Current"))?.name).toBe("claude-fable-5-p000");
+    expect(resolveDesktop3pAlias(staleAlias)).toBe("test/model-14753");
+  });
+
+  test("fails closed when a managed wire id matches a real Anthropic id", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const collision = "claude-fable-5-p000";
+    const profile = {
+      version: 1 as const,
+      assignments: {
+        "test/routed": { family: "opus" as const, alias: "claude-opus-4-8-20260101" },
+        [`anthropic/${collision}`]: { family: "opus" as const, alias: collision },
+      },
+      defaults: { opus: "test/routed", fable: null, sonnet: null, haiku: null },
+    };
+    try {
+      const rendered = generateDesktop3pModels([], [
+        { provider: "test", id: "routed" },
+        { provider: "anthropic", id: collision },
+      ], profile);
+      expect(rendered.map(model => model.name)).toEqual([collision]);
+      expect(resolveDesktop3pAlias(collision)).toBeNull();
+      expect(resolveInboundModel(collision)).toBe(collision);
+      expect(warning.mock.calls.flat().join(" ")).toContain("conflicts with a real Anthropic model");
+    } finally {
+      warning.mockRestore();
+      buildDesktop3pRegistry([], []);
+    }
+  });
+
+  test("renders persisted date slots as Desktop-distinct aliases and keeps legacy decoding", () => {
     const routed = [{ provider: "cursor", id: "gpt-5.6-luna", contextWindow: 1_000_000 }];
     let profile = reconcileDesktopProfile(undefined, [
       { route: "native/gpt-5.6-sol", label: "GPT 5.6 Sol" },
       { route: "cursor/gpt-5.6-luna", label: "GPT 5.6 Luna", contextWindow: 1_000_000 },
     ]);
     profile = moveDesktopRoute(profile, "cursor/gpt-5.6-luna", "haiku", true);
-    const models = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile);
-    const luna = models.find(model => model.labelOverride.includes("Luna"));
+    const storedAliases = Object.values(profile.assignments).map(assignment => assignment.alias);
+    expect(storedAliases.every(alias => /^claude-opus-4-8-20\d{6}$/.test(alias))).toBe(true);
+
+    const rendered = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile);
+    const luna = rendered.find(model => model.labelOverride.includes("Luna"));
     expect(luna).toMatchObject({ anthropicFamilyTier: "haiku", isFamilyDefault: true, supports1m: true });
-    expect(luna?.name).toMatch(/^claude-opus-4-8-20\d{6}$/);
+    expect(rendered.map(model => model.name)).toEqual([
+      expect.stringMatching(/^claude-fable-5-p[0-9a-z]{3}$/),
+      expect.stringMatching(/^claude-fable-5-p[0-9a-z]{3}$/),
+    ]);
+    const desktopIdentity = (id: string) => id.replace(/-(\d{8})$/, "");
+    expect(new Set(rendered.map(model => desktopIdentity(model.name))).size).toBe(2);
     expect(resolveDesktop3pAlias(luna!.name)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(luna!.name)).toBe("cursor/gpt-5.6-luna");
+    const legacyDate = profile.assignments["cursor/gpt-5.6-luna"]!.alias;
+    expect(resolveDesktop3pAlias(legacyDate)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(legacyDate)).toBe("cursor/gpt-5.6-luna");
+    const previousWireId = luna!.name.replace("claude-fable-5-", "claude-opus-4-8-");
+    expect(resolveInboundModel(previousWireId)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(`${previousWireId}[1m]`)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(`${luna!.name}[1m]`)).toBe("cursor/gpt-5.6-luna");
+    // Desktop 2.31226 normalizes terminal dates, then uses a prefix fallback
+    // for fable/mythos. These wire IDs retain identity and reach that fallback.
+    expect(rendered.every(model => /^(?:claude-)?(?:fable|mythos)(?:-|$)/.test(desktopIdentity(model.name)))).toBe(true);
+    expect(isUnresolvedDesktop3pAlias("claude-fable-5-pzzz")).toBe(true);
+    expect(() => resolveInboundModel("claude-fable-5-pzzz")).toThrow("Unknown Claude Desktop alias");
+    buildDesktop3pRegistry([], []);
+  });
+
+  test("old profile IDs never capture a genuine Anthropic model during migration", () => {
+    const collision = "claude-opus-4-8-p000";
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const profile = {
+      version: 1 as const,
+      assignments: {
+        "test/routed": { family: "opus" as const, alias: "claude-opus-4-8-20260101" },
+        [`anthropic/${collision}`]: { family: "opus" as const, alias: collision },
+      },
+      defaults: { opus: "test/routed", fable: null, sonnet: null, haiku: null },
+    };
+    try {
+      const rendered = generateDesktop3pModels([], [{ provider: "test", id: "routed" }, { provider: "anthropic", id: collision }], profile);
+      expect(rendered.map(model => model.name)).toEqual(["claude-fable-5-p000", collision]);
+      expect(resolveInboundModel("claude-fable-5-p000")).toBe("test/routed");
+      expect(resolveInboundModel(collision)).toBe(collision);
+      expect(resolveDesktop3pAlias(collision)).toBeNull();
+      expect(warning.mock.calls.flat().join(" ")).toContain("conflicts with a real Anthropic model");
+    } finally {
+      warning.mockRestore();
+      buildDesktop3pRegistry([], []);
+    }
   });
 
   test("backs up owned config and preserves old bytes when atomic replacement fails", () => {
@@ -389,12 +518,12 @@ describe("Claude Desktop 3P models", () => {
     const path = join(dir, "owned.json");
     try {
       writeFileSync(path, "old bytes\n");
-      const success = atomicReplaceDesktopConfig(path, "new bytes\n");
+      const success = atomicReplaceDesktopConfig(path, "new bytes\n", readFileSync(path));
       expect(readFileSync(path, "utf8")).toBe("new bytes\n");
       expect(readFileSync(success.backupPath!, "utf8")).toBe("old bytes\n");
 
       writeFileSync(path, "stable bytes\n");
-      expect(() => atomicReplaceDesktopConfig(path, "never written\n", () => { throw new Error("injected"); })).toThrow("injected");
+      expect(() => atomicReplaceDesktopConfig(path, "never written\n", readFileSync(path), () => { throw new Error("injected"); })).toThrow("injected");
       expect(readFileSync(path, "utf8")).toBe("stable bytes\n");
       expect(readFileSync(`${path}.bak`, "utf8")).toBe("stable bytes\n");
     } finally {
@@ -549,3 +678,71 @@ test("Desktop FAST base validation preserves exact catalog IDs and clears stale 
     expect(isUnresolvedDesktop3pAlias(unknown)).toBe(true);
   } finally { buildDesktop3pRegistry([], []); }
 });
+
+// Multi-MiB real-file fixtures plus ACL-hardened writes need extra Windows wall-clock budget.
+test("oversized Desktop replacement is refused before writing a backup", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-desktop-bound-"));
+  const path = join(dir, "profile.json");
+  try {
+    writeFileSync(path, '{"original":true}');
+    expect(() => atomicReplaceDesktopConfig(path, "x".repeat(MAX_DESKTOP_PROFILE_FILE_BYTES + 1), Buffer.from('{"original":true}')))
+      .toThrow("desktop_config_too_large");
+    expect(readFileSync(path, "utf8")).toBe('{"original":true}');
+    expect(existsSync(path + ".bak")).toBe(false);
+    expect(() => assertDesktopLibraryTextSize("é".repeat(MAX_DESKTOP_PROFILE_FILE_BYTES / 2))).not.toThrow();
+    expect(() => assertDesktopLibraryTextSize("é".repeat(MAX_DESKTOP_PROFILE_FILE_BYTES / 2 + 1)))
+      .toThrow("desktop_config_too_large");
+  } finally { removeTreeWithRetry(dir); }
+}, 20_000);
+
+test.each(["profile", "metadata"] as const)("oversized Desktop %s output refuses before file mutation", kind => {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-desktop-write-bound-"));
+  const previous = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+  const previousHome = process.env.OPENCODEX_HOME;
+  process.env.OPENCODEX_HOME = join(dir, "ocx");
+  process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = dir;
+  try {
+    saveConfig({
+      providers: { test: { adapter: "openai-chat", baseUrl: "http://127.0.0.1:1/v1",
+        allowPrivateNetwork: true, liveModels: false, models: ["fixture-model"] } },
+      defaultProvider: "test", port: 4096,
+    } as OcxConfig);
+    const id = "owned-profile";
+    const metadata = {
+      appliedId: id, entries: [{ id, name: "opencodex" }],
+      ...(kind === "metadata" ? { foreignRows: Array(500_000).fill("x") } : {}),
+    };
+    const profile = {
+      inferenceProvider: "gateway", inferenceCredentialKind: "static",
+      inferenceGatewayBaseUrl: "http://127.0.0.1:1", inferenceGatewayApiKey: "old-key",
+      modelDiscoveryEnabled: false, inferenceModels: [],
+      ...(kind === "profile" ? { foreignPad: "x".repeat(MAX_DESKTOP_PROFILE_FILE_BYTES - 512) } : {}),
+    };
+    const metadataPath = join(dir, "_meta.json");
+    const profilePath = join(dir, `${id}.json`);
+    const beforeMeta = JSON.stringify(metadata);
+    const beforeProfile = JSON.stringify(profile);
+    expect(Buffer.byteLength(beforeMeta)).toBeLessThan(MAX_DESKTOP_PROFILE_FILE_BYTES);
+    expect(Buffer.byteLength(beforeProfile)).toBeLessThan(MAX_DESKTOP_PROFILE_FILE_BYTES);
+    if (kind === "metadata") {
+      expect(Buffer.byteLength(JSON.stringify(metadata, null, 2) + "\n")).toBeGreaterThan(MAX_DESKTOP_PROFILE_FILE_BYTES);
+    }
+    writeFileSync(metadataPath, beforeMeta);
+    writeFileSync(profilePath, beforeProfile);
+    const models = Array.from({ length: 100 }, (_, index) => ({ provider: "test", id: `fixture-${index}` }));
+    const result = writeDesktop3pConfig(4096, [], models, "new-key", "static", undefined, undefined, {
+      lockPath: join(dir, "locks", "desktop.sqlite"),
+    });
+    expect(result.written).toBe(false);
+    expect(result.reason).toBe("desktop_config_too_large");
+    expect(readFileSync(profilePath, "utf8")).toBe(beforeProfile);
+    expect(readFileSync(metadataPath, "utf8")).toBe(beforeMeta);
+    expect(existsSync(profilePath + ".bak")).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+    else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previous;
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    removeTreeWithRetry(dir);
+  }
+}, 20_000);

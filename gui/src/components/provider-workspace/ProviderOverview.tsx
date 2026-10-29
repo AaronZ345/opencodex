@@ -15,6 +15,7 @@ import type { ProviderUpdatePatch, ProviderUpdateResult } from "./types";
 import ProviderCurrentQuota from "./ProviderCurrentQuota";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import ProviderSponsor from "./ProviderSponsor";
+import ProviderCompletionTest from "./ProviderCompletionTest";
 
 type ConnectionTestResult = {
   applicable?: boolean;
@@ -33,8 +34,9 @@ type ConnectionTestState = {
 
 export default function ProviderOverview({
   item, preset, usageTotals, quotaReport, currentQuotaReading, onRefreshQuota, oauthEmail, oauth,
-  apiBase, connectionIdentity,
+  apiBase, connectionIdentity, availableModels = [],
   onEditSettings, onViewUsage, onUpdateProvider,
+  onCreateJevAuto,
   onReauthenticate, onCancelLogin, reauthBusy = false,
 }: {
   item: WorkspaceItem;
@@ -47,10 +49,12 @@ export default function ProviderOverview({
   /** Login state for OAuth summaries that carry no email (e.g. Cursor/Kimi). */
   oauth?: { loggedIn?: boolean };
   apiBase?: string;
+  availableModels?: string[];
   /** Opaque active credential identity used only to invalidate stale probe results. */
   connectionIdentity?: string;
   onEditSettings?: () => void;
   onViewUsage?: () => void;
+  onCreateJevAuto?: () => void;
   onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
   onReauthenticate?: () => void;
   onCancelLogin?: () => void;
@@ -98,7 +102,8 @@ export default function ProviderOverview({
   }, [connectionProbeKey]);
 
   const testConnection = useCallback(async () => {
-    if (!apiBase) return;
+    // "" is the same-origin dashboard, a real server; only an omitted base has nothing to probe.
+    if (apiBase === undefined) return;
     connectionAbortRef.current?.controller.abort();
     const controller = new AbortController();
     connectionAbortRef.current = { key: connectionProbeKey, controller };
@@ -172,7 +177,7 @@ export default function ProviderOverview({
             <dd>{item.defaultModel ?? <span className="muted">—</span>}</dd>
           </div>
         </dl>
-        {apiBase && (
+        {apiBase !== undefined && (
           <div className="row" style={{ marginTop: 12, alignItems: "center" }}>
             <button
               type="button"
@@ -193,12 +198,24 @@ export default function ProviderOverview({
             )}
           </div>
         )}
+        {apiBase !== undefined && <ProviderCompletionTest key={connectionProbeKey} apiBase={apiBase} provider={item.name}
+          models={[...new Set([...(item.models ?? []), ...availableModels, ...(item.defaultModel ? [item.defaultModel] : [])])]} />}
         {onEditSettings && (
           <button type="button" className="link-btn pws-edit-settings-link" onClick={onEditSettings}>
             {t("pws.editSettings")}
           </button>
         )}
       </section>
+
+      {item.adapter === "jev-decision" && onCreateJevAuto && (
+        <section className="pws-section" aria-label={t("cws.jev.create")}>
+          <h3 className="pws-section-title">{t("cws.jev.create")}</h3>
+          <p className="muted" style={{ marginTop: 0 }}>{t("cws.jev.setupHint")}</p>
+          <button type="button" className="btn btn-primary btn-sm" onClick={onCreateJevAuto}>
+            {t("cws.jev.create")}
+          </button>
+        </section>
+      )}
 
       <section className="pws-section" aria-label={t("pws.authSummary")}>
         <h3 className="pws-section-title">{t("pws.authSummary")}</h3>

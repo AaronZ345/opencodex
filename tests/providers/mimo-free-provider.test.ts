@@ -1,6 +1,6 @@
 import { describe, expect, test, mock, beforeEach } from "bun:test";
 import { PROVIDER_REGISTRY } from "../../src/providers/registry";
-import { providerConfigSeed, deriveKeyLoginMap, deriveFeaturedProviderIds } from "../../src/providers/derive";
+import { providerConfigSeed, deriveKeyLoginMap, deriveFeaturedProviderIds, deriveProviderPresets } from "../../src/providers/derive";
 import {
   getMimoClientId,
   resetMimoClientIdCache,
@@ -91,28 +91,32 @@ describe("mimo-free provider registry", () => {
     expect(entry?.baseUrl).toBe("https://api.xiaomimimo.com/api/free-ai/openai/chat");
     expect(entry?.authKind).toBe("key");
     expect(entry?.keyOptional).toBe(true);
-    expect(entry?.featured).toBe(true);
+    expect(entry?.featured).toBe(false);
+    expect(entry?.deprecated).toBeTruthy();
     expect(entry?.liveModels).toBe(true);
     expect(entry?.defaultModel).toBe("mimo-auto");
   });
 
-  test("providerConfigSeed preserves keyOptional and disables static live discovery", () => {
+  test("providerConfigSeed still resolves a saved provider and disables static live discovery", () => {
     const seed = providerConfigSeed(entry!);
+    expect(seed.adapter).toBe("mimo-free");
     expect(seed.keyOptional).toBe(true);
     expect(seed.liveModels).toBe(false);
   });
 
-  test("is included in the key-login map", () => {
+  test("is excluded from the key-login map", () => {
     const keyMap = deriveKeyLoginMap();
-    expect(keyMap["mimo-free"]).toBeDefined();
+    expect(keyMap["mimo-free"]).toBeUndefined();
   });
 
-  test("is in the featured provider list", () => {
-    expect(deriveFeaturedProviderIds()).toContain("mimo-free");
+  test("is excluded from the featured list and the add-provider presets", () => {
+    expect(deriveFeaturedProviderIds()).not.toContain("mimo-free");
+    expect(deriveProviderPresets().find(preset => preset.id === "mimo-free")).toBeUndefined();
   });
 
-  test("provider note mentions no key needed", () => {
-    expect(entry?.note?.toLowerCase()).toContain("no key needed");
+  test("provider note explains the deprecation and the upstream failure", () => {
+    expect(entry?.note?.toLowerCase()).toContain("deprecated");
+    expect(entry?.note?.toLowerCase()).toContain("unsupported model");
   });
 });
 
@@ -270,16 +274,77 @@ describe("mimo-free JWT cache", () => {
     }
   });
 
-  test("bootstrap propagates the caller abort signal into fetch", async () => {
+  test("an already-aborted caller rejects without starting a bootstrap", async () => {
     const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response(JSON.stringify({ jwt: "x.y.z" }), { status: 200 })) as unknown as typeof fetch;
+    try {
+      await expect(getMimoJwt(AbortSignal.abort())).rejects.toThrow(/aborted/i);
+      expect((globalThis.fetch as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetMimoJwtCache();
+    }
+  });
+
+  test("one waiter aborting does not cancel the bootstrap another waiter shares", async () => {
+    const fakeJwt = "h." + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64") + ".s";
+    const originalFetch = globalThis.fetch;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
     globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
-      if (init?.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
-      return new Response(JSON.stringify({ jwt: "x.y.z" }), { status: 200 });
+      // Behave like fetch: a signal abort rejects the in-flight request.
+      await new Promise<void>((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")), { once: true });
+        void gate.then(resolve);
+      });
+      return new Response(JSON.stringify({ jwt: fakeJwt }), { status: 200 });
     }) as unknown as typeof fetch;
     try {
-      const aborted = AbortSignal.abort();
-      await expect(getMimoJwt(aborted)).rejects.toThrow(/aborted/i);
+      const first = new AbortController();
+      const second = new AbortController();
+      const a = getMimoJwt(first.signal);
+      const b = getMimoJwt(second.signal);
+      first.abort();
+      await expect(a).rejects.toThrow(/aborted/i);
+      release();
+      expect(await b).toBe(fakeJwt);
+      expect(await getMimoJwt()).toBe(fakeJwt);
+      expect((globalThis.fetch as ReturnType<typeof mock>).mock.calls.length).toBe(1);
     } finally {
+      globalThis.fetch = originalFetch;
+      resetMimoJwtCache();
+    }
+  });
+
+  test("a bootstrap that fails after every waiter left is handled and the next call starts over", async () => {
+    const fakeJwt = "h." + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64") + ".s";
+    const originalFetch = globalThis.fetch;
+    let fail!: () => void;
+    const gate = new Promise<void>(resolve => { fail = resolve; });
+    let calls = 0;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    globalThis.fetch = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await gate;
+        return new Response("down", { status: 503 });
+      }
+      return new Response(JSON.stringify({ jwt: fakeJwt }), { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      const only = new AbortController();
+      const waiter = getMimoJwt(only.signal);
+      only.abort();
+      await expect(waiter).rejects.toThrow(/aborted/i);
+      fail();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(unhandled).toEqual([]);
+      expect(await getMimoJwt()).toBe(fakeJwt);
+      expect(calls).toBe(2);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
       globalThis.fetch = originalFetch;
       resetMimoJwtCache();
     }
@@ -462,13 +527,40 @@ describe("mimo-free adapter request building", () => {
   });
 });
 
+describe("mimo-free request cancellation", () => {
+  beforeEach(() => {
+    resetMimoJwtCache();
+  });
+
+  test("buildRequest stops waiting for the first bootstrap when the request is aborted", async () => {
+    const originalFetch = globalThis.fetch;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    globalThis.fetch = mock(async () => {
+      await gate;
+      return new Response(JSON.stringify({ jwt: "late.jwt.token" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      const adapter = createMimoFreeAdapter(providerConfigSeed(PROVIDER_REGISTRY.find(e => e.id === "mimo-free")!));
+      const controller = new AbortController();
+      const pending = adapter.buildRequest(minimalRequest(), { abortSignal: controller.signal });
+      const settled = pending.then(() => "resolved", () => "rejected");
+      controller.abort();
+      const outcome = await Promise.race([settled, new Promise(resolve => setTimeout(() => resolve("still waiting"), 50))]);
+      expect(outcome).toBe("rejected");
+      // Only the shared bootstrap ran; no inference request was built or sent.
+      expect((globalThis.fetch as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    } finally {
+      release();
+      globalThis.fetch = originalFetch;
+      resetMimoJwtCache();
+    }
+  });
+});
+
 describe("mimo-free GUI preset", () => {
-  test("deriveProviderPresets exposes keyOptional for picker", () => {
-    const { deriveProviderPresets } = require("../../src/providers/derive");
+  test("deprecated provider is hidden from the picker", () => {
     const presets = deriveProviderPresets();
-    const preset = presets.find((p: { id: string }) => p.id === "mimo-free");
-    expect(preset).toBeDefined();
-    expect(preset.keyOptional).toBe(true);
-    expect(preset.note).toMatch(/no key needed/i);
+    expect(presets.find((p: { id: string }) => p.id === "mimo-free")).toBeUndefined();
   });
 });

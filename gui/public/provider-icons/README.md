@@ -14,6 +14,9 @@ Export-client marks (used by the API tab's connect rows, not the provider list):
 
 - `cline-color.svg` — reuses the existing provider mark already tracked in this directory
   for Cline CLI; no new image was imported for the file integration.
+- `commandcode-color.svg` — reuses the Command Code provider mark already tracked in this
+  directory (the ⌘ mark in brand purple `#8C4EDD`, added in `b143984642`) for the Command
+  Code client integration; no new image was imported.
 
 - `pi.svg` — fetched 2026-08-02 from `https://pi.dev/favicon.svg`, the Pi
   project's own favicon, unmodified. Pi is `earendil-works/pi`
@@ -380,3 +383,39 @@ committing it.
   `b60df52303ba7170772b256c20c04940`), gradient id and all. The contributor works
   at Crusoe and confirms this is the company mark. Painted as an image: the
   gradient is the brand, so it must never be masked.
+
+- `factory-droid.svg` — Factory Docs favicon, fetched 2026-09-28 from `https://docs.factory.ai/favicon.svg`; unmodified first-party asset for Factory Droid.
+
+## TokenLab (2026-09-29)
+
+- `tokenlab.svg` — TokenLab's "Specimen Split" symbol, `logos/tokenlab-symbol.svg` from the
+  sponsor asset pack TokenLab supplied for its Standard sponsorship (`SPONSORS.md`), committed
+  byte for byte (416 bytes, MD5 `fcb8c1325a34ed52b1dc89eabf08a0e6`), `<title>`/`<desc>` included
+  since they do not affect rendering. `viewBox="0 0 48 48"`, one `#151714` ink, so it is
+  **masked** like `packycode.svg`: as an image it vanishes on the dark tile. The pack's reverse
+  symbol (`#F5F5F1`) is the same geometry and is not needed once the mark follows the theme.
+
+## OpenGateway (2026-10-02)
+
+- `opengateway.svg` — OpenGateway's header logo, `https://opengateway.ai/logo.svg` (the asset the
+  site's own header renders), committed byte for byte (860 bytes, MD5 `b510e841406d8bcb24fb4ad584f128fd`). `viewBox="0 0 1140 650"`
+  (1.75:1, inside the 2.5 lockup limit), pure geometry (`rect`/`path`), drawn in `currentColor`, so it
+  is **masked**: as an image `currentColor` resolves to black and vanishes on the dark tile. The site
+  favicon `https://opengateway.ai/icon.svg` was rejected: its "OG" is a `<text>` glyph.
+
+## WorkBuddy AI (2026-10-22)
+
+- `workbuddy-color.svg` — unchanged SVG from the international WorkBuddy site's
+  declared favicon (`https://www.workbuddy.ai/`):
+  `https://download.codebuddy.ai/web/workbuddy/2365138d79c29bb1cbce4644f5cbbffd2b561a5c/assets/logo.svg`.
+  The 40×40 artwork retains its green background, gradients and white mark;
+  render it as an image in either theme. Used to identify the `workbuddy-ai`
+  provider, with the same asset embedded by the native tray.
+## T3 Code (2026-10-22)
+
+- `t3code.svg` — `assets/prod/logo.svg` from `pingdotgg/t3code` (MIT, © T3 Tools Inc.), the
+  production app icon the project ships, read at commit `f054d1b8` and committed byte for byte
+  (1048 bytes, MD5 `a2254eaba3e380cbc0b0101301cb5c9f`). `viewBox="0 0 128 128"`, a black rounded
+  plate carrying a white "T3" glyph. **Not masked:** two neutral inks on an opaque plate, the
+  plated case `qoder.svg` and `omo.svg` already record, so masking would fill the tile and
+  discard the glyph. As an image it reads on both surfaces.

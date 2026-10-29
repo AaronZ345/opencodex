@@ -1,14 +1,26 @@
+import { protectGlmSummaryBudget } from "./summary-budget";
 import { openAIChatTransport, stripBracketedModelSuffix } from "./wire";
 import type { AdapterRequest } from "../base";
 import { frameAgentRouterMessages } from "../agentrouter";
+import { applyExplicitChatDeveloperRole } from "./developer-role";
 import { openRouterProviderPayload, resolveOpenRouterRouting } from "../../providers/openrouter-routing";
 import { resolveVercelGatewayRouting, vercelGatewayProviderPayload } from "../../providers/vercel-gateway-routing";
 import { fastPolicyForModel } from "../../providers/service-tier";
+import { applyGithubCopilotContextTier } from "../../providers/github-copilot-context";
 import { canonicalFastTierMarker, decideTier, type ResolvedFastPolicy } from "../../providers/fastwire";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { isDebugEnabled } from "../../lib/debug-settings";
-import { modelRecordValue } from "../../reasoning-effort";
 import { modelInList, type OcxProviderConfig } from "../../types";
+import { mapReasoningEffort, modelRecordValue } from "../../reasoning-effort";
+import { resolveReasoningCapabilities } from "../../providers/reasoning-capabilities";
+import { chatParallelToolCallsWireValue } from "./parallel-tool-calls";
+import { applyExplicitChatReasoningWirePolicy, declaresIndependentChatReasoningControls } from "./reasoning-wire";
+import { declaresThinkingToggleWire, reasoningControlsAreUnsupported } from "../reasoning-controls";
+import { planNativeChatReasoningReplay } from "./reasoning-replay";
+import type { OcxReasoningReplayScopeRef } from "../../types";
+import { jsonUtf8Bytes } from "../../lib/json-byte-size";
+import { isTranslatorBudgetExceededError, TRANSLATOR_MAX_TURN_BYTES, TranslatorBudgetExceededError,
+  type TranslatorBudget } from "../../lib/translator-budget";
 
 const CHAT_PASSTHROUGH_FIELDS = [
   "audio",
@@ -49,20 +61,67 @@ export function buildOpenAIChatPassthroughRequest(
   stream: boolean,
   fastPolicy: ResolvedFastPolicy = fastPolicyForModel(provider, modelId, undefined, "chat"),
   fastMode?: boolean,
+  providerName?: string,
+  replayScope?: OcxReasoningReplayScopeRef,
+  maxSerializedBytes = TRANSLATOR_MAX_TURN_BYTES,
+  translatorBudget?: TranslatorBudget,
 ): AdapterRequest {
   const { url, headers, hasCredential } = openAIChatTransport(provider);
 
   const body: Record<string, unknown> = {
     model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(modelId) : modelId,
-    messages: frameAgentRouterMessages(provider.baseUrl, rawBody.messages),
+    // The caller's messages retain their wire shape. An operator who
+    // recorded that this destination rejects the `developer` role gets that role converted in
+    // place. Verbatim was not neutral there — it sent the role anyway and the turn failed
+    // upstream with a 400 before the model saw it. An unrecorded destination is still verbatim,
+    // and the conversion changes the role of those messages and nothing else, so the position
+    // of every message and every other field survive unchanged. Missing thinking history is
+    // repaired below using the same preserve policy as the translated Chat builder.
+    messages: applyExplicitChatDeveloperRole(
+      frameAgentRouterMessages(provider.baseUrl, rawBody.messages),
+      provider,
+    ),
     stream,
   };
   for (const field of CHAT_PASSTHROUGH_FIELDS) {
     if (rawBody[field] !== undefined) body[field] = rawBody[field];
   }
+  const replayPlan = planNativeChatReasoningReplay(body.messages, provider, modelId, replayScope,
+    Array.isArray(rawBody.tools) && rawBody.tools.length > 0, maxSerializedBytes);
+  if (protectGlmSummaryBudget(body, provider.baseUrl, body.reasoning_effort)) body.reasoning_effort = "low";
+  const toggleWire = declaresThinkingToggleWire(provider, modelId);
+  const independentControls = declaresIndependentChatReasoningControls(provider, modelId);
   const rawEfforts = modelRecordValue(provider.modelReasoningEfforts, modelId) ?? provider.reasoningEfforts;
-  if (modelInList(provider.noReasoningModels, modelId) || rawEfforts?.length === 0) {
+  const reasoningDisabled = modelInList(provider.noReasoningModels, modelId)
+    || (!toggleWire && rawEfforts?.length === 0) || reasoningControlsAreUnsupported(provider, modelId);
+  if (reasoningDisabled) {
     delete body.reasoning_effort;
+  }
+  const hasTools = Array.isArray(rawBody.tools) && rawBody.tools.length > 0;
+  const requestedEffort = typeof body.reasoning_effort === "string" ? body.reasoning_effort : undefined;
+  const explicitThinkingEnabled = rawBody.reasoning !== null && typeof rawBody.reasoning === "object"
+    && typeof (rawBody.reasoning as { enabled?: unknown }).enabled === "boolean"
+    ? (rawBody.reasoning as { enabled: boolean }).enabled
+    : undefined;
+  const explicitReasoning = applyExplicitChatReasoningWirePolicy({
+    provider,
+    modelId,
+    hasTools,
+    thinkingEnabled: explicitThinkingEnabled,
+    requestedEffort,
+    wireEffort: toggleWire && independentControls ? mapReasoningEffort(provider, modelId, requestedEffort) : requestedEffort,
+    reasoningDisabled,
+    body,
+  });
+  let reasoningLog = explicitReasoning.handled ? explicitReasoning.reasoningLog : undefined;
+  // A native caller's own thinking object is already in the upstream wire shape. Forward it only
+  // on a provider-declared toggle wire, below an explicit reasoning.enabled but above a default.
+  if (!reasoningDisabled && toggleWire && independentControls
+    && resolveReasoningCapabilities(provider, modelId).supportsThinkingToggle !== false
+    && explicitThinkingEnabled === undefined
+    && rawBody.thinking !== undefined) {
+    body.thinking = rawBody.thinking;
+    reasoningLog = undefined;
   }
 
   const openRouterRouting = resolveOpenRouterRouting(provider, modelId);
@@ -72,6 +131,7 @@ export function buildOpenAIChatPassthroughRequest(
 
   if (modelInList(provider.noTemperatureModels, modelId)) delete body.temperature;
   if (modelInList(provider.noTopPModels, modelId)) delete body.top_p;
+  if (modelInList(provider.noStopModels, modelId)) delete body.stop;
   if (modelInList(provider.noPenaltyModels, modelId)) {
     delete body.presence_penalty;
     delete body.frequency_penalty;
@@ -107,13 +167,13 @@ export function buildOpenAIChatPassthroughRequest(
   if (provider.promptCacheKey && rawBody.prompt_cache_key !== undefined) {
     body.prompt_cache_key = rawBody.prompt_cache_key;
   }
-  if (Array.isArray(rawBody.tools) && rawBody.tools.length > 0) {
-    if (provider.parallelToolCalls === true) {
-      body.parallel_tool_calls = rawBody.parallel_tool_calls !== false;
-    } else if (provider.parallelToolCalls === false
-        && (provider.baseUrl === "https://integrate.api.nvidia.com/v1" || provider.pinParallelToolCallsFalse === true)) {
-      body.parallel_tool_calls = false;
-    }
+  if (hasTools) {
+    // Same three provider states as the translated path, and the same defect in the unset one:
+    // a caller's explicit false was dropped here too (#5211). The native route reads the bit off
+    // the raw request rather than the parsed options, since nothing projects this body.
+    const requested = typeof rawBody.parallel_tool_calls === "boolean" ? rawBody.parallel_tool_calls : undefined;
+    const parallelToolCalls = chatParallelToolCallsWireValue(provider, requested);
+    if (parallelToolCalls !== undefined) body.parallel_tool_calls = parallelToolCalls;
   }
   if (stream) {
     const callerOptions = rawBody.stream_options !== null
@@ -126,7 +186,33 @@ export function buildOpenAIChatPassthroughRequest(
     body.stream_options = rawBody.stream_options;
   }
 
-  const bodyJson = JSON.stringify(body);
+  const transformedBody = () => applyGithubCopilotContextTier(body, provider, modelId, providerName);
+  // The binding constraint is the final size base + net, so a shrinking replay may legitimately
+  // measure a base above the cap; only a base above max - net makes the result unserializable.
+  let baseBytes = 0;
+  try {
+    baseBytes = jsonUtf8Bytes(transformedBody(), maxSerializedBytes - replayPlan.serializedBytes);
+  } catch (error) {
+    if (isTranslatorBudgetExceededError(error)) {
+      throw new TranslatorBudgetExceededError("request_copies", maxSerializedBytes);
+    }
+    throw error;
+  }
+  if (replayPlan.serializedBytes > maxSerializedBytes - baseBytes) {
+    throw new TranslatorBudgetExceededError("request_copies", maxSerializedBytes);
+  }
+  const preSerialization = translatorBudget?.reserveTransient(baseBytes + replayPlan.serializedBytes, {
+    kind: "request_copies",
+  });
+  let bodyJson: string;
+  try {
+    if (replayPlan.hasChanges) {
+      body.messages = replayPlan.apply();
+    }
+    bodyJson = JSON.stringify(transformedBody());
+  } finally {
+    preSerialization?.release();
+  }
 
   if (isDebugEnabled()) {
     let host = "upstream";
@@ -142,5 +228,8 @@ export function buildOpenAIChatPassthroughRequest(
     });
   }
 
-  return { url, method: "POST", headers, body: bodyJson };
+  return {
+    url, method: "POST", headers, body: bodyJson,
+    ...(reasoningLog ? { reasoningLog } : {}),
+  };
 }

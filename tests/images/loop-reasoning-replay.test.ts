@@ -18,6 +18,11 @@ import { createTestTranslatorBudget } from "../helpers/translator-budget";
 const REASONING = "I need to inspect files before answering.";
 
 const PREV_HOME = process.env.OPENCODEX_HOME;
+// `mock.restore()` does not undo `mock.module`: Bun keeps both overrides below for every
+// file that runs after this one in the same process. Keep the real modules to put back,
+// and restore only the ones captured: a setup that failed partway must not install an empty module.
+let realProgressStream: Record<string, unknown> | undefined;
+let realFulfill: Record<string, unknown> | undefined;
 let runWithImageBridgeProduction: typeof import("../../src/images/loop")["runWithImageBridge"];
 let fulfillResult: import("../../src/images/types").ImageCallResult = {
   ok: true, model: "grok-imagine-image-quality", prompt: "a cat",
@@ -27,6 +32,8 @@ let fulfillResult: import("../../src/images/types").ImageCallResult = {
 beforeAll(async () => {
   process.env.OPENCODEX_HOME = join(tmpdir(), "ocx-test-" + randomUUID());
   mock.restore();
+  realProgressStream = { ...(await import("../../src/web-search/progress-stream")) };
+  realFulfill = { ...(await import("../../src/images/fulfill")) };
   mock.module("../../src/web-search/progress-stream", () => ({
     parseStreamWithProgress: async function* (_resp: Response, parse: (r: Response) => AsyncGenerator<AdapterEvent>, _opts: unknown) {
       for await (const e of parse(_resp)) yield e;
@@ -44,6 +51,8 @@ afterAll(() => {
   if (PREV_HOME === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = PREV_HOME;
   mock.restore();
+  if (realProgressStream) { const real = realProgressStream; mock.module("../../src/web-search/progress-stream", () => real); }
+  if (realFulfill) { const real = realFulfill; mock.module("../../src/images/fulfill", () => real); }
 });
 
 let streamQueue: AdapterEvent[][] = [];
@@ -136,4 +145,30 @@ describe("issue #950 — image-bridge synthetic tool round (raw reasoning)", () 
     expect(seenAssistants[0]!.map(p => p.type)).toEqual(["thinking", "toolCall"]);
     expect(seenAssistants[0]!.find(p => p.type === "thinking")).toMatchObject({ thinking: REASONING });
   });
+});
+
+
+test("signed progress preceding image generation remains thinking on the internal replay", async () => {
+  let replay: unknown;
+  const adapter: ProviderAdapter = { ...mockAdapter, buildRequest: async parsed => {
+    replay = parsed.context.messages.find(m => m.role === "assistant")?.content;
+    return { url: "https://test/v1/chat", method: "POST", headers: {}, body: "{}" };
+  } };
+  streamQueue = [[
+    { type: "thinking_delta", thinking: "" },
+    { type: "thinking_signature", signature: "ReasoningSignature123456==" },
+    { type: "text_delta", text: "Creating the requested image.", phase: "commentary", anthropicThinkingSignature: "ProgressSignature123456==" },
+    { type: "tool_call_start", id: "call_progress", name: "image_gen" },
+    { type: "tool_call_delta", arguments: '{"prompt":"a cat"}' },
+    { type: "tool_call_end" }, { type: "done" },
+  ], [{ type: "text_delta", text: "ready" }, { type: "done" }]];
+  const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan: imagePlan, maxRounds: 1 });
+  const sse = await response.text();
+  const frames = sse.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
+  expect(frames.filter(f => f.type === "response.output_text.delta" && f.delta === "Creating the requested image.")).toHaveLength(1);
+  expect(replay).toEqual([
+    { type: "thinking", thinking: "", signature: "ReasoningSignature123456==" },
+    { type: "thinking", thinking: "Creating the requested image.", signature: "ProgressSignature123456==" },
+    expect.objectContaining({ type: "toolCall", id: "call_progress" }),
+  ]);
 });

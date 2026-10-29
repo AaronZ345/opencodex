@@ -19,9 +19,13 @@ import {
   CYBER_POLICY_ERROR_CODE,
   isCyberPolicyCode,
   isCyberPolicyMessage,
+  isTerminalRefusalCode,
+  UNDECLARED_TOOL_CALL_ERROR_CODE,
 } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
+import { truncationReasonFor } from "../responses/truncated-stop-reason";
 import { createSseBlockBuffer, sseDataPayload } from "../server/sse-payload-rewrite";
+import { reasoningDetailEntriesForItem } from "./reasoning-details";
 
 function isRec(v: unknown): v is Rec {
   return !!v && typeof v === "object" && !Array.isArray(v);
@@ -31,7 +35,7 @@ function uuid(): string {
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-function completionId(): string {
+export function completionId(): string {
   return `chatcmpl-${uuid().slice(0, 24)}`;
 }
 
@@ -133,12 +137,12 @@ function streamErrorStatus(message: string): number {
   return 502;
 }
 
-function dataFrame(payload: Rec | "[DONE]"): string {
+export function dataFrame(payload: Rec | "[DONE]"): string {
   if (payload === "[DONE]") return "data: [DONE]\n\n";
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-function chunkBase(id: string, model: string, created: number): Rec {
+export function chunkBase(id: string, model: string, created: number): Rec {
   return {
     id,
     object: "chat.completion.chunk",
@@ -148,17 +152,119 @@ function chunkBase(id: string, model: string, created: number): Rec {
   };
 }
 
-function appendedUtf8Bytes(previous: string, previousBytes: number, fragment: string): number {
+export function appendedUtf8Bytes(previous: string, previousBytes: number, fragment: string): number {
   let nextBytes = previousBytes + Buffer.byteLength(fragment);
   const previousLast = previous.charCodeAt(previous.length - 1);
   const fragmentFirst = fragment.charCodeAt(0);
   if (previousLast >= 0xd800 && previousLast <= 0xdbff
     && fragmentFirst >= 0xdc00 && fragmentFirst <= 0xdfff) {
-    // Buffer.byteLength() replaces each isolated surrogate with three bytes, while the joined
-    // pair is one four-byte scalar. Preserve full-string sizing without re-encoding the prefix.
-    nextBytes -= 2;
+    // Buffer implementations disagree on the encoded size of an isolated surrogate. Measure
+    // the join delta so incremental accounting equals the completed scalar on every runtime.
+    const tail = previous[previous.length - 1]!;
+    const head = fragment[0]!;
+    nextBytes += Buffer.byteLength(tail + head) - Buffer.byteLength(tail) - Buffer.byteLength(head);
   }
   return nextBytes;
+}
+
+/** Details a streamed Chat failure carries into its error frame. */
+export interface ChatCompletionsStreamFailure {
+  code?: string | null;
+  type?: string;
+  status?: number;
+}
+
+/**
+ * The `data: {error}` payload a streamed Chat failure ends with, and whether it is one of the
+ * fixed, bounded failures that must be delivered even when the translation budget is exhausted.
+ * Provider text is redacted; the two fixed failures carry no provider text at all.
+ */
+export function chatCompletionsStreamErrorPayload(
+  message: string,
+  details?: ChatCompletionsStreamFailure,
+): { payload: Rec; bounded: boolean } {
+  const translatorOverflow = details?.code === "translation_buffer_limit";
+  const safeMessage = translatorOverflow ? "upstream translation buffer exceeded the safe limit"
+    : details?.code === "invalid_refusal" ? "upstream refusal representations are inconsistent"
+    : redactSecretString(message);
+  const statusHint = details?.status ?? streamErrorStatus(safeMessage);
+  const classified = classifyError(statusHint, details?.type ?? "upstream_error", safeMessage);
+  if (translatorOverflow) {
+    classified.code = "translation_buffer_limit";
+    // Provider-controlled overflow is an upstream failure on every path:
+    // streaming frame, collector, and defensive JSON agree on 502.
+    classified.type = "upstream_error";
+  } else if (details?.code === "invalid_refusal") {
+    classified.code = details.code;
+    classified.type = "upstream_error";
+  } else if (isCyberPolicyCode(details?.code) || classified.code === CYBER_POLICY_ERROR_CODE) {
+    classified.code = CYBER_POLICY_ERROR_CODE;
+    classified.type = cyberPolicyErrorType(details?.type);
+  } else if (details?.code === UNDECLARED_TOOL_CALL_ERROR_CODE) {
+    // The guard's deterministic refusal keeps its wire identity past classifyError's
+    // generic 5xx remap — same code the buffered Chat error and the SSE frame carry.
+    classified.code = UNDECLARED_TOOL_CALL_ERROR_CODE;
+  } else if (isTerminalRefusalCode(details?.code)) {
+    // A terminal refusal (e.g. `invalid_prompt` for a plan refusal on a later sidecar iteration)
+    // is a client error; its code survives so the client sees the refusal, not a server fault.
+    classified.code = details!.code!;
+  } else if (details?.code !== undefined && details.code !== null && !classified.code) {
+    classified.code = details.code;
+  }
+  return {
+    payload: {
+      error: {
+        message: classified.message,
+        type: classified.type,
+        param: null,
+        code: classified.code,
+      },
+    },
+    bounded: translatorOverflow || details?.code === "invalid_refusal",
+  };
+}
+
+/** How a Responses `response.failed` error object becomes a streamed Chat failure. */
+export function chatCompletionsFailedResponse(error: Rec): { message: string; details: ChatCompletionsStreamFailure } {
+  const message = typeof error.message === "string" ? error.message : "upstream request failed";
+  const code = typeof error.code === "string" ? error.code : null;
+  const type = typeof error.type === "string" ? error.type : undefined;
+  return {
+    message,
+    details: {
+      code,
+      ...(code === "translation_buffer_limit"
+        ? { status: 502, type: "upstream_error" }
+        // A terminal refusal code is a 400-class verdict; inferring status from its wording
+        // turned a permanent refusal into a retryable 502.
+        : { type, ...(isTerminalRefusalCode(code) ? { status: 400 } : {}) }),
+    },
+  };
+}
+
+/**
+ * A Responses incomplete reason as the Chat client sees it: a truthful early finish for an
+ * output cap or a content filter, and a failure for every other reason (stall, adapter EOF,
+ * proxy-synthesized incompletes), which must never look like a clean stop.
+ */
+export function chatCompletionsIncompleteOutcome(
+  reason: unknown,
+  message: unknown,
+): { finishReason: "length" | "content_filter" } | { failMessage: string } {
+  // Upstream Responses endpoints do not all use OpenAI's `max_output_tokens`: Volcengine Ark
+  // (Coding Plan `/responses`) sends `incomplete_details.reason: "length"` for a hit output cap.
+  // Read the reason through the shared truncation vocabulary so such a turn ends with
+  // finish_reason "length" instead of a 502. Proxy reasons (adapter_eof, upstream_stall_timeout,
+  // missing_terminal_event) are not in that vocabulary and still fail.
+  const truncation = typeof reason === "string" ? truncationReasonFor(reason) : undefined;
+  if (truncation === "max_output_tokens") return { finishReason: "length" };
+  if (truncation === "content_filter") return { finishReason: "content_filter" };
+  const why = typeof reason === "string" ? reason : "unknown";
+  return {
+    failMessage: typeof message === "string" && message.length > 0
+      ? message
+      : `upstream stream ended early (${why})`,
+  };
 }
 
 function refusalTranslationError(): ChatCompletionsStreamError {
@@ -420,6 +526,17 @@ export function responsesSseToChatCompletionsSse(
         frame.choices = [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }];
         emit(frame);
       };
+      // #7429: provider-issued thinking state, one complete frame per finished reasoning item.
+      let nextReasoningDetailIndex = 0;
+      const emitReasoningDetails = (item: Rec) => {
+        const entries = reasoningDetailEntriesForItem(item, nextReasoningDetailIndex, translatorBudget);
+        if (entries.length === 0) return;
+        nextReasoningDetailIndex += entries.length;
+        ensureRole();
+        const frame = chunkBase(id, model, created);
+        frame.choices = [{ index: 0, delta: { reasoning_details: entries }, finish_reason: null }];
+        emit(frame);
+      };
       const resolveFinalArguments = (candidate: unknown, streamed: string) => {
         if (typeof candidate !== "string") return streamed;
         // Some compatible providers send an empty final snapshot. Do not let that erase
@@ -506,38 +623,12 @@ export function responsesSseToChatCompletionsSse(
         // Deliver the error frame then close the stream abnormally (no [DONE]).
         // Do not controller.error() — that can drop already-enqueued bytes from consumers
         // like response.text().
-        const translatorOverflow = details?.code === "translation_buffer_limit";
-        const safeMessage = translatorOverflow ? "upstream translation buffer exceeded the safe limit"
-          : details?.code === "invalid_refusal" ? "upstream refusal representations are inconsistent"
-          : redactSecretString(message);
-        const statusHint = details?.status ?? streamErrorStatus(safeMessage);
-        const classified = classifyError(statusHint, details?.type ?? "upstream_error", safeMessage);
-        if (translatorOverflow) {
-          classified.code = "translation_buffer_limit";
-          // Provider-controlled overflow is an upstream failure on every path:
-          // streaming frame, collector, and defensive JSON agree on 502.
-          classified.type = "upstream_error";
-        } else if (details?.code === "invalid_refusal") {
-          classified.code = details.code;
-          classified.type = "upstream_error";
-        } else if (isCyberPolicyCode(details?.code) || classified.code === CYBER_POLICY_ERROR_CODE) {
-          classified.code = CYBER_POLICY_ERROR_CODE;
-          classified.type = cyberPolicyErrorType(details?.type);
-        } else if (details?.code !== undefined && details.code !== null && !classified.code) {
-          classified.code = details.code;
-        }
+        const { payload, bounded } = chatCompletionsStreamErrorPayload(message, details);
         try {
-          const frame = encoder.encode(dataFrame({
-            error: {
-              message: classified.message,
-              type: classified.type,
-              param: null,
-              code: classified.code,
-            },
-          }));
+          const frame = encoder.encode(dataFrame(payload));
           // These fixed, bounded failures must survive even when decoder-owned input
           // still fills the budget. They contain no provider text or IDs.
-          if (translatorOverflow || details?.code === "invalid_refusal") controller.enqueue(frame);
+          if (bounded) controller.enqueue(frame);
           else enqueueLiveFrame(frame);
           emittedFrames++;
         } catch {
@@ -552,8 +643,16 @@ export function responsesSseToChatCompletionsSse(
         }
         switch (eventName) {
           case "response.created":
+            ensureRole();
+            break;
           case "response.heartbeat":
             ensureRole();
+            // A typed Responses heartbeat carries transport liveness, not Chat content. Preserve
+            // that signal as an SSE comment so idle-sensitive Chat clients receive bytes without
+            // inventing a semantic chunk that parsers, usage counters, or progress watchdogs could
+            // mistake for model output.
+            enqueueLiveFrame(encoder.encode(": opencodex heartbeat\n\n"));
+            emittedFrames++;
             break;
           case "response.output_text.delta": {
             if (typeof data.delta === "string") emitContent(data.delta);
@@ -644,6 +743,7 @@ export function responsesSseToChatCompletionsSse(
               && refusalItems.has(data.output_index)) {
               refusalItem(data.output_index, data, "item_id");
             }
+            if (item.type === "reasoning") emitReasoningDetails(item);
             if (item.type === "function_call") {
               sawToolUse = true;
               const callId = typeof item.call_id === "string" ? item.call_id : "";
@@ -680,37 +780,23 @@ export function responsesSseToChatCompletionsSse(
           case "response.incomplete": {
             const response = isRec(data.response) ? data.response : {};
             const details = isRec(response.incomplete_details) ? response.incomplete_details : {};
-            const reason = details.reason === "max_output_tokens" ? "length"
-              : details.reason === "content_filter" ? "content_filter"
-              : undefined;
-            if (reason !== undefined) {
+            const outcome = chatCompletionsIncompleteOutcome(details.reason, details.message);
+            if ("finishReason" in outcome) {
               // Truthful OpenAI-compatible finish reasons: the turn ended, just early.
               snapshotRefusals(response);
-              finish(reason, response.usage);
+              finish(outcome.finishReason, response.usage);
             } else {
               // upstream_stall_timeout / adapter_eof / proxy-synthesized incompletes are
               // failures, not early finishes: emit an error frame and close WITHOUT
               // [DONE] instead of a success-looking stop/tool_calls + [DONE].
-              const why = typeof details.reason === "string" ? details.reason : "unknown";
-              const message = typeof details.message === "string" && details.message.length > 0
-                ? details.message
-                : `upstream stream ended early (${why})`;
-              fail(message);
+              fail(outcome.failMessage);
             }
             break;
           }
           case "response.failed": {
             const response = isRec(data.response) ? data.response : {};
-            const error = isRec(response.error) ? response.error : {};
-            const message = typeof error.message === "string" ? error.message : "upstream request failed";
-            const code = typeof error.code === "string" ? error.code : null;
-            const type = typeof error.type === "string" ? error.type : undefined;
-            fail(message, {
-              code,
-              ...(code === "translation_buffer_limit"
-                ? { status: 502, type: "upstream_error" }
-                : { type, ...(code === CYBER_POLICY_ERROR_CODE ? { status: 400 } : {}) }),
-            });
+            const failure = chatCompletionsFailedResponse(isRec(response.error) ? response.error : {});
+            fail(failure.message, failure.details);
             break;
           }
           default:
@@ -799,8 +885,8 @@ export function responsesJsonToChatCompletion(json: unknown, model: string, tran
   const incomplete = isRec(body.incomplete_details) ? body.incomplete_details : {};
   let incompleteFinish: "length" | "content_filter" | undefined;
   if (body.status === "incomplete") {
-    if (incomplete.reason === "max_output_tokens") incompleteFinish = "length";
-    else if (incomplete.reason === "content_filter") incompleteFinish = "content_filter";
+    const outcome = chatCompletionsIncompleteOutcome(incomplete.reason, undefined);
+    if ("finishReason" in outcome) incompleteFinish = outcome.finishReason;
     else throw new ChatCompletionsStreamError("upstream response ended without a supported completion boundary", {
       code: "upstream_incomplete", type: "upstream_error",
     });
@@ -813,6 +899,7 @@ export function responsesJsonToChatCompletion(json: unknown, model: string, tran
   let contentBytes = 0;
   let reasoningBytes = 0;
   const toolCalls: Rec[] = [];
+  const reasoningDetails: Rec[] = [];
   const append = (previous: string, previousBytes: number, fragment: string): { text: string; bytes: number } => {
     if (!fragment) return { text: previous, bytes: previousBytes };
     const scope = { kind: "retained_collectors" as const };
@@ -843,6 +930,11 @@ export function responsesJsonToChatCompletion(json: unknown, model: string, tran
         }
       }
     } else if (raw.type === "reasoning") {
+      const entries = reasoningDetailEntriesForItem(raw, reasoningDetails.length, translatorBudget);
+      if (entries.length > 0) {
+        translatorBudget?.chargeRetained(Buffer.byteLength(JSON.stringify(entries)), { kind: "retained_collectors" });
+        reasoningDetails.push(...entries);
+      }
       if (Array.isArray(raw.summary)) {
         for (const part of raw.summary) {
           if (isRec(part) && part.type === "summary_text" && typeof part.text === "string") {
@@ -889,6 +981,7 @@ export function responsesJsonToChatCompletion(json: unknown, model: string, tran
     refusal,
   };
   if (reasoning) message.reasoning_content = reasoning;
+  if (reasoningDetails.length > 0) message.reasoning_details = reasoningDetails;
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
 
   return {
@@ -922,7 +1015,8 @@ export async function collectChatCompletion(
   let content = "";
   let refusal: string | null = null;
   let reasoning = "";
-  const retainedBytes = { content: 0, refusal: 0, reasoning: 0 };
+  const reasoningDetails: Rec[] = [];
+  const retainedBytes = { content: 0, refusal: 0, reasoning: 0, reasoningDetails: 0 };
   const toolCalls = new Map<number, { id: string; name: string; arguments: string; argumentBytes: number }>();
   // Per-call budget scopes (2 MiB/call enforced by the budget): the map key is the
   // wire index, which is stable across deltas and present before the call id.
@@ -946,8 +1040,8 @@ export async function collectChatCompletion(
     }
   };
   const releaseCollectors = () => {
-    translatorBudget.releaseRetained(retainedBytes.content + retainedBytes.refusal + retainedBytes.reasoning,
-      { kind: "retained_collectors" });
+    translatorBudget.releaseRetained(retainedBytes.content + retainedBytes.refusal + retainedBytes.reasoning
+      + retainedBytes.reasoningDetails, { kind: "retained_collectors" });
   };
   try {
     // Share native relay framing, while retaining the collector's existing admission
@@ -972,7 +1066,7 @@ export async function collectChatCompletion(
           const code = typeof parsed.error.code === "string" ? parsed.error.code : null;
           const status = code === "translation_buffer_limit"
             ? 502
-            : code === CYBER_POLICY_ERROR_CODE || isCyberPolicyMessage(message)
+            : isTerminalRefusalCode(code) || isCyberPolicyMessage(message)
               ? 400
               : streamErrorStatus(message);
           const streamError = new ChatCompletionsStreamError(message, {
@@ -996,6 +1090,16 @@ export async function collectChatCompletion(
           refusal = appendRetained("refusal", refusal ?? "", delta.refusal);
         }
         if (typeof delta.reasoning_content === "string") reasoning = appendRetained("reasoning", reasoning, delta.reasoning_content);
+        // Each entry arrives complete in one frame (#7429), so the fold is a concatenation.
+        if (Array.isArray(delta.reasoning_details)) {
+          for (const entry of delta.reasoning_details) {
+            if (!isRec(entry)) continue;
+            const entryBytes = Buffer.byteLength(JSON.stringify(entry));
+            translatorBudget.chargeRetained(entryBytes, { kind: "retained_collectors" });
+            retainedBytes.reasoningDetails += entryBytes;
+            reasoningDetails.push(entry);
+          }
+        }
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
             if (!isRec(tc)) continue;
@@ -1062,6 +1166,7 @@ export async function collectChatCompletion(
     refusal,
   };
   if (reasoning) message.reasoning_content = reasoning;
+  if (reasoningDetails.length > 0) message.reasoning_details = reasoningDetails;
   if (toolCalls.size > 0) {
     // Final owner transfer is itself a charging operation: if it overflows,
     // release every copy already charged in this loop and close every scope

@@ -30,6 +30,7 @@ export interface ResponsesTerminalRepairPolicy {
 
 export type ProviderModelDiscoveryScalar = string | number | boolean;
 
+/** Path segment `*` projects at most 256 array elements; containsAny/All match projected scalars exactly. */
 export type ProviderModelDiscoveryPredicate =
   | {
       path: readonly string[];
@@ -62,6 +63,8 @@ export interface ProviderModelDiscoveryFilter {
 }
 
 interface ProviderModelDiscoverySharedSpec {
+  /** Product-config envelope used by WorkBuddy AI instead of an OpenAI model list. */
+  format?: "workbuddy";
   /** Query parameters applied to the resolved discovery URL. */
   query?: Readonly<Record<string, string>>;
   /** Top-level response key containing model rows; defaults to `data`. */
@@ -70,6 +73,8 @@ interface ProviderModelDiscoverySharedSpec {
   idField?: string;
   /** Declarative eligibility rules evaluated against each untrusted model row. */
   filter?: ProviderModelDiscoveryFilter;
+  /** Stable partition: admitted original rows matching ANY predicate precede other rows. Registry-only. */
+  preferFirst?: readonly ProviderModelDiscoveryPredicate[];
   /** Optional lower byte ceiling; the process-wide hard ceiling still wins. */
   maxResponseBytes?: number;
   /** Optional lower raw-row ceiling; the process-wide hard ceiling still wins. */
@@ -112,6 +117,12 @@ export interface ProviderRegistryEntry {
   apiKeyTransport?: OcxProviderConfig["apiKeyTransport"];
   alias?: string;
   authKind: ProviderAuthKind;
+  /**
+   * Credential preset for an auxiliary service rather than a model transport.
+   * Its adapter is an identity marker and is intentionally absent from the
+   * routable adapter registry.
+   */
+  credentialOnly?: boolean;
   codexAccountMode?: CodexAccountMode;
   /** OAuth preset may explicitly honor a persisted API-key billing mode. */
   allowKeyAuthOverride?: boolean;
@@ -151,6 +162,14 @@ export interface ProviderRegistryEntry {
    */
   sponsor?: { tier: "main" | "standard"; url: string };
   dashboardPreset?: boolean;
+  /**
+   * The upstream route or service this entry depends on is gone. Deprecated entries stay in the
+   * registry so saved providers keep resolving and a pinned adapter keeps loading, but they are
+   * excluded from the add-provider picker, the init menu, the featured list, and new key logins.
+   * The value is the operator-facing reason; it is registry-only and never seeded into saved
+   * config.
+   */
+  deprecated?: string;
   note?: string;
   dashboardUrl?: string;
   defaultModel?: string;
@@ -204,7 +223,7 @@ export interface ProviderRegistryEntry {
    */
   chatCompletionsPath?: string;
   /**
-   * Endpoints this entry used to live at, kept so a saved custom provider that still points
+   * Canonical or historical endpoints, kept so a saved custom provider that still points
    * at one keeps receiving this row's metadata through `registryEntryForProviderDestination`.
    * Destination matching is by adapter plus normalized base URL, so moving a row's wire or
    * prefix would otherwise orphan every config a user wrote against the old address.
@@ -258,12 +277,21 @@ export interface ProviderRegistryEntry {
   /** Provider-specific copy for the Codex catalog's Fast tier. */
   fastTierDescription?: string;
   /**
+   * The Fast lane is billed beyond the plan, so it stays off until the operator sets
+   * `providers.<name>.fastEnabled: true` (see `providerFastSwitchOff`).
+   */
+  fastOptIn?: boolean;
+  /**
    * Registry-only destination guard for `modelSupportsServiceTier`. This scopes vendor evidence
    * without changing provider ownership, routing, authentication, or config validation.
    */
   modelServiceTierCapabilityBaseUrlGuard?: (baseUrl: string) => boolean;
   /** Registry default for plaintext reasoning replay; see `OcxProviderConfig.preserveResponsesReasoningContent`. Registry-only like `supportsServiceTier`. */
   preserveResponsesReasoningContent?: boolean;
+  /** Registry default for preserving input item IDs; see `OcxProviderConfig.preserveResponsesInputItemIds`. */
+  preserveResponsesInputItemIds?: boolean;
+  /** Registry default for preserving per-item chat metadata; see `OcxProviderConfig.preserveResponsesMessageMetadata`. */
+  preserveResponsesMessageMetadata?: boolean;
   /** Registry default for dropping replayed reasoning items for Responses upstreams that reject them. */
   dropResponsesReasoningItems?: boolean;
   /** Registry defaults for per-model Codex reasoning propagation; explicit user keys win during enrichment. */
@@ -290,6 +318,15 @@ export interface ProviderRegistryEntry {
    */
   modelDisplayNames?: Record<string, string>;
   modelInputModalities?: Record<string, string[]>;
+  /**
+   * Provider-wide input modalities for every model `modelInputModalities` does not enumerate,
+   * including ids that arrive from live discovery. Declare it where the limit belongs to the
+   * provider's API rather than to one model; a per-model entry still wins over it. Registry-only
+   * and runtime-only: never seeded or enriched into saved config, and applied only while a provider
+   * points at this entry's destination (routed provider, vision eligibility).
+   */
+  inputModalities?: string[];
+  modelCapabilities?: OcxProviderConfig["modelCapabilities"];
   defaultMaxOutputTokens?: number;
   modelMaxOutputTokens?: Record<string, number>;
   reasoningEfforts?: string[];
@@ -308,6 +345,7 @@ export interface ProviderRegistryEntry {
   noReasoningModels?: string[];
   noTemperatureModels?: string[];
   noTopPModels?: string[];
+  noStopModels?: string[];
   noPenaltyModels?: string[];
   /**
    * Registry-only seed for `OcxProviderConfig.noJsonSchemaModels`. Merged into the
@@ -315,6 +353,8 @@ export interface ProviderRegistryEntry {
    * `directReasoningEffortModels` above is registry-owned.
    */
   noJsonSchemaModels?: string[];
+  /** Exact models with no established structured-output wire format. Registry-owned at routing. */
+  noStructuredOutputModels?: string[];
   /** Opt this provider into parallel tool calls (see OcxProviderConfig.parallelToolCalls). */
   parallelToolCalls?: boolean;
   /** Opt this provider into forwarding prompt_cache_key (OpenAI-specific; strict backends reject it). */
@@ -327,6 +367,12 @@ export interface ProviderRegistryEntry {
   chatServiceTier?: boolean;
   /** OpenAI Chat EOF policy for gateways that omit terminal frames after complete tool calls. */
   openaiChatEofTolerance?: boolean;
+  /**
+   * Record that this destination rejects the Chat `developer` role (`400 role 'developer' is not
+   * allowed`), so both the translated route and the native `/v1/chat/completions` passthrough send
+   * `system` instead. Seeds `foldDeveloperRoleToSystem` on the provider config; a user value wins.
+   */
+  foldDeveloperRoleToSystem?: boolean;
   autoToolChoiceOnlyModels?: string[];
   preserveReasoningContentModels?: string[];
   requiresReasoningPlaceholderModels?: string[];
@@ -335,11 +381,15 @@ export interface ProviderRegistryEntry {
    */
   showThinkingSummary?: boolean;
   reasoningSplitModels?: string[];
+  /** See OcxProviderConfig.inlineThinkTagModels. */
+  inlineThinkTagModels?: string[];
   reasoningDetailsModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];
   escapeBuiltinToolNames?: boolean;
   oauthId?: string;
+  /** OAuth implementation family; instance identity remains the exact id/oauthId. */
+  oauthFamily?: "anthropic";
   virtualModels?: Record<string, { wireModelId: string; reasoningMode: "pro" }>;
   modelMaxInputTokens?: Record<string, number>;
   jawcodeBundle?: string;
@@ -352,12 +402,13 @@ export interface ProviderRegistryEntry {
 
 export type ProviderConfigSeed = Pick<
   OcxProviderConfig,
+  "anthropicOAuthInstance" |
   "adapter" | "baseUrl" | "apiKeyTransport" | "responsesPath" | "chatCompletionsPath" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
   | "liveModels" | "contextWindow" | "modelContextWindows" | "modelInputModalities"
-  | "modelDisplayNames"
+  | "modelDisplayNames" | "modelCapabilities"
   | "modelMaxInputTokens" | "defaultMaxOutputTokens" | "modelMaxOutputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap" | "reasoningWireFormat"
-  | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noPenaltyModels"
-  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance" | "showThinkingSummary"
+  | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noStopModels" | "noPenaltyModels"
+  | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "requiresReasoningPlaceholderModels" | "reasoningSplitModels" | "inlineThinkTagModels" | "reasoningDetailsModels" | "thinkingToggleModels" | "thinkingBudgetModels" | "escapeBuiltinToolNames" | "openaiChatEofTolerance" | "foldDeveloperRoleToSystem" | "showThinkingSummary"
   | "googleMode" | "project" | "location" | "headers"
 >;

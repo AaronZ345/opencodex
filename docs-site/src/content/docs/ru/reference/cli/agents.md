@@ -17,7 +17,16 @@ surface mode, delegation, effort и fallback, описано в
 
 ```bash
 ocx agent subagents set ark/model-a,openai/gpt-5.5
+ocx agent sidecar web --enabled off
 ```
+
+`--enabled off` — тот же переключатель, что и строка **Выкл. (Off)** в дашборде: OpenCodex
+перестаёт запускать сайдкар, а интеграция Codex записывает `web_search = "disabled"` в
+`~/.codex/config.toml`, что и позволяет использовать MCP-сервер как единственный путь поиска.
+`--enabled on` снова удаляет эту строку. Когда сохранение действительно переключает
+состояние, команда сообщает о записи на стороне Codex (`codexWebSearch` в `--json`,
+иначе завершающая строка `Codex config:`) и предлагает `ocx sync`, если запись не
+удалась. Флаг работает и для `vision`.
 
 ### `ocx v2 <status|on|off|mode <v1|default|v2>|threads <n>>`
 
@@ -100,12 +109,15 @@ ocx debug usage logs [-f|--follow]
 
 ### `ocx access <key|endpoints|models|test> ...`
 
-Управляйте admission API-key'ами OpenCodex и проверяйте внешние endpoint'ы и модели.
-`ocx api-key <list|create|remove> ...` — alias `ocx access key`.
+Просматривайте список API-ключей доступа к OpenCodex, внешние конечные точки и модели. `ocx api-key` — псевдоним семейства команд `ocx access key`.
+
+Создание ключа и начало ротации возвращают секрет в открытом виде, показываемый только один раз, как в текстовом формате, так и в JSON. Агент должен передать эти действия человеку, который выполнит их вручную в терминале вне сеанса агента. Не запрашивайте сам ключ в чате: нужны только подтверждение настройки и проверки подключения, а также несекретные идентификаторы ключа и ротации.
 
 ```bash
-ocx access key create deployment
+ocx access key list --json
 ```
+
+Подтверждение работы нового ключа не является разрешением отозвать старый. Для завершения ротации или удаления старого ключа требуется отдельное явное разрешение на отзыв именно этого ключа. После разрешённой операции снова проверьте список. Не обходите этот порядок прямым вызовом API.
 
 ## Интеграции клиентов
 
@@ -139,6 +151,39 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 `--hybrid` и `--discovery-only` для apply по-прежнему поддерживаются. Для настроек Claude Code
 используйте `ocx claude config <status|set> ...`.
 
+### `ocx codex [codex args...]`
+
+Ключ передаётся только когда конфигурация и её пространства имён защищены от изменения другими субъектами; текущий пользователь и привилегированные субъекты ОС считаются доверенными. Процессы того же пользователя доверенные: субъект с вашими правами записи уже может прочитать ваш файл ключа OpenCodex. Замена конфигурации тем же пользователем между проверкой и нативным запуском находится вне этой модели угроз; конфигурация при передаче управления не фиксируется.
+
+При обычной установке Windows права ProgramData по умолчанию позволяют другим пользователям создавать каталоги. Поэтому автоматические учётные данные не передаются даже при отсутствии `ProgramData\OpenAI\Codex`. Папка системной конфигурации Codex в ProgramData должна существовать и быть доступна для записи только Administrators/SYSTEM; родительские каталоги должны быть защищены от замены другими пользователями. Попросите администратора проверить политику каталогов. opencodex никогда не меняет ACL самостоятельно и не предоставляет команду подготовки.
+
+Вместо этого можно передать ключ самостоятельно, например экспортировав `OPENCODEX_API_AUTH_TOKEN`; `ocx codex` оставляет его значение без изменений. Существующие системные файлы конфигурации по-прежнему блокируют автоматические учётные данные и требуют отдельной проверки. Для каждой причины отказа выводится одна короткая конкретная строка stderr без значений ключей, содержимого или путей файлов ключей.
+
+Перед подсказкой из одного слова укажите `--`, чтобы исключить выбор неизвестной подкоманды Codex.
+
+Пространство машинной конфигурации должно запрещать другим пользователям создание отсутствующих системных файлов. Непроверенный Windows ProgramData/OpenAI/Codex запрещает передачу токена; каталог не создаётся. macOS допускает ACL только с запретами и разрешения только на чтение. Любое разрешение записи, добавления, удаления, изменения атрибутов, безопасности или владельца блокирует передачу даже после запрещающей записи. Неизвестные теги и ошибки проверки также блокируют её.
+
+Новый служебный токен читается только если argv входит в список ниже, нет непустых переменных прокси HTTP(S)/ALL или переопределений `CODEX_*`/`OPENAI_*`/`AZURE_OPENAI_*` (канонический `CODEX_HOME` разрешён), а пространства home/config/system проходят проверку владельца. Нужны только проверенные ключи и точный управляемый loopback-провайдер, без дополнительных потребителей учётных данных и слоёв конфигурации. Любой аргумент вне списка, включая `-c`/`--config`, `-p`/`--profile`, неизвестные флаги и `resume`/`fork`, блокирует токен с диагностикой без значений; явные учётные данные и исходные аргументы сохраняются.
+
+Канонический каталог и `config.toml` должны принадлежать текущему пользователю. POSIX запрещает запись group/other; Windows проверяет SID владельца и запрещает запись DACL всем, кроме текущего пользователя, SYSTEM и Administrators. Проверяются права замены родительских путей. На macOS также не должно быть принудительных настроек Codex. Эти проверки не изолируют вредоносный процесс того же пользователя или администратора.
+
+| Allowlist | Flags |
+| --- | --- |
+| Switches | `--no-daemon`, `--json`, `--ephemeral`, `--skip-git-repo-check`, `--no-alt-screen`, `--full-auto`, `--dangerously-bypass-approvals-and-sandbox`, `--search` |
+| One value | `--model`/`-m`, `--sandbox`/`-s`, `--ask-for-approval`/`-a`, `--image`/`-i` |
+
+
+
+При автоматическом чтении учётных данных `CODEX_HOME` трактуется как буквальный путь, включая `~` и пробелы. После проверки дочерний процесс получает тот же канонический абсолютный путь. Недоступный каталог отключает чтение. Любое непустое значение `HTTP_PROXY`, `HTTPS_PROXY` или `ALL_PROXY` без учёта регистра также отключает чтение независимо от `NO_PROXY`; отклонённые запуски и экспортированные пользователем учётные данные не меняются. При передаче нового токена в обе переменные дочернего процесса `NO_PROXY` и `no_proxy` добавляются `127.0.0.1` и `::1` с сохранением прежних исключений. Включение `features.respect_system_proxy` или передача `--enable`/`--disable` отключает автоматическое чтение.
+
+Лаунчер пытается запустить прокси и передаёт Codex исходные аргументы, не переписывая конфигурацию. Нативные маршруты и чужие шлюзы пропускают запуск прокси. Неизвестный маршрут предупреждает и пытается запустить прокси; неудача предупреждает и продолжает выполнение. Справка, версия и внутренние команды `login`, `doctor`, `help` пропускают запуск и автоматическое чтение токена.
+
+Отсутствующий `OPENCODEX_API_AUTH_TOKEN` читается из `service-api-token` этой установки только при полном совпадении транспортной конфигурации выбранного provider с управляемым блоком для настроенного loopback-слушателя или сохранённого локального клиентского подключения. Имя и комментарии не дают разрешения. Неизвестные или удалённые адреса, profile по умолчанию, конфигурация проекта, `OPENAI_BASE_URL` и переданные `-c`/`--config`, `-p`/`--profile`, `-C`/`--cd`, `--remote` отключают автоматическое чтение. Экспортированные пользователем учётные данные и аргументы сохраняются; подмена файла токена и совпадения с административными токенами отклоняются.
+
+Только совпавшая (`matched`) обёртка autostart запускает свой базовый Codex напрямую. Неизвестное состояние, включая исключение проверки, требует проверенного обхода; управляемая CMD-обёртка Windows должна полностью совпадать с текущим шаблоном для запуска с `OCX_SHIM_BYPASS=1`. Обычные npm-лаунчеры поддерживаются. Непроверяемая или устаревшая обёртка отклоняется с кодом 1 без запуска Codex; обновите её через `ocx codex-shim install`. Запуск не исправляет shim; проверка содержимого не доказывает происхождение базового файла Windows и не предотвращает одновременную замену пути.
+
+Справка лаунчера: `ocx help codex`; справка Codex: `ocx codex --help`. Последующий обычный запуск `codex` сохраняет прежнее поведение.
+
 ### `ocx opencode [opencode args...]`
 
 Убедиться, что прокси запущен, и затем запустить opencode со сгенерированными блоками
@@ -154,7 +199,7 @@ override, но файлы на диске никогда не меняются. 
 
 ## Экспорт client config
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo|cline|kilo|commandcode|droid>`
 
 Печатает client config, направленный на работающий прокси. Команда сериализует блок
 провайдера `opencodex` в нативном формате выбранного клиента: base URL, список моделей и,
@@ -165,7 +210,7 @@ override, но файлы на диске никогда не меняются. 
 
 | Флаг | Действие |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo>` | Обязателен. Выбирает формат конфигурации клиента. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo\|cline\|kilo\|commandcode\|droid>` | Обязателен. Выбирает формат конфигурации клиента. |
 | `--json` | Печатать только JSON-конфиг в stdout, чтобы redirect сохранял побайтно точный вывод. Вся диагностика, включая заметку о записи через `--out`, идёт в stderr. |
 | `--out <path>` | Записать конфиг в `<path>`. Перезаписывать существующий файл не позволит. |
 | `--force` | Разрешить `--out` заменить существующий файл. |
@@ -198,6 +243,11 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | `aside` | `~/.aside/u/<account>/models.json` для аккаунта, который `accounts.json` самого Aside называет текущим; нечитаемый манифест отклоняется, а не подменяется произвольным аккаунтом | `aside-models.json` | нет — loopback placeholder |
 | `raycast` | `~/.config/raycast/ai/providers.yaml` одинаково на macOS и Windows (Raycast не учитывает `XDG_CONFIG_HOME`) | `raycast-providers.yaml` | нет — только loopback, запись `api_keys` не создаётся |
 | `omo` | `~/.omo/agent/models.json` (`OMO_CODING_AGENT_DIR`, затем `SENPI_CODING_AGENT_DIR`, затем `PI_CODING_AGENT_DIR` имеют приоритет в этом порядке, если заданы; относительное значение отклоняется) | `omo-models.json` | нет — loopback placeholder |
+| `kilo` | первый существующий файл среди `kilo.jsonc`, `kilo.json`, `opencode.jsonc`, `opencode.json` или `config.json` в `~/.config/kilo` (`XDG_CONFIG_HOME` переносит каталог); если ни одного нет, используется `kilo.jsonc` | `kilo.jsonc` | `OPENCODEX_KILO_API_KEY` |
+| `commandcode` | `~/.commandcode/providers.json` (в Windows при использовании домашнего каталога по умолчанию: использовать `HOME ?? USERPROFILE`, только если значение не пустое, не состоит из пробелов и является абсолютным путём Windows, иначе `homedir()`; отдельно переданный домашний каталог сохраняется; добавить `.commandcode\providers.json`) | `providers.json` | только loopback; `apiKey: false`; переменная окружения не нужна |
+| `droid` | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` on Windows) | `factory-settings.json` | только loopback; переменная окружения не нужна |
+
+Эти пути указаны по умолчанию. Абсолютный `dataBaseDir` в `~/.zcode/v2/setting.json`, который всегда остаётся в домашнем каталоге по умолчанию, переносит хранилище в `<dataBaseDir>/.zcode/v2/provider_config.json`. `ZCODE_DATA_DIR` задаёт сам корень `.zcode` и имеет приоритет над настройкой; `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` имеет приоритет для файла провайдеров. Нечитаемая, некорректная или относительная настройка блокирует новое применение и обновление. Существующие записи владения и восстановления сохраняются. См. [правила путей и восстановления на английском](https://opencodex.me/guides/integrations/#zcode-314-and-later).
 
 Экспорт для Raycast — это отдельный документ `providers.yaml` с одним элементом `id: opencodex` в
 последовательности `providers`: `name: OpenCodex`, базовый URL прокси с `/v1` и каждая маршрутизируемая
@@ -223,12 +273,11 @@ MCP-записи.
 :::
 
 Никакой ключ никогда не сериализуется. Сгенерированные конфиги несут либо документированную
-env-reference, либо несекретную loopback-заглушку. Loopback-прокси (`127.0.0.1`, по умолчанию) вообще не
-требует admission key. Если прокси слушает не на loopback, задайте соответствующую переменную
+env-reference, либо несекретную loopback-заглушку. Адрес loopback (`127.0.0.1`) сам по себе не означает доступ без ключа: проверьте политику и endpoint. CLI-команды модели/аудио с выбранным ключом требуют явного ввода и на loopback. Если прокси слушает не на loopback, задайте соответствующую переменную
 `OPENCODEX_OPENCODE_API_KEY`, `OPENCODEX_HERMES_API_KEY` или `OPENCODEX_OPENCLAW_API_KEY`.
 Интеграция gjc использует несекретное локальное значение и не требует переменной окружения. Она поддерживает только loopback и не настраивает учётные данные удалённого доступа.
 Как выдаются admission key, описано в
-[Удалённом доступе](/reference/configuration/#remote-access). Ключи upstream-провайдеров — это совсем
+[Удалённом доступе](/ru/reference/configuration/server/#удалённый-доступ). Ключи upstream-провайдеров — это совсем
 отдельная история и настраиваются в [Провайдерах](/guides/providers/).
 
 Тот же payload отдаётся через `GET /api/client-config` и показывается на вкладке API в дашборде,
@@ -240,7 +289,9 @@ env-reference, либо несекретную loopback-заглушку. Loopba
 
 Управляйте headless runtime-setting'ами, startup, sync, diagnostics и update.
 
-`ocx system codex-restart --yes` перезапускает Codex app-server'ы и полностью закрывает и заново запускает Desktop-приложение Codex тем же модулем, что и `ocx sync --restart-codex`. Если сам proxy запущен внутри приложения Codex, команда отказывается с actionable-сообщением вместо handoff, который она не может завершить.
+`ocx system codex-restart --yes` перезапускает Codex app-server'ы тем же модулем, что и `ocx sync --restart-codex`. Desktop-приложение Codex полностью закрывается и запускается заново, если оно было запущено до записи текущего каталога моделей или этот запрос изменил привязку `model_catalog_json`, потому что выбор модели строится при запуске. Иначе приложение остаётся открытым, само перезапускает свой app-server и сохраняет неотправленные черновики и ожидающие подтверждения. Если состояние приложения или каталога прочитать нельзя, выполняется полный перезапуск. Если сам proxy запущен внутри приложения Codex, перезапуск Desktop отказывается с actionable-сообщением вместо handoff, который он не может завершить.
+
+Изменение привязки `model_catalog_json` этим запросом также вызывает перезапуск Desktop, даже если процесс оболочки запущен после записи файла каталога.
 
 ```bash
 ocx system settings --stream-mode eager-relay
@@ -252,7 +303,7 @@ ocx system settings --stream-mode eager-relay
 ocx system codex-cli-update check --json
 ```
 
-`check` не обращается к реестру пакетов и в строго ограниченном объёме проверяет данные о происхождении настроенного кандидата, включая замаскированный путь к исполняемому файлу и подтверждения его принадлежности. Доверенный контекст опубликованного средства запуска подтверждает только подлинность снимка данных о кандидате, но не факт успешного запуска Codex. Поскольку команда выполняет только такую проверку и никогда не запускает Codex, кандидаты из окружения и сохранённых данных отображаются только в отчёте (`managed: false`, обычно `selection_unattested`). В выводе JSON присутствуют `candidateAvailable`, `candidateVersion`, `candidateSource` и `selectionAttested`, причём значение `selectionAttested` всегда равно `false`. Для проверки настроенного кандидата нужен доверенный контекст опубликованного средства запуска. При прямом запуске через Bun или из исходного кода такого подтверждения нет; в этом случае команда игнорирует кандидатов из окружения и сохранённых данных и может вернуть `candidate_unavailable` в POSIX-системах. В Windows этот первый этап вообще не выполняет файловый ввод-вывод по путям кандидата или конфигурации. Только абсолютный кандидат из окружения, зафиксированный доверенным средством запуска, может получить лексическую метку комплекта приложения или менеджера версий; все остальные кандидаты Windows отклоняются по принципу fail-closed. Поскольку этот этап вообще не читает сохранённое состояние выбора, запуск в Windows без захваченного кандидата из окружения возвращает `windows_inspection_deferred`, а не `candidate_unavailable`: команда не может определить, установлен ли Codex CLI, поэтому сообщает об отложенной проверке, а не утверждает, что кандидата нет. Команда не запускает Codex или менеджер пакетов, не восстанавливает shim, ничего не записывает в конфигурацию или кеш, не останавливает процессы и ничего не устанавливает. Кандидаты, входящие в комплект приложения, найденные в распознанных путях менеджеров версий, являющиеся непроверенными автономными установками или имеющие неоднозначное состояние shim, отображаются как `unmanaged` или `unknown` и никогда не классифицируются как `managed`.
+`check` не обращается к реестру и не запускает Codex. В POSIX `selectionAttested` может быть `true`, если разрешитель выбирает тот же канонический путь, что и кандидат окружения, зафиксированный опубликованным средством запуска. Связанный манифест npm-global может подтвердить `managed: true`, если он доказывает владение и, когда версия кандидата сообщается, она совпадает с версией манифеста; сохранённые кандидаты остаются неаттестованными. Windows x64 также поддерживает привязанный к доказательству абсолютный стандартный npm `codex.cmd` с цепочкой инструментов Node/npm — локальной для префикса при её наличии, иначе парой из захваченного PATH, привязанной к архитектуре средства запуска, — и проверенной внутрипрефиксной платформенной подложкой, используя удерживаемые дескрипторы, отклоняющие reparse. Остальные раскладки Windows остаются отложенными или неуправляемыми. Результат `managed` в Windows классифицирует только наблюдаемую раскладку установки: привязанные Node/npm — это цепочка инструментов метаданных средства обновления, доступная только для чтения, а не гарантия того, какой интерпретатор разрешит последующий вызов `codex.cmd`. Прямой запуск через Bun или исходный код не даёт доказательства средства запуска. `plan` обращается к официальному реестру с изолированными временными настройками, кешем и журналами npm, отказывая при активных сессиях или неполном наблюдении процессов. Он ничего не устанавливает и не посылает сигналы. Windows x64 apply требует ограниченного префикса npm с проверенным частным правом записи и сохраняет несвязанные пакеты и shim; неподдерживаемые наблюдаемые раскладки возвращают `applicable: false` и `refusal: windows_apply_disabled`; выбор только по PATH, обёртки автозапуска OpenCodex и откат к global/vendor остаются отложенными. См. [полное описание команд и причин отказа (англ.)](/reference/cli/agents/#read-only-codex-cli-update-plan).
 
 В Windows захваченная команда без полного пути, например `CODEX_CLI_PATH=codex`, удалённый путь или путь устройства возвращает `candidate_path_unavailable`. Кандидат захвачен, но его путь не подходит для этой проверки.
 
@@ -269,7 +320,37 @@ ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <abs
 
 Идентификатор или хеш описывает файлы в момент наблюдения, а не выдаёт постоянное разрешение на обновление. Он не доказывает выбранный runtime, прошлый установщик, действующую конфигурацию npm или подлинность инструментов. Указанный Node лишь наблюдается; выбор его запускателем не подтверждается. Команда не запускает цели, не обращается к реестру пакетов, не устанавливает ПО, не пишет конфигурацию и не управляет процессами. Существующий Windows `check` по-прежнему не выполняет файловый ввод-вывод кандидатов или конфигурации.
 
-### `ocx config <show|get|set|unset|validate|export|import> ...`
+### `ocx config [show|get|set|unset|validate|export|import] ...`
+
+`ocx config [show] [--json] [--source]` показывает локальную конфигурацию без запущенного прокси. `show` можно опустить при использовании любого из флагов или обоих в любом порядке. `--source` добавляет источник, ошибки и предупреждения диагностики и разрешён только при просмотре. `--json` может предшествовать явно указанному действию, не меняя его. Повторные флаги `--json` или `--source` и неизвестные аргументы отклоняются.
 
 Проверяйте и безопасно меняйте валидированную конфигурацию OpenCodex. `show` и `get`
 маскируют секреты. Импорт выполняет валидацию перед записью и требует `--yes`.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## Hermes / Command Code: model names
+
+Hermes and Command Code support `--model-names alias|routed` (API: `modelNames`).
+The default is `routed`, independent of `preferModelAliasIds`. A connection
+stores its mode; later Apply without the option preserves it. Alias mode uses
+only provider-qualified aliases that the router proves equivalent; missing,
+unsafe or colliding aliases fall back to routed keys. Combos keep their keys.
+Removed/renamed aliases migrate on the next successful managed refresh, with
+foreign-edit refusal. Named Hermes profiles need explicit Apply.
+
+`ocx export --client hermes --model-names alias --json` previews a current
+already loaded catalog without writing client files or managed state; a cold or
+stale catalog returns unavailable. Explicit `--out` writes an export artifact.
+See the [English integration guide](/guides/integrations/#opt-in-alias-model-names)
+for the canonical workflow.

@@ -1,0 +1,154 @@
+import { serviceApiTokenFingerprint } from "../../lib/service-secrets";
+import type { Server } from "bun";
+import type { OcxConfig } from "../../types";
+import {
+  createClaudeInterceptLifecycle,
+  type ClaudeInterceptLifecycle,
+} from "./claude-intercept-lifecycle";
+import {
+  createLinkListenerLifecycle,
+  linkListenerOwnsTarget,
+  linkRouteAllowed,
+  type LinkListenerDeps,
+  type LinkListenerLifecycle,
+  type LinkListenerStatus,
+} from "./link-listener";
+import { createLinkSupervisor, type LinkSupervisor } from "../../link/supervisor";
+import { flushLinkDiagnostics, recordLinkDiagnostic } from "../../link/diagnostics";
+import { linkManagementRouteAllowed } from "../../link/management-routes";
+import { linkChildParityRouteAllowed } from "../../link/child-parity";
+import { saveConfigPreservingClaudeCode } from "../../config/live-reconcile";
+import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
+import { startJevQuotaActivation } from "../../combos/jev-quota-activation";
+export { LINK_INGRESS_HOSTNAME } from "./link-listener";
+import type { ServerIngress } from "./serve-options";
+
+export interface OptionalListenerStartContext<T> {
+  startProxy?: typeof import("../../claude/intercept/connect-proxy").startConnectProxy;
+  config: OcxConfig;
+  publicPort: number;
+  requestedPort?: number;
+  maxRequestBodySize: number;
+  dispatch: (req: Request, server: Server<T>) => Promise<Response>;
+}
+
+export interface OptionalListenerSet<T> {
+  ensureClaudeIntercept(): ReturnType<ClaudeInterceptLifecycle<T>["ensure"]>;
+  claudeInterceptOutcome(): ReturnType<ClaudeInterceptLifecycle<T>["lastOutcome"]>;
+  ingressOf(server: Server<T>): ServerIngress | undefined;
+  linkRouteAllowed(url: URL, req: Request): boolean;
+  linkAdmissionKeyIds(): ReadonlySet<string>;
+  onAuthenticatedCatalog(listener: (apiKeyId: string) => void): () => void;
+  notifyAuthenticatedCatalog(apiKeyId: string): void;
+  peerObservation(linkId: string): import("../../link/peer-report").LinkPeerEntry;
+  status(): LinkListenerStatus;
+  linkStatus(): LinkListenerStatus;
+  linkSupervisor(): LinkSupervisor;
+  start(ctx: OptionalListenerStartContext<T>): void;
+  ensureStarted(): Promise<void>;
+  close(): Promise<void>;
+  registerSupervisorStop(stop: () => Promise<void>): () => void;
+  stop(): Promise<void>;
+}
+
+export function createOptionalListenerSet<T>(linkDeps: LinkListenerDeps = {}): OptionalListenerSet<T> {
+  const claudeIntercept: ClaudeInterceptLifecycle<T> = createClaudeInterceptLifecycle<T>();
+  const linkListener: LinkListenerLifecycle<T> = createLinkListenerLifecycle<T>(linkDeps);
+  let activeConfig: OcxConfig | undefined;
+  let stopJevQuotaActivation: (() => void) | undefined;
+  const supervisor = createLinkSupervisor({
+    // Tunnel state changes and their causes reach <configDir>/link/diagnostics.jsonl (bounded).
+    diagnostic: recordLinkDiagnostic,
+    flushDiagnostics: flushLinkDiagnostics,
+    apiKeys: () => activeConfig?.apiKeys ?? [],
+    revokeApiKey: id => {
+      if (!activeConfig) return false;
+      const before = activeConfig.apiKeys ?? [];
+      if (!before.some(key => key.id === id)) return false;
+      activeConfig.apiKeys = before.filter(key => key.id !== id);
+      try {
+        saveConfigPreservingClaudeCode(activeConfig);
+        reconcileLiveStateStores();
+      } catch (error) {
+        activeConfig.apiKeys = before;
+        throw error;
+      }
+      return true;
+    },
+  });
+  let unregisterSupervisorAdmission: (() => void) | undefined;
+  let supervisorStop: (() => Promise<void>) | undefined;
+
+  return {
+    ensureClaudeIntercept: () => claudeIntercept.ensure(),
+    claudeInterceptOutcome: () => claudeIntercept.lastOutcome(),
+    ingressOf(server) {
+      if (linkListener.ownsListener(server)) return "hub-link";
+      if (claudeIntercept.ownsListener(server)) return "claude-intercept";
+      return undefined;
+    },
+    // The Home's link listener admits the data plane plus the read-only management relay
+    // (#6957). The Child's own ingress keeps the data-only table, so a local caller on the Child
+    // cannot reach the Home's management reads without the Child's dashboard session. The one
+    // write is the Child's apply report (OCX-6), which changes only an in-memory status field.
+    linkRouteAllowed: (url, req) => linkRouteAllowed(url, req) || linkManagementRouteAllowed(url, req)
+      || linkChildParityRouteAllowed(url, req),
+    linkAdmissionKeyIds: () => linkListener.linkAdmissionKeyIds(),
+    onAuthenticatedCatalog: listener => linkListener.onAuthenticatedCatalog(listener),
+    notifyAuthenticatedCatalog: apiKeyId => linkListener.notifyAuthenticatedCatalog(apiKeyId),
+    peerObservation: linkId => linkListener.peerObservation(linkId),
+    status: () => linkListener.status(),
+    linkStatus: () => linkListener.status(),
+    linkSupervisor: () => supervisor,
+    start(ctx) {
+      activeConfig = ctx.config;
+      linkListener.start({ dispatch: ctx.dispatch, maxRequestBodySize: ctx.maxRequestBodySize,
+        connectionGeneration: linkId => supervisor.connectionGeneration?.(linkId),
+        keyFingerprints: apiKeyId => {
+          const entry = activeConfig?.apiKeys?.find(candidate => candidate.id === apiKeyId);
+          if (!entry?.key) return [];
+          const fingerprints = [serviceApiTokenFingerprint(entry.key)];
+          const pending = entry.pendingRotation;
+          if (pending && Date.parse(pending.expiresAt) > Date.now()) fingerprints.push(serviceApiTokenFingerprint(pending.key));
+          return fingerprints;
+        },
+      });
+      unregisterSupervisorAdmission ??= linkListener.onAuthenticatedCatalog(apiKeyId => supervisor.notifyAuthenticatedRequest?.(apiKeyId));
+      if (linkListenerOwnsTarget(linkListener.status())) {
+        supervisor.start();
+      }
+      supervisorStop = () => supervisor.stop();
+      claudeIntercept.start({
+        startProxy: ctx.startProxy,
+        config: ctx.config,
+        publicPort: ctx.publicPort,
+        requestedPort: ctx.requestedPort,
+        maxRequestBodySize: ctx.maxRequestBodySize,
+        dispatch: ctx.dispatch,
+      });
+      // Last, after every listener started: JEV advisory quota follows the live config while serving.
+      stopJevQuotaActivation = startJevQuotaActivation(ctx.config);
+    },
+    ensureStarted: () => linkListener.ensureStarted(),
+    close: () => linkListener.close(),
+    registerSupervisorStop(stop) {
+      supervisorStop = stop;
+      return () => {
+        if (supervisorStop === stop) supervisorStop = undefined;
+      };
+    },
+    async stop() {
+      let failure: unknown;
+      if (supervisorStop) {
+        try { await supervisorStop(); } catch (error) { failure = error; }
+      }
+      try { await linkListener.stop(); } catch (error) { failure ??= error; }
+      try { await claudeIntercept.stop(); } catch (error) { failure ??= error; }
+      unregisterSupervisorAdmission?.();
+      unregisterSupervisorAdmission = undefined;
+      stopJevQuotaActivation?.();
+      stopJevQuotaActivation = undefined;
+      if (failure) throw failure;
+    },
+  };
+}

@@ -301,6 +301,9 @@ describe("fetchProviderAccountQuotas", () => {
           expires_in: 3600,
         }), { status: 200 });
       }
+      // A refresh also reads the account profile for its subscription plan (#6935); that is
+      // not a usage probe, so it must not be counted as one.
+      if (url.includes("/api/oauth/profile")) return new Response("{}", { status: 404 });
       const auth = new Headers(init?.headers).get("authorization") ?? "";
       if (auth.endsWith("token-bg-fresh")) {
         usageForBg += 1;
@@ -342,10 +345,13 @@ describe("fetchProviderAccountQuotas", () => {
     let releaseUsage!: () => void;
     const usageGate = new Promise<void>(resolve => { releaseUsage = resolve; });
     let usageCalls = 0;
+    let usageStarted!: () => void;
+    const usageEntered = new Promise<void>(resolve => { usageStarted = resolve; });
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       const auth = new Headers(init?.headers).get("authorization") ?? "";
       if (auth.endsWith("token-first")) {
         usageCalls += 1;
+        usageStarted();
         await usageGate;
         return new Response(usageBody(70, 15), { status: 200 });
       }
@@ -365,9 +371,14 @@ describe("fetchProviderAccountQuotas", () => {
     };
     const reportPromise = fetchProviderQuotaReports(config, true);
     // Switch active mid-flight before Anthropic responds.
-    await setActiveAccount("anthropic", second!.id);
-    releaseUsage();
-    await reportPromise;
+    try {
+      await usageEntered;
+      await setActiveAccount("anthropic", second!.id);
+    } finally { releaseUsage(); }
+    const switchedReport = await reportPromise;
+    expect(switchedReport.reports).toEqual([]);
+    expect(getCachedProviderAccountQuota("anthropic", first!.id)?.fiveHourPercent).toBe(70);
+    expect(getCachedProviderAccountQuota("anthropic", second!.id)).toBeNull();
 
     // First account still owns token-first — seed must land on first, not second.
     clearProviderQuotaCache();
@@ -727,7 +738,7 @@ describe("google-antigravity per-account quota (#1082)", () => {
     const byId = Object.fromEntries(rows.map(row => [row.accountId, row]));
     const [idA, idB] = [idFor("a@example.com"), idFor("b@example.com")];
     expect(Object.keys(byId).sort()).toEqual([idA, idB].sort());
-    const windows = (id: string) => byId[id]!.quota!.customWindows!.map(w => `${w.label}=${w.percent}`);
+    const windows = (id: string) => byId[id]!.quota!.customWindows!.filter(w => w.modelId === undefined).map(w => `${w.label}=${w.percent}`);
     expect(windows(idA)).toEqual(["Gem=14", "Gem (Weekly)=14", "Cla=62", "Cla (Weekly)=62"]);
     expect(windows(idB)).toEqual(["Gem=3", "Gem (Weekly)=3", "Cla=9", "Cla (Weekly)=9"]);
     expect(byId[idA]!.quota!.customWindows![0]!.resetAt).toBeDefined();
@@ -761,7 +772,7 @@ describe("google-antigravity per-account quota (#1082)", () => {
     const rows = await fetchProviderAccountQuotas("google-antigravity");
     const byId = Object.fromEntries(rows.map(row => [row.accountId, row]));
     const [idA, idB] = [idFor("a@example.com"), idFor("b@example.com")];
-    const windows = (id: string) => byId[id]!.quota!.customWindows!.map(w => `${w.label}=${w.percent}`);
+    const windows = (id: string) => byId[id]!.quota!.customWindows!.filter(w => w.modelId === undefined).map(w => `${w.label}=${w.percent}`);
     expect(windows(idA)).toEqual(["Gem=14", "Cla=62"]);
     expect(windows(idB)).toEqual(["Gem=3", "Cla=9"]);
     expect(byId[idA]!.quota!.customWindows![0]!.resetAt).toBeDefined();
@@ -806,8 +817,8 @@ describe("google-antigravity per-account quota (#1082)", () => {
         expect(posted.filter(row => row.auth === auth)).toEqual(urls.map(url => ({ url, auth, project, address: "198.18.56.214", tls: true, signal: true })));
       }
       const byId = Object.fromEntries(rows.map(row => [row.accountId, row]));
-      expect(byId[idFor("a@example.com")]?.quota?.customWindows?.map(w => w.percent)).toEqual(fallback ? [14, 62] : [14, 14, 62, 62]);
-      expect(byId[idFor("b@example.com")]?.quota?.customWindows?.map(w => w.percent)).toEqual(fallback ? [3, 9] : [3, 3, 9, 9]);
+      expect(byId[idFor("a@example.com")]?.quota?.customWindows?.filter(w => w.modelId === undefined).map(w => w.percent)).toEqual(fallback ? [14, 62] : [14, 14, 62, 62]);
+      expect(byId[idFor("b@example.com")]?.quota?.customWindows?.filter(w => w.modelId === undefined).map(w => w.percent)).toEqual(fallback ? [3, 9] : [3, 3, 9, 9]);
       expect(plainFetchCalls).toBe(0);
     });
   }
@@ -885,7 +896,79 @@ describe("google-antigravity per-account quota (#1082)", () => {
     expect(cached.quotaFailure).toBe("access_denied");
     await saveCredential("google-antigravity", { ...credential, access: "agy-third" });
     expect(cached.quotaFailureIsCurrent?.()).toBe(false);
-    expect((await fetchProviderAccountQuotas("google-antigravity"))[0]).not.toHaveProperty("quotaFailure");
+    expect((await fetchProviderAccountQuotas("google-antigravity"))[0]).toHaveProperty("quotaFailure", "access_denied");
+  });
+
+  test("same-id credential and project replacement invalidates cached model quota measurements", async () => {
+    const credential = { access: "agy-model-first", refresh: "r1", expires: Date.now() + 3600_000, projectId: "proj-model-first", accountId: "agy-model", email: "model@example.com" };
+    await saveCredential("google-antigravity", credential);
+    setAntigravityAccountQuotaTransportForTests({
+      resolveAddresses: async () => ({ hostname: "daily-cloudcode-pa.googleapis.com", addresses: [{ address: "142.250.0.1", family: 4 }], privateNetwork: false }),
+      pinnedPost: async url => url.endsWith("retrieveUserQuotaSummary")
+        ? new Response(null, { status: 404 })
+        : new Response(JSON.stringify({ models: {
+            "gemini-3.8-flash-high": { quotaInfo: { remainingFraction: 0.76 } },
+          } }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+
+    const [row] = await fetchProviderAccountQuotas("google-antigravity", true);
+    const accountId = idFor("model@example.com");
+    expect(row?.quota?.customWindows).toContainEqual({
+      label: "gemini-3.8-flash-high", modelId: "gemini-3.8-flash-high", percent: 24,
+    });
+    expect(getCachedProviderAccountQuota("google-antigravity", accountId)?.customWindows)
+      .toContainEqual({ label: "gemini-3.8-flash-high", modelId: "gemini-3.8-flash-high", percent: 24 });
+
+    await saveCredential("google-antigravity", { ...credential, access: "agy-model-second", projectId: "proj-model-second" });
+    expect(getCachedProviderAccountQuota("google-antigravity", accountId)).toBeNull();
+  });
+
+  test.each(["unchanged", "grant", "project", "both"] as const)("paused model quota retains only current credential and project (%s)", async replacement => {
+    const { setAccountPaused } = await import("../../src/oauth/store");
+    const credential = { access: "paused-model-first", refresh: "paused-refresh", expires: Date.now() + 3600_000,
+      projectId: "paused-project-first", accountId: "paused-model-user", email: "paused-model@example.com" };
+    await saveCredential("google-antigravity", credential);
+    let posts = 0;
+    globalThis.fetch = (async () => { throw new Error("unexpected external quota transport"); }) as typeof fetch;
+    setAntigravityAccountQuotaTransportForTests({
+      resolveAddresses: async () => ({ hostname: "daily-cloudcode-pa.googleapis.com",
+        addresses: [{ address: "142.250.0.1", family: 4 }], privateNetwork: false }),
+      pinnedPost: async url => {
+        posts++;
+        return url.endsWith("retrieveUserQuotaSummary") ? new Response(null, { status: 404 })
+          : Response.json({ models: { "gemini-paused-model": { quotaInfo: { remainingFraction: 0.76 } } } });
+      },
+    });
+    const [seeded] = await fetchProviderAccountQuotas("google-antigravity", true);
+    const accountId = idFor("paused-model@example.com");
+    expect(seeded?.quota?.customWindows).toContainEqual({
+      label: "gemini-paused-model", modelId: "gemini-paused-model", percent: 24,
+    });
+    expect(posts).toBe(2);
+    if (replacement !== "unchanged") {
+      await saveCredential("google-antigravity", { ...credential,
+        ...(replacement !== "project" ? { access: "paused-model-second" } : {}),
+        ...(replacement !== "grant" ? { projectId: "paused-project-second" } : {}),
+      });
+      expect(idFor("paused-model@example.com")).toBe(accountId);
+    }
+    await setAccountPaused("google-antigravity", accountId, true);
+    const expected = replacement === "unchanged" ? seeded!.quota : null;
+    expect(getCachedProviderAccountQuota("google-antigravity", accountId)).toEqual(expected);
+    const [paused] = await fetchProviderAccountQuotas("google-antigravity", true);
+    expect(posts).toBe(2);
+    expect(paused?.quota).toEqual(expected);
+    if (replacement !== "unchanged") expect(paused?.unavailable).toBe(true);
+    else {
+      expect(paused?.unavailable).toBeUndefined();
+      expect(paused?.isCurrent?.()).toBe(true);
+      expect(Object.keys(paused!)).not.toContain("isCurrent");
+      // A sibling roster read may await before management projects this already-returned row.
+      await saveCredential("google-antigravity", { ...credential, access: "paused-model-later" });
+      expect(paused?.isCurrent?.()).toBe(false);
+      expect(getCachedProviderAccountQuota("google-antigravity", accountId)).toBeNull();
+      expect(posts).toBe(2);
+    }
   });
 
   test("NO_PROXY denial preserves an unavailable account row without sending its bearer", async () => {
@@ -926,7 +1009,7 @@ describe("google-antigravity per-account quota (#1082)", () => {
           },
         });
         expect(await fetchProviderAccountQuotas("google-antigravity")).toEqual([{ accountId: idFor("a@example.com"), quota: null, unavailable: true, quotaFailure: status < 400 ? "redirect_blocked" : "access_denied" }]);
-        expect(posted).toEqual(fallback ? [summaryUrl, modelsUrl] : [summaryUrl]);
+        expect(posted).toEqual(fallback ? [summaryUrl, modelsUrl] : status === 403 ? [summaryUrl, summaryUrl] : [summaryUrl]);
         expect(plainFetchCalls).toBe(0);
       });
     }
@@ -1057,7 +1140,7 @@ describe("google-antigravity Fake-IP TUN quota probes without HTTP proxy (#3781)
       expect(rows[0]!.accountId).toBe(idFor("a@example.com"));
       expect(rows[0]!.unavailable).toBeUndefined();
       expect(rows[0]!.quotaFailure).toBeUndefined();
-      expect(rows[0]!.quota?.customWindows?.map(w => `${w.label}=${w.percent}`)).toEqual(fallback ? ["Gem=14", "Cla=62"] : ["Gem=14", "Gem (Weekly)=14", "Cla=62", "Cla (Weekly)=62"]);
+      expect(rows[0]!.quota?.customWindows?.filter(w => w.modelId === undefined).map(w => `${w.label}=${w.percent}`)).toEqual(fallback ? ["Gem=14", "Cla=62"] : ["Gem=14", "Gem (Weekly)=14", "Cla=62", "Cla (Weekly)=62"]);
       expect(plainFetchCalls).toBe(0);
     });
   }
@@ -1110,4 +1193,70 @@ describe("google-antigravity Fake-IP TUN quota probes without HTTP proxy (#3781)
     expect(posted).toBe(0);
     expect(plainFetchCalls).toBe(0);
   });
+});
+
+describe("paused generic OAuth accounts are never quota-probed", () => {
+  const { setAntigravityAccountQuotaTransportForTests } = require("../../src/providers/quota") as typeof import("../../src/providers/quota");
+  const { setAccountPaused } = require("../../src/oauth/store") as typeof import("../../src/oauth/store");
+  const { getTokenForAccountQuotaProbe } = require("../../src/providers/quota/account-cache") as typeof import("../../src/providers/quota/account-cache");
+  const proxyKeys = PROXY_ENV_KEYS.flatMap(key => [key, key.toLowerCase()]);
+  const originalProxyEnv = Object.fromEntries(proxyKeys.map(key => [key, process.env[key]]));
+  beforeEach(() => { for (const key of proxyKeys) delete process.env[key]; });
+  afterEach(() => {
+    setAntigravityAccountQuotaTransportForTests(null);
+    for (const key of proxyKeys) {
+      if (originalProxyEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalProxyEnv[key];
+    }
+  });
+
+  test("a forced refresh probes only the unpaused account and keeps the paused row's last reading", async () => {
+    const expires = Date.now() + 60 * 60_000;
+    await saveCredential("google-antigravity", { access: "agy-live", refresh: "r1", expires, projectId: "proj-live", accountId: "agy-a", email: "live@example.com" });
+    await saveCredential("google-antigravity", { access: "agy-held", refresh: "r2", expires, projectId: "proj-held", accountId: "agy-b", email: "held@example.com" });
+    const heldId = getAccountSet("google-antigravity")!.accounts.find(a => a.credential.email === "held@example.com")!.id;
+    globalThis.fetch = (async () => { throw new Error("plain fetch must not be used for account bearers"); }) as typeof fetch;
+    const seen: string[] = [];
+    setAntigravityAccountQuotaTransportForTests({
+      resolveAddresses: async () => ({ hostname: "daily-cloudcode-pa.googleapis.com", addresses: [{ address: "142.250.0.1", family: 4 }], privateNetwork: false }),
+      pinnedPost: async (_url, _pinned, _body, _signal, requestOptions) => {
+        seen.push(new Headers(requestOptions?.headers).get("authorization") ?? "");
+        return new Response(JSON.stringify({ groups: [{ displayName: "Gemini Models", buckets: [
+          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.5, resetTime: "2026-09-02T12:00:00Z" },
+        ] }] }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+
+    await fetchProviderAccountQuotas("google-antigravity", true);
+    expect(seen.sort()).toEqual(["Bearer agy-held", "Bearer agy-live"]);
+    const heldBefore = getCachedProviderAccountQuota("google-antigravity", heldId);
+    expect(heldBefore).not.toBeNull();
+
+    await setAccountPaused("google-antigravity", heldId, true);
+    seen.length = 0;
+    const rows = await fetchProviderAccountQuotas("google-antigravity", true);
+    expect(seen).toEqual(["Bearer agy-live"]);
+    expect(rows.find(row => row.accountId === heldId)?.quota).toEqual(heldBefore);
+    await expect(getTokenForAccountQuotaProbe("google-antigravity", heldId)).rejects.toThrow("paused");
+  });
+});
+
+test("a paused Meta Muse account is never used to mint a quota key", async () => {
+  const { fetchMuseKeyQuota } = require("../../src/providers/quota/vendor-probes-oauth") as typeof import("../../src/providers/quota/vendor-probes-oauth");
+  const { resetMuseKeyQuotaBackoff } = require("../../src/providers/muse-key-quota") as typeof import("../../src/providers/muse-key-quota");
+  const { setAccountPaused } = require("../../src/oauth/store") as typeof import("../../src/oauth/store");
+  await saveCredential("meta-muse", { access: "muse-access", refresh: "muse-refresh", expires: Date.now() + 60 * 60_000,
+    email: "muse@example.com", muse: { oauthAccessToken: "meta-account-" + "z".repeat(48) } });
+  const id = getAccountSet("meta-muse")!.activeAccountId;
+  let mints = 0;
+  globalThis.fetch = (async () => { mints += 1; return new Response(JSON.stringify({}), { status: 200 }); }) as unknown as typeof fetch;
+  resetMuseKeyQuotaBackoff();
+  await fetchMuseKeyQuota("meta-muse");
+  expect(mints).toBe(1);
+
+  resetMuseKeyQuotaBackoff();
+  await setAccountPaused("meta-muse", id, true);
+  expect(await fetchMuseKeyQuota("meta-muse")).toBeNull();
+  expect(mints).toBe(1);
+  resetMuseKeyQuotaBackoff();
 });

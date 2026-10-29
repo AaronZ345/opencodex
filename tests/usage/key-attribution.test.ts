@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
-  addFinalRequestLog, beginRequestAttempt, finishRequestAttempt, noteProviderAttemptSend,
-  recordKeyAttemptFailure, recordKeyAttemptUsage, applyResponseLogMetadata,
+  addFinalRequestLog, aggregateAttemptUsage, beginRequestAttempt, finishRequestAttempt, noteProviderAttemptSend,
+  recordKeyAttemptFailure, recordKeyAttemptUsage, applyResponseLogMetadata, sealRequestAttemptIdentity,
   inspectResponseLogSsePayload, type RequestLogContext, type RequestLogEntry,
 } from "../../src/server/request-log";
 import { readFileSync } from "node:fs";
 import { repoPath } from "../helpers/repo-root";
 import { normalizeUsageEntryForTest } from "../../src/usage/log";
+import { formatAnthropicProviderForLog } from "../../src/oauth/anthropic-routing";
 
 describe("key attempt accounting", () => {
   test("a combo parent copied before streaming rotation cannot overwrite the final key's usage", () => {
@@ -16,14 +17,17 @@ describe("key attempt accounting", () => {
     const key = (reference: string) => ({ adapter: "openai-chat" as const, authMode: "key" as const,
       baseUrl: "https://example.test", _apiKeyAttempt: { reference } });
     noteProviderAttemptSend(child, "test", key("synthetic-a"), undefined);
-    recordKeyAttemptUsage(child, { inputTokens: 100, outputTokens: 10 });
+    recordKeyAttemptUsage(child, { inputTokens: 100, outputTokens: 10, providerCredits: 0.04 });
     const parent = { ...child };
     noteProviderAttemptSend(child, "test", key("synthetic-b"), undefined, "key-429");
-    recordKeyAttemptUsage(child, { inputTokens: 200, outputTokens: 20 });
+    recordKeyAttemptUsage(child, { inputTokens: 200, outputTokens: 20, providerCredits: 0.01 });
     const rows: RequestLogEntry[] = [];
     addFinalRequestLog("stream-key-switch", Date.now(), parent, 200, undefined, row => rows.push(row));
     expect(rows[0].attempts?.map(attempt => attempt.usage?.inputTokens)).toEqual([100, 200]);
-    expect(rows[0].usage).toMatchObject({ inputTokens: 300, outputTokens: 30 });
+    expect(rows[0].usage).toMatchObject({ inputTokens: 300, outputTokens: 30, providerCredits: 0.05 });
+    const persisted = normalizeUsageEntryForTest({ ...rows[0], timestamp: 1, durationMs: 1 });
+    expect(persisted.usage?.providerCredits).toBe(0.05);
+    expect(persisted.attempts?.map(attempt => attempt.usage?.providerCredits)).toEqual([0.04, 0.01]);
   });
 
   test("a reader takes the attempts or the request total, never both", () => {
@@ -106,6 +110,152 @@ describe("key attempt accounting", () => {
     expect(roundTrip.usage).toMatchObject({ inputTokens: 400, outputTokens: 60 });
     expect(JSON.stringify(roundTrip)).not.toContain("test-key-");
   });
+  test("a rotated non-combo request totals every physical attempt, not only the last", async () => {
+    const key = (reference: string) => ({ adapter: "openai-chat" as const, authMode: "key" as const,
+      baseUrl: "https://example.test/v1", _apiKeyAttempt: { reference } });
+    const active = beginRequestAttempt(1, "test-provider", "test-model", "openai-chat");
+    const ctx: RequestLogContext = { provider: "test-provider", model: "test-model",
+      activeAttempt: active, activeAttemptStartedAt: Date.now(), attempts: [active] };
+    noteProviderAttemptSend(ctx, "test-provider", key("test-key-a"), undefined);
+    await recordKeyAttemptFailure(ctx, Response.json({ usage: { prompt_tokens: 100, completion_tokens: 20 } }, { status: 429 }));
+    noteProviderAttemptSend(ctx, "test-provider", key("test-key-b"), undefined, "key-429");
+    recordKeyAttemptUsage(ctx, { inputTokens: 300, outputTokens: 40 });
+    const rows: RequestLogEntry[] = [];
+    addFinalRequestLog("non-combo-rotation", Date.now(), ctx, 200, undefined, row => rows.push(row));
+    expect(rows[0].attempts?.map(attempt => attempt.usage?.inputTokens)).toEqual([100, 300]);
+    expect(rows[0]).toMatchObject({ provider: "test-provider", usageStatus: "reported", totalTokens: 460,
+      usage: { inputTokens: 400, outputTokens: 60 } });
+  });
+  test("a row's usage status is the aggregate of its non-combo attempts", async () => {
+    const key = (reference?: string) => ({ adapter: "openai-chat" as const, authMode: "key" as const,
+      baseUrl: "https://example.test/v1", _apiKeyAttempt: reference ? { reference } : undefined });
+    const active = beginRequestAttempt(1, "test-provider", "test-model", "openai-chat");
+    const ctx: RequestLogContext = { provider: "test-provider", model: "test-model",
+      activeAttempt: active, activeAttemptStartedAt: Date.now(), attempts: [active] };
+    noteProviderAttemptSend(ctx, "test-provider", key("test-key-a"), undefined);
+    await recordKeyAttemptFailure(ctx, Response.json({ usage: { prompt_tokens: 100, completion_tokens: 20 } }, { status: 429 }));
+    noteProviderAttemptSend(ctx, "test-provider", key("test-key-b"), undefined, "key-429");
+    await recordKeyAttemptFailure(ctx, Response.json({ error: "synthetic" }, { status: 401 }));
+    noteProviderAttemptSend(ctx, "test-provider", key(), undefined, "key-401");
+    recordKeyAttemptUsage(ctx, { inputTokens: 300, outputTokens: 40 });
+    const rows: RequestLogEntry[] = [];
+    addFinalRequestLog("non-combo-mixed-status", Date.now(), ctx, 200, undefined, row => rows.push(row));
+    expect(rows[0]).toMatchObject({ totalTokens: 460, usage: { inputTokens: 400, outputTokens: 60 } });
+    // Whatever status the no-usage refusal earns, the row reports the aggregate of its attempts,
+    // not the last attempt's status alone.
+    expect(rows[0].usageStatus).toBe(aggregateAttemptUsage(rows[0].attempts!).status);
+  });
+  test("a locally answered non-combo request keeps its own usage", () => {
+    const sent = beginRequestAttempt(1, "test-provider", "test-model", "openai-chat");
+    Object.assign(sent, { sendCount: 1, status: 429, usageStatus: "reported", usage: { inputTokens: 100, outputTokens: 10 } });
+    const local = beginRequestAttempt(2, "test-provider", "test-model", "openai-chat");
+    local.locallyAnswered = true;
+    const ctx: RequestLogContext = { provider: "test-provider", model: "test-model", activeAttempt: local,
+      attempts: [sent, local], localTerminalReason: "synthetic", usage: { inputTokens: 7, outputTokens: 3 } };
+    const rows: RequestLogEntry[] = [];
+    addFinalRequestLog("local-answer", Date.now(), ctx, 200, undefined, row => rows.push(row));
+    expect(rows[0]).toMatchObject({ totalTokens: 10, usage: { inputTokens: 7, outputTokens: 3 } });
+  });
+  test.each([
+    ["generic OAuth", "o111111", "o222222"],
+    ["Codex pool", "paaaaa1", "pbbbbb2"],
+  ])("a %s account rotation opens its own attempt row", (_kind, first, second) => {
+    const oauth = { adapter: "openai-responses" as const, authMode: "oauth" as const, baseUrl: "https://example.test" };
+    const active = beginRequestAttempt(1, "xai", "model", "openai-responses");
+    const ctx: RequestLogContext = { provider: "xai", model: "model", activeAttempt: active,
+      activeAttemptStartedAt: Date.now(), attempts: [active], accountLogLabel: first };
+    noteProviderAttemptSend(ctx, "xai", oauth, undefined);
+    recordKeyAttemptUsage(ctx, { inputTokens: 100, outputTokens: 10 });
+    ctx.accountLogLabel = second;
+    noteProviderAttemptSend(ctx, "xai", oauth, undefined, "rate-limit-429");
+    expect(ctx.activeAttempt).toBe(active);
+    expect(ctx.attempts).toHaveLength(2);
+    expect(ctx.attempts?.[0]).toMatchObject({ ordinal: 1, accountLogLabel: first, sendCount: 1,
+      usage: { inputTokens: 100, outputTokens: 10 } });
+    // The second account's tokens land on their own row rather than on the first account's.
+    expect(active).toMatchObject({ ordinal: 2, accountLogLabel: second, sendCount: 1 });
+    expect(active.usage).toBeUndefined();
+  });
+  test.each([
+    ["generic OAuth", "o111111", "o222222"],
+    ["Codex pool", "paaaaa1", "pbbbbb2"],
+  ])("a post-send seal preserves the old %s row before the next send", (_kind, first, second) => {
+    const oauth = { adapter: "openai-responses" as const, authMode: "oauth" as const,
+      baseUrl: "https://example.test" };
+    const active = beginRequestAttempt(1, "xai", "model", "openai-responses");
+    const ctx: RequestLogContext = { provider: "xai", model: "model", activeAttempt: active,
+      activeAttemptStartedAt: Date.now(), attempts: [active], accountLogLabel: first };
+
+    noteProviderAttemptSend(ctx, "xai", oauth, undefined);
+    recordKeyAttemptUsage(ctx, { inputTokens: 100, outputTokens: 10 });
+
+    ctx.accountLogLabel = second;
+    sealRequestAttemptIdentity(active, "xai", "openai-responses", second);
+    noteProviderAttemptSend(ctx, "xai", oauth, undefined, "rate-limit-429");
+    recordKeyAttemptUsage(ctx, { inputTokens: 50, outputTokens: 5 });
+
+    expect(ctx.attempts).toHaveLength(2);
+    expect(ctx.attempts?.[0]).toMatchObject({
+      ordinal: 1, accountLogLabel: first, sendCount: 1,
+      usage: { inputTokens: 100, outputTokens: 10 },
+    });
+    expect(active).toMatchObject({
+      ordinal: 2, accountLogLabel: second, sendCount: 1,
+      usage: { inputTokens: 50, outputTokens: 5 },
+    });
+  });
+  test("a sent attempt keeps the account-qualified provider it spent its tokens on", () => {
+    // Anthropic pool accounts carry no label at all -- `stampOAuthAccountLabel` skips that base
+    // provider -- so the account lives in the log provider string and the seal used to erase it.
+    const oauth = { adapter: "anthropic-messages", authMode: "oauth" as const, baseUrl: "https://example.test" };
+    const firstProvider = formatAnthropicProviderForLog("anthropic", "account-a");
+    const secondProvider = formatAnthropicProviderForLog("anthropic", "account-b");
+    expect(firstProvider).toMatch(/^anthropic-p[a-f0-9]{6}$/);
+    expect(secondProvider).toMatch(/^anthropic-p[a-f0-9]{6}$/);
+    const active = beginRequestAttempt(1, "anthropic", "model", "anthropic-messages");
+    const ctx: RequestLogContext = { provider: firstProvider, model: "model",
+      activeAttempt: active, activeAttemptStartedAt: Date.now(), attempts: [active] };
+    noteProviderAttemptSend(ctx, "anthropic", oauth, undefined);
+    expect(active).toMatchObject({ provider: firstProvider, sendCount: 1 });
+    ctx.provider = secondProvider;
+    sealRequestAttemptIdentity(active, ctx.provider, "anthropic-messages", ctx.accountLogLabel);
+    expect(active.provider).toBe(firstProvider);
+  });
+  test("an Anthropic account rotation opens its own attempt row", () => {
+    // No label to compare: the account lives in the account-qualified log provider string.
+    const oauth = { adapter: "anthropic-messages", authMode: "oauth" as const, baseUrl: "https://example.test" };
+    const firstProvider = formatAnthropicProviderForLog("anthropic", "account-a");
+    const secondProvider = formatAnthropicProviderForLog("anthropic", "account-b");
+    const active = beginRequestAttempt(1, "anthropic", "model", "anthropic-messages");
+    const ctx: RequestLogContext = { provider: firstProvider, model: "model",
+      activeAttempt: active, activeAttemptStartedAt: Date.now(), attempts: [active] };
+    noteProviderAttemptSend(ctx, "anthropic", oauth, undefined);
+    recordKeyAttemptUsage(ctx, { inputTokens: 100, outputTokens: 10 });
+    ctx.provider = secondProvider;
+    // The dispatch paths re-seal between sends (src/server/responses/request-transport.ts:691).
+    // That re-stamp is what used to launder the rotation before the split below could read it.
+    sealRequestAttemptIdentity(active, ctx.provider, "anthropic-messages", ctx.accountLogLabel);
+    noteProviderAttemptSend(ctx, "anthropic", oauth, undefined, "rate-limit-429");
+    recordKeyAttemptUsage(ctx, { inputTokens: 50, outputTokens: 5 });
+    expect(ctx.activeAttempt).toBe(active);
+    expect(ctx.attempts).toHaveLength(2);
+    // Each account keeps the tokens it actually spent.
+    expect(ctx.attempts?.[0]).toMatchObject({ ordinal: 1, provider: firstProvider,
+      sendCount: 1, usage: { inputTokens: 100, outputTokens: 10 } });
+    expect(active).toMatchObject({ ordinal: 2, provider: secondProvider,
+      sendCount: 1, usage: { inputTokens: 50, outputTokens: 5 } });
+  });
+  test.each([["oauth-account-403", 403], ["oauth-401", 401], ["oauth-account-402", 402]] as const)(
+    "an account rotation after %s seals the first row with the status it answered", (recovery, status) => {
+      const oauth = { adapter: "anthropic-messages", authMode: "oauth" as const, baseUrl: "https://example.test" };
+      const active = beginRequestAttempt(1, "anthropic", "model", "anthropic-messages");
+      const ctx: RequestLogContext = { provider: formatAnthropicProviderForLog("anthropic", "account-a"),
+        model: "model", activeAttempt: active, activeAttemptStartedAt: Date.now(), attempts: [active] };
+      noteProviderAttemptSend(ctx, "anthropic", oauth, undefined);
+      ctx.provider = formatAnthropicProviderForLog("anthropic", "account-b");
+      noteProviderAttemptSend(ctx, "anthropic", oauth, undefined, recovery);
+      expect(ctx.attempts?.[0]).toMatchObject({ ordinal: 1, status });
+    });
   test("wire snapshots replace the current send against a pre-send baseline", () => {
     const active = beginRequestAttempt(1, "test", "model", "openai-chat");
     const ctx: RequestLogContext = { provider: "test", model: "model", activeAttempt: active, attempts: [active] };

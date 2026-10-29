@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { codexAccountGatedCanonicalWireModel } from "../../src/server/responses/core";
+import type { BundledCatalogDeps } from "../../src/codex/catalog/bundled";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../src/codex/catalog/native-models";
 import { isGpt56NativeSlug } from "../../src/codex/catalog/effort";
 import { nativeOpenAiContextTier, nativeOpenAiMaxInputTokens } from "../../src/codex/catalog";
@@ -66,8 +67,22 @@ import { convergeCodexCatalog } from "../../src/codex/convergence";
 import { resetCodexRuntimeResolveCacheForTests } from "../../src/codex/runtime";
 import { resolveCodexCatalogSerializationDatabasePath, resolveEffectiveUserIdentity } from "../../src/codex/user-identity";
 import { CODEX_FORWARD_BASE_URL } from "../../src/providers/openai-tiers";
+import { NEUTRAL_IDENTITY_LINE } from "../../src/adapters/identity";
 
 const originalFetch = globalThis.fetch;
+
+function withBundledCatalogFixture<T>(models: unknown[], read: (deps: BundledCatalogDeps) => T): T {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ocx-bundled-catalog-")));
+  const command = join(root, process.platform === "win32" ? "codex.exe" : "codex"), calls: unknown[][] = [];
+  try {
+    writeFileSync(command, "fixture only; execution must stay injected", { mode: 0o700 });
+    const result = read({ commandCandidates: () => [command], execFileSync: (file, args) => {
+      calls.push([file, args]); return JSON.stringify({ models });
+    } });
+    expect(calls).toEqual([[command, ["debug", "models", "--bundled"]]]);
+    return result;
+  } finally { removeTreeWithRetry(root); }
+}
 
 /**
  * Discovery runs on the pinned outbound transport, which does not read
@@ -414,7 +429,7 @@ describe("combo catalog capability intersection", () => {
       expect(row.slug).toBe(alias);
       expect(row.display_name).toBe(alias);
       expect(row.owned_by).toBe("combo");
-      expect(row.base_instructions).toContain("mixed");
+      expect(row.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
       expect(row).not.toHaveProperty("model_messages");
       expect(row.tool_mode).toBe("code_mode_only");
       expect(row.web_search_tool_type).toBe("text_and_image");
@@ -2042,7 +2057,7 @@ describe("provider discovered model display names", () => {
       maxOutputTokens: 500_000,
       // Classified by the 2026-09-13 OAuth-lane probe: grok-4.6 is Fast-eligible on
       // either xAI transport, so the hint fills the capability and its description.
-      supportsServiceTier: true,
+      supportsServiceTier: true, supportsUltraFastTier: false, supportsFlexTier: false,
       fastTierDescription: "Priority processing; tier pricing applies on key auth only",
     });
     expect(catalogModelSlug(output)).toBe("xai/grok-4.6");
@@ -3361,10 +3376,7 @@ describe("Codex catalog routed normalization", () => {
   });
 
   test("loads bundled Codex catalog from debug models output", () => {
-    const catalog = loadBundledCodexCatalog({
-      commandCandidates: () => ["codex"],
-      execFileSync: () => JSON.stringify({ models: [nativeTemplate()] }),
-    });
+    const catalog = withBundledCatalogFixture([nativeTemplate()], deps => loadBundledCodexCatalog(deps));
 
     expect(catalog?.models?.[0]?.slug).toBe("gpt-5.5");
   });
@@ -3373,10 +3385,7 @@ describe("Codex catalog routed normalization", () => {
     const dir = mkdtempSync(join(tmpdir(), "ocx-catalog-"));
     const path = join(dir, "nested", "opencodex-catalog.json");
     try {
-      const catalog = materializeBundledCodexCatalog(path, {
-        commandCandidates: () => ["codex"],
-        execFileSync: () => JSON.stringify({ models: [nativeTemplate()] }),
-      });
+      const catalog = withBundledCatalogFixture([nativeTemplate()], deps => materializeBundledCodexCatalog(path, deps));
 
       expect(catalog?.models?.[0]?.slug).toBe("gpt-5.5");
       expect(existsSync(path)).toBe(true);
@@ -3426,7 +3435,7 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.supports_search_tool).toBe(true);
     expect(routed?.supports_reasoning_summaries).toBe(false);
     expect(routed?.base_instructions).not.toBe(nativeTemplate().base_instructions);
-    expect(routed?.base_instructions).toContain("claude-sonnet-4-6");
+    expect(routed?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(routed?.default_reasoning_level).toBe("medium");
   });
 
@@ -3530,7 +3539,7 @@ describe("Codex catalog routed normalization", () => {
       "low", "medium", "high", "xhigh", "max", "ultra",
     ]);
     expect(gpt56?.context_window).toBe(272_000);
-    expect(gpt56?.max_context_window).toBe(272_000);
+    expect(gpt56?.max_context_window).toBe(922_000);
     expect(gpt56?.auto_compact_token_limit).toBe(244_800);
     expect((gpt55?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort)).toEqual([
       "low", "medium", "high", "xhigh", "max", "ultra",
@@ -3560,7 +3569,7 @@ describe("Codex catalog routed normalization", () => {
     expect(sol?.display_name).toBe("GPT-5.6-Sol");
     expect(terra?.display_name).toBe("GPT-5.6-Terra");
     expect(luna?.display_name).toBe("GPT-5.6-Luna");
-    expect(sol?.description).toBe("Latest frontier agentic coding model.");
+    expect(sol?.description).toBe("Reliable agentic workhorse for everyday tasks.");
     expect(sol?.availability_nux).toBeDefined();
 
     // Per-slug multi-agent generation: sol/terra v2, luna v1.
@@ -3753,9 +3762,9 @@ describe("Codex catalog routed normalization", () => {
       display_name: "Daybreak Blue",
       // The pinned snapshot stays a verbatim copy of what upstream shipped; the live
       // contract (1,050,000 / 922,000) is carried by NATIVE_OPENAI_CONTEXT_OVERRIDES and
-      // applied on top by applyNativeOpenAiContextOverride, so the raw entry still reads 372k.
-      context_window: 372_000,
-      max_context_window: 372_000,
+      // applied on top by applyNativeOpenAiContextOverride, so the raw entry reads 272k/872k.
+      context_window: 272_000,
+      max_context_window: 872_000,
       comp_hash: "3000",
       tool_mode: "code_mode_only",
       use_responses_lite: true,
@@ -3764,10 +3773,9 @@ describe("Codex catalog routed normalization", () => {
       multi_agent_version: "v2",
     });
     expect(source).not.toHaveProperty("availability_nux");
-    expect(source?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(source?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(source?.base_instructions).not.toContain("based on GPT-5");
-    expect((source?.model_messages as { instructions_template?: string })?.instructions_template)
-      .toContain("powered by the gpt-daybreak-blue-latest");
+    expect((source?.model_messages as { instructions_template?: string })?.instructions_template).toContain(NEUTRAL_IDENTITY_LINE);
 
     // NATIVE_OPENAI_MODELS already contains the slug; passing it again would double it.
     const projected = buildCatalogEntries(
@@ -3947,7 +3955,7 @@ describe("Codex catalog routed normalization", () => {
       multi_agent_version: "v2",
       opencodex_catalog_kind: CODEX_CUSTOM_MODEL_CATALOG_KIND,
     });
-    expect(daybreak?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(daybreak?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(daybreak?.model_messages).toBeDefined();
     expect(entries.some(entry => entry.slug === NATIVE_DAYBREAK_BLUE_MODEL)).toBe(false);
     expect(entries.some(entry => entry.slug === `main/${NATIVE_DAYBREAK_BLUE_MODEL}`)).toBe(false);
@@ -3995,7 +4003,7 @@ describe("Codex catalog routed normalization", () => {
       display_name: "GPT-6-Astra", multi_agent_reasoning_effort: "xhigh",
       service_tiers: [{ id: "priority", name: "Fast", description: "2x speed, increased usage" }],
     });
-    expect(astra?.base_instructions).toContain("powered by the gpt-6-astra");
+    expect(astra?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(astra?.base_instructions).not.toContain("daybreak");
   });
 
@@ -4232,8 +4240,8 @@ describe("Codex catalog routed normalization", () => {
         { effort: "low", description: "l" }, { effort: "max", description: "m" }, { effort: "ultra", description: "u" },
       ],
     };
-    // Genuine: real display name — must be preserved untouched (installed codex is SoT once
-    // it catches up), marker field proves no replacement happened.
+    // Genuine metadata is preserved; priority is resolved separately from source provenance.
+    // The marker proves no metadata replacement happened.
     const genuineSol = {
       ...nativeTemplate(),
       slug: "gpt-5.6-sol",
@@ -4249,9 +4257,9 @@ describe("Codex catalog routed normalization", () => {
     expect(luna?.display_name).toBe("GPT-5.6-Luna");
     expect((luna?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
       .toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(luna?.priority).toBe(3); // upstream priority restored for the upgraded entry
+    expect(luna?.priority).toBe(8); // upstream priority restored for the upgraded entry
     expect(sol?.genuine_marker).toBe("from-installed-catalog");
-    expect(sol?.priority).toBe(1);
+    expect(sol?.priority).toBe(4); // no baseline/source field: use snapshot, never published rank
   });
 
   test("fallback-quality upgrades restore snapshot metadata without losing pristine priority", () => {
@@ -4269,7 +4277,7 @@ describe("Codex catalog routed normalization", () => {
     const sol = merged.find(entry => entry.slug === "gpt-5.6-sol");
 
     expect(sol?.display_name).toBe("GPT-5.6-Sol");
-    expect(sol?.description).toBe("Latest frontier agentic coding model.");
+    expect(sol?.description).toBe("Reliable agentic workhorse for everyday tasks.");
     expect(sol?.priority).toBe(41);
     expect(sol).not.toHaveProperty("stale_marker");
   });
@@ -4321,12 +4329,12 @@ describe("Codex catalog routed normalization", () => {
 
     expect(bare).toMatchObject({
       context_window: 272_000,
-      max_context_window: 272_000,
+      max_context_window: 922_000,
       auto_compact_token_limit: 120_000,
     });
     expect(account).toMatchObject({
       context_window: 272_000,
-      max_context_window: 272_000,
+      max_context_window: 922_000,
       auto_compact_token_limit: 120_000,
       opencodex_catalog_kind: CODEX_ACCOUNT_BOUND_CATALOG_KIND,
     });
@@ -4667,7 +4675,7 @@ describe("Codex catalog routed normalization", () => {
 
     expect(fetchCalls).toBe(0);
     expect(ids).toEqual([...(provider.models ?? [])].sort());
-    expect(ids).toHaveLength(7);
+    expect(ids).toHaveLength(4);
     expect(getProviderDiscoveryStatus(providerName)).toBeUndefined();
 
     markProviderDiscoveryFailed(providerName, { reason: "http", httpStatus: 404 });
@@ -6266,7 +6274,7 @@ describe("Codex catalog routed normalization", () => {
 
     expect(provider.modelSupportsReasoningSummaries).toEqual({
       "deepseek-v4-flash": false,
-      "deepseek-flash": true,
+      "deepseek-flash": true, "deepseek-v4-pro": true,
     });
   });
 
@@ -6839,7 +6847,7 @@ describe("OpenAI API trusted catalog augmentation", () => {
     "gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro",
     "daybreak-red-latest", "daybreak-blue-latest",
-    "gpt-6-astra",
+    "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
   ];
 
   test("Astra API registry metadata reaches the emitted catalog independently of native limits", async () => {
@@ -7104,32 +7112,16 @@ describe("shouldExposeRoutedModel — Gemini image-capable exemption", () => {
       expect(shouldExposeRoutedModel({ provider: "openrouter", id })).toBe(false);
     }
   });
-
-  test("still filters compatibility-excluded slugs", () => {
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "hy3-preview" })).toBe(false);
-    // Issue #2330: uncallable or stale OpenCode Go models
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "mimo-v2-omni" })).toBe(false);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "mimo-v2-pro" })).toBe(false);
-    // Control / live models are exposed
-    expect(shouldExposeRoutedModel({ provider: "opencode-free", id: "deepseek-v4-flash-free" })).toBe(true);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "grok-4.6" })).toBe(true);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "glm-5.2" })).toBe(true);
-  });
 });
 
 describe("Codex reasoning-effort capability clamp", () => {
-  function bundledCatalogDeps(efforts: string[]) {
-    return {
-      commandCandidates: () => ["codex"],
-      execFileSync: () => JSON.stringify({
-        models: [{
-          slug: "gpt-5.5",
-          base_instructions: "test",
-          supported_reasoning_levels: efforts.map(effort => ({ effort, description: effort })),
-          default_reasoning_level: "medium",
-        }],
-      }),
-    };
+  function bundledCatalogDeps(efforts: string[], read: (deps: BundledCatalogDeps) => void) {
+    withBundledCatalogFixture([{
+      slug: "gpt-5.5",
+      base_instructions: "test",
+      supported_reasoning_levels: efforts.map(effort => ({ effort, description: effort })),
+      default_reasoning_level: "medium",
+    }], read);
   }
 
   function routedEntry() {
@@ -7172,7 +7164,7 @@ describe("Codex reasoning-effort capability clamp", () => {
   test("keeps max and ultra when the installed Codex ladder stops at xhigh", () => {
     const models = [routedEntry()];
 
-    clampCatalogModelsToCodexSupport(models, bundledCatalogDeps(["low", "medium", "high", "xhigh"]));
+    bundledCatalogDeps(["low", "medium", "high", "xhigh"], deps => clampCatalogModelsToCodexSupport(models, deps));
 
     expect(models[0]!.supported_reasoning_levels.map(level => level.effort))
       .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
@@ -7181,7 +7173,7 @@ describe("Codex reasoning-effort capability clamp", () => {
   test("preserves max and ultra when the installed Codex ladder includes them", () => {
     const models = [routedEntry()];
 
-    clampCatalogModelsToCodexSupport(models, bundledCatalogDeps(["low", "medium", "high", "xhigh", "max", "ultra"]));
+    bundledCatalogDeps(["low", "medium", "high", "xhigh", "max", "ultra"], deps => clampCatalogModelsToCodexSupport(models, deps));
 
     expect(models[0]!.supported_reasoning_levels.map(level => level.effort))
       .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);

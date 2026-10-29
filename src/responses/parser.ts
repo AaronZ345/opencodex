@@ -1,3 +1,4 @@
+import { anthropicProgressEnvelope, isAnthropicProgressMirror } from "./anthropic-progress";
 import type {
   OcxAssistantMessage,
   OcxContentPart,
@@ -15,10 +16,13 @@ import { createToolChoiceResolver, namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import { providerMetadataFromResponsesFunctionCall } from "./provider-opaque-metadata";
 import { lookupReplayThoughtSignature } from "./thought-signature-replay";
-import { compactionItemToText, isCompactionItemType } from "./compaction";
+import { decodeRetainedCompaction, RETAINED_COMPACTION_PREFIX } from "./retained-compaction";
+import { CHECKPOINT_CONTINUATION_NOTE, compactionItemToText, decodeCompactionSummary, isCompactionItemType, SUMMARY_PREFIX } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
+import { hasRoutedIdentity, nameRoutedIdentity } from "../adapters/identity";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
+import { rewriteReplayedWebSearchCells } from "./web-search-replay";
 import { buildImageTool, extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
 import { toolSearchDescription, toolSearchParameters } from "./tool-search-compat";
 
@@ -26,6 +30,8 @@ import { isObj, inputContentParts, outputTextOf, outputToToolResultContent, tool
 import { mapToolChoice, buildTools, customToolNamespaces } from "./parser-tools";
 import { parseTextFormat } from "./parser-text-format";
 import { externalTaskInputContent } from "./task-input";
+import { normalizeVisualizationContext } from "./visualization-directives";
+import { frameCompactionHistory } from "./compaction-history-framing";
 
 /**
  * Wrap a remembered proxy-side signature as provider metadata for a replayed tool call.
@@ -40,6 +46,91 @@ function replayThoughtSignatureMetadata(
 ): { google: { thoughtSignature: string } } | undefined {
   const signature = lookupReplayThoughtSignature(callId, scope);
   return signature ? { google: { thoughtSignature: signature } } : undefined;
+}
+
+/**
+ * Repair one bounded inbound-history corruption: a JSON object literal that lost exactly
+ * its opening brace (observed as `code":"…}` after `{"` went missing, taking the key's
+ * opening quote with it). Only a text that ends with `}` and parses into an object once
+ * the brace is restored counts — anything looser keeps the tolerated-{} fallback so
+ * freeform text that merely resembles JSON is never rewritten.
+ */
+function repairJsonObjectEnvelope(text: string): Record<string, unknown> | undefined {
+  if (!text.endsWith("}")) return undefined;
+  // A body that still opens with a quoted key lost only `{`; the observed shape lost
+  // `{"` together, taking the key's opening quote with it. Both restorations must parse
+  // into an object, so freeform text that merely resembles JSON is never rewritten.
+  const candidate = text.startsWith('"') ? `{${text}` : `{"${text}`;
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    if (isObj(parsed)) return parsed;
+  } catch {
+    /* fall through to the tolerated-{} path */
+  }
+  return undefined;
+}
+
+/**
+ * Repair the observed MiMo tool-call corruption: the model emits its proprietary
+ * `</function></tool_call>` closing tags INSIDE the JSON string value of the
+ * function arguments, and drops the JSON object's closing brace. Strip the
+ * suffix, restore the brace, and only accept the repair when the result parses
+ * into an object.
+ */
+function repairMimoToolCallEnvelope(text: string): Record<string, unknown> | undefined {
+  const suffix = "</function></tool_call>";
+  if (!text.endsWith(suffix)) return undefined;
+  const stripped = text.slice(0, -suffix.length);
+  if (!stripped.startsWith("{")) return undefined;
+  // A trailing brace or quote can itself belong to the unterminated string.
+  // Try only the three observed envelope endings, accepting an object parse.
+  for (const candidate of [stripped, `${stripped}}`, `${stripped}"}`]) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (isObj(parsed)) return parsed;
+    } catch {
+      /* try the next bounded envelope ending */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Decode a function call's serialized arguments the way history replay tolerates them: empty
+ * or non-JSON text becomes `{}` instead of failing every later turn, and the bounded
+ * lost-brace and MiMo closing-tag corruptions above are repaired. Shared with the direct Chat decoder
+ * (`src/protocols/codecs/chat-ir.ts`) so both decode the same call to the same object.
+ */
+export function functionCallArgumentsFromText(callId: string, rawArguments: string | undefined): Record<string, unknown> {
+  let args: Record<string, unknown> = {};
+  const rawArgs = rawArguments?.trim();
+  if (rawArgs) {
+    try {
+      const parsed: unknown = JSON.parse(rawArgs);
+      if (isObj(parsed)) args = parsed;
+    } catch {
+      // Corruptions observed on Xiaomi MiMo routed requests, each with a bounded
+      // repair so a serialized call the model can still see is restored instead
+      // of replaying {} forever.
+      const mimoRepaired = repairMimoToolCallEnvelope(rawArgs);
+      if (mimoRepaired !== undefined) {
+        args = mimoRepaired;
+        console.warn(`[parser] function_call ${callId} repaired MiMo tool-call envelope (tags inside string)`);
+        return args;
+      }
+      // One observed serialization corruption loses exactly the JSON object's opening
+      // brace; the closed envelope is tight enough to repair back into a call the
+      // routed model can still see and retry, instead of replaying {} forever.
+      const repaired = repairJsonObjectEnvelope(rawArgs);
+      if (repaired === undefined) {
+        console.warn(`[parser] function_call ${callId} has non-JSON arguments; defaulting to {}`);
+      } else {
+        args = repaired;
+        console.warn(`[parser] function_call ${callId} arguments lost the JSON opening brace; repaired from history`);
+      }
+    }
+  }
+  return args;
 }
 
 
@@ -94,6 +185,37 @@ function attachPendingReasoningToCallOwner(
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
+export function hasValidatedActiveReasoningEffort(options: Pick<OcxRequestOptions, "reasoning" | "thinkingEnabled">): boolean {
+  return options.thinkingEnabled ?? (options.reasoning !== undefined && options.reasoning !== "none");
+}
+
+
+/**
+ * Name this request's destination in an instruction text inherited from a stored session block.
+ *
+ * Returns the input unchanged when it carries no sentence of ours, which is every request that has
+ * not gone through a sub-agent spawn. The catalog block is model-neutral on disk (#5217) and some
+ * routed adapters build their own system text instead of calling `identifyRoutedModel`, so both the
+ * neutral line and a sentence naming an earlier model are handled here — request time is the first
+ * point where the destination model is known.
+ */
+function nameDestinationText(text: string, modelId: string): string {
+  return hasRoutedIdentity(text) ? nameRoutedIdentity(text, modelId) : text;
+}
+
+function nameDestinationContent(
+  content: string | OcxContentPart[],
+  modelId: string,
+): string | OcxContentPart[] {
+  if (typeof content === "string") return nameDestinationText(content, modelId);
+  let changed = false;
+  const parts = content.map((part) => {
+    if (part.type !== "text" || !hasRoutedIdentity(part.text)) return part;
+    changed = true;
+    return { ...part, text: nameRoutedIdentity(part.text, modelId) };
+  });
+  return changed ? parts : content;
+}
 
 export function parseRequest(
   body: unknown,
@@ -105,12 +227,19 @@ export function parseRequest(
   if (!parsed.success) {
     throw new Error(`responses parse error: ${parsed.error.message}`);
   }
-  const data = parsed.data;
+  const data = frameCompactionHistory(parsed.data);
   const now = Date.now();
   const messages: OcxMessage[] = [];
   // Built before the item loop: a custom_tool_call echoed back in `input` needs the
   // namespace from the request's own tool catalog to survive the round trip.
   const customToolNamespacesByName = customToolNamespaces(data.tools);
+  // Stash the hosted web_search config (if Codex enabled it) so the proxy can run searches via the
+  // sidecar for routed providers. buildTools still drops the hosted tool; the sidecar path
+  // re-injects a synthetic function tool only when it will actually handle the call. The same
+  // declaration decides how replayed search cells are rebuilt below.
+  const webSearch = extractHostedWebSearch(data.tools as unknown[] | undefined);
+  // With search declared, replayed hosted cells become web_search call/output pairs (#7269).
+  const webSearchReplay = webSearch && Array.isArray(data.input) ? rewriteReplayedWebSearchCells(data.input) : undefined;
   const systemPrompt: string[] = [];
   // Responses reasoning siblings belong to the following assistant, including across call items.
   // Keep them off the message list until that assistant arrives; turn boundaries clear the array.
@@ -138,19 +267,27 @@ export function parseRequest(
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
   let compactionRequest = false;
+  let decodedCheckpoint = false;
   let contextCompactionBoundary = false;
   let continuationConversationMessageIndex: number | undefined;
 
   if (typeof data.instructions === "string" && data.instructions.length > 0) {
-    systemPrompt.push(data.instructions);
+    // #5217: this is the stored session instruction block. A sub-agent spawned on a DIFFERENT model
+    // receives the parent's copy verbatim, so the identity sentence inside it names the parent
+    // unless it is renamed here, where the destination model is known.
+    systemPrompt.push(nameDestinationText(data.instructions, data.model));
   }
 
   if (typeof data.input === "string") {
     if (data.previous_response_id) continuationConversationMessageIndex = messages.length;
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
-    for (let inputIndex = 0; inputIndex < data.input.length; inputIndex++) {
-      const item = data.input[inputIndex];
+    const inputItems = (webSearchReplay?.items ?? data.input) as typeof data.input;
+    for (let itemIndex = 0; itemIndex < inputItems.length; itemIndex++) {
+      const item = inputItems[itemIndex];
+      // Boundaries are measured on the caller's input, before any replayed-search rewrite.
+      const inputIndex = webSearchReplay?.sourceIndexes[itemIndex] ?? itemIndex;
+      if (itemIndex > 0 && isAnthropicProgressMirror(item, anthropicProgressEnvelope(inputItems[itemIndex - 1]))) continue;
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
       const itemRole = (item as { role?: string }).role;
       const externalTaskInput = effectiveType === "function_call_output" ? externalTaskInputContent(item) : undefined;
@@ -192,8 +329,15 @@ export function parseRequest(
         continue;
       }
 
+      if (effectiveType === "configuration_update") {
+        // Codex 0.164 positional reasoning-effort control. It is not a turn, so a translated route
+        // drops it without touching pending reasoning; the native passthrough keeps it verbatim in
+        // _rawBody. Mapping its effort onto the routed request is deliberately not done (#6895).
+        continue;
+      }
+
       if (isCompactionItemType(effectiveType)) {
-        // A stored summary from a previous compaction. Decode our ocx1 envelope into plain text so
+        // A stored summary from a previous compaction. Decode our ocx1/ocx2 envelopes into plain text so
         // the routed model keeps the compacted context; real OpenAI-encrypted blobs degrade to a note.
         // `context_compaction` (encrypted_content optional) is codex-rs's local-compaction marker;
         // with no payload it is a pure marker (the summary follows as its own user message), so it
@@ -203,7 +347,15 @@ export function parseRequest(
         if (inputIndex >= replayedInputPrefixLength) contextCompactionBoundary = true;
         const encrypted = (item as { encrypted_content?: unknown }).encrypted_content;
         if (effectiveType === "context_compaction" && typeof encrypted !== "string") continue;
+        if (typeof encrypted === "string" && decodeCompactionSummary(encrypted) !== null) decodedCheckpoint = true;
         pendingReasoning.length = 0;
+        if (typeof encrypted === "string" && encrypted.startsWith(RETAINED_COMPACTION_PREFIX)) {
+          const retained = decodeRetainedCompaction(encrypted);
+          if (!retained) throw new Error("Invalid OpenCodex retained compaction envelope");
+          messages.push({ role: "user", content: `${SUMMARY_PREFIX}\n\n${retained.summary}`, timestamp: now });
+          messages.push(...retained.reasoning.map(content => ({ role: "user" as const, content, timestamp: now })));
+          continue;
+        }
         messages.push({
           role: "user",
           content: compactionItemToText(typeof encrypted === "string" ? encrypted : undefined),
@@ -245,15 +397,28 @@ export function parseRequest(
           case "system": {
             pendingReasoning.length = 0;
             const text = inputContentParts(msg.content);
-            const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
-            if (flat.length > 0) systemPrompt.push(flat);
+            const flat = typeof text === "string"
+              ? text
+              : text.map(p => (p.type === "text" || p.type === "document" ? p.text : "")).join("");
+            // #5217: a system-role item is instruction text, exactly like `instructions` and a
+            // developer item, so it needs the same request-time naming — it lands in the system
+            // block verbatim, and Codex replays the parent's copy to a sub-agent on another model.
+            if (flat.length > 0) systemPrompt.push(nameDestinationText(flat, data.model));
             break;
           }
           case "user":
           case "developer": {
             pendingReasoning.length = 0;
             const content = inputContentParts(msg.content);
-            messages.push({ role: msg.role, content, timestamp: now });
+            messages.push({
+              role: msg.role,
+              // #5217: Codex replays the PARENT session's instruction block as the worker's
+              // developer message, so a sub-agent on another model inherits an identity sentence
+              // naming the parent. Only this proxy's own sentence is rewritten, and only on a
+              // developer item; user turns are the caller's content and stay byte-identical.
+              content: msg.role === "developer" ? nameDestinationContent(content, data.model) : content,
+              timestamp: now,
+            });
             break;
           }
           case "assistant": {
@@ -324,16 +489,7 @@ export function parseRequest(
         const call = item as { id?: string; call_id: string; name: string; arguments?: string; namespace?: string; extra_content?: unknown };
         // Tolerate empty/non-JSON arguments (e.g. a no-arg tool call serialized as "") instead of
         // throwing — a single poisoned history item would otherwise 400 every subsequent turn.
-        let args: Record<string, unknown> = {};
-        const rawArgs = call.arguments?.trim();
-        if (rawArgs) {
-          try {
-            const parsed: unknown = JSON.parse(rawArgs);
-            if (isObj(parsed)) args = parsed;
-          } catch {
-            console.warn(`[parser] function_call ${call.call_id} has non-JSON arguments; defaulting to {}`);
-          }
-        }
+        const args = functionCallArgumentsFromText(call.call_id, call.arguments);
         // Do NOT map Responses item `id` (fc_/ctc_/…) onto `thoughtSignature`. That field is
         // reserved for Gemini/Antigravity opaque thought tokens; forwarding item ids as
         // thoughtSignature 400s Antigravity (Base64 / TYPE_BYTES). Continuity for CCA comes from
@@ -391,9 +547,9 @@ export function parseRequest(
       }
 
       if (effectiveType === "web_search_call") {
-        // Replayed hosted web-search evidence has no paired result payload that routed providers can
-        // consume. Keep it out of assistant-visible text: the old marker was useful as an internal
-        // loop hint, but when no sidecar is available the model can echo it as a fake answer.
+        // Without a search declaration the cell stays out of routed history: a call to an undeclared
+        // tool, or assistant-visible marker text the model could echo as a fake answer, would be
+        // worse than the gap. With one, the cell was already rewritten into a web_search pair.
         pendingReasoning.length = 0;
         continue;
       }
@@ -506,6 +662,10 @@ export function parseRequest(
     .map(t => loadedToolNames.has(namespacedToolName(t.namespace, t.name))
       ? { ...t, loadedFromToolSearch: true }
       : t);
+  // #6764: the decoded checkpoint is ordinary user text on this route. Say in the system prompt
+  // what it is, so a retained earlier request that it reports as completed is not repeated.
+  // A compaction request is a summarizer turn and must not be told to continue.
+  if (decodedCheckpoint && !compactionRequest) systemPrompt.push(CHECKPOINT_CONTINUATION_NOTE);
   const context: OcxContext = {
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
     messages,
@@ -535,21 +695,19 @@ export function parseRequest(
   // `reasoning_effort_for_request`), so current clients never send it — but a catalog that
   // advertises ultra plus an older/direct caller can. Degrade it to max like upstream instead of
   // silently dropping reasoning altogether.
+  if (data.reasoning?.enabled !== undefined) options.thinkingEnabled = data.reasoning.enabled;
   const requestedEffort = data.reasoning?.effort === "ultra" ? "max" : data.reasoning?.effort;
   if (requestedEffort && REASONING_EFFORTS.has(requestedEffort)) {
     options.reasoning = requestedEffort;
   }
   const summaryMode = data.reasoning?.summary;
-  if (!summaryMode || summaryMode === "none") options.hideThinkingSummary = true;
+  const reasoningActive = hasValidatedActiveReasoningEffort(options);
+  if (summaryMode === "none" || (!summaryMode && !reasoningActive)) options.hideThinkingSummary = true;
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
   if (data.service_tier !== undefined) options.serviceTier = data.service_tier;
   if (data.prompt_cache_key !== undefined) options.promptCacheKey = data.prompt_cache_key;
 
-  // Stash the hosted web_search config (if Codex enabled it) so the proxy can run searches via the
-  // gpt-mini sidecar for routed providers. buildTools still drops the hosted tool; the sidecar path
-  // re-injects a synthetic function tool only when it will actually handle the call.
-  const webSearch = extractHostedWebSearch(data.tools as unknown[] | undefined);
   const imageGen = extractHostedImageGeneration([
     ...(data.tools as unknown[] ?? []),
     ...loadedToolSpecs,
@@ -564,7 +722,9 @@ export function parseRequest(
   return {
     modelId: data.model,
     ...(data.previous_response_id ? { previousResponseId: data.previous_response_id } : {}),
-    context,
+    // Codex App visualization references in the private-use form are invisible to some models;
+    // hand every model the app's ASCII directive instead (visualization-directives.ts).
+    context: normalizeVisualizationContext(context),
     stream: data.stream === true,
     options,
     _rawBody: body,
@@ -573,6 +733,7 @@ export function parseRequest(
       ? { _continuationConversationMessageIndex: continuationConversationMessageIndex }
       : {}),
     ...(webSearch ? { _webSearch: webSearch } : {}),
+    ...(webSearchReplay ? { _replayedWebSearchCells: webSearchReplay.cells } : {}),
     ...(imageGen ? { _imageGeneration: imageGen } : {}),
     ...(textFormat ? { _structuredOutput: true } : {}),
     ...(compactionRequest ? { _compactionRequest: true } : {}),

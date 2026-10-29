@@ -3,9 +3,9 @@ import { dirname, join } from "node:path";
 import { maskNonCode, specifierSites, tokenize } from "./tokens";
 
 /**
- * The tests/ layout map. `explicit` is the authoritative basename -> directory table; the
- * regex seeds under `domains` exist so a brand-new test file can still resolve before someone
- * adds it to `explicit`. `migrated` lists the domains whose files have already left the root.
+ * The tests/ layout map merges layout.json's authoritative basename -> directory table with
+ * optional explicit-map shards and seeds.json beside it. Its `domains` regexes place a brand-new test before it joins `explicit`;
+ * `migrated` lists domains whose files have already left the root.
  */
 export interface DomainSpec {
   match: string[];
@@ -22,19 +22,46 @@ export interface Layout {
 }
 
 export const LAYOUT_PATH = join(import.meta.dir, "layout.json");
+export function seedsPathFor(path: string): string {
+  return join(dirname(path), "seeds.json");
+}
 
 export function loadLayout(path: string = LAYOUT_PATH): Layout {
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Layout;
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as Pick<Layout, "version" | "root" | "explicit"> & { explicitShards?: string[] };
+  const seedsPath = seedsPathFor(path);
+  const seeds = JSON.parse(readFileSync(seedsPath, "utf8")) as Pick<Layout, "keepAtRoot" | "domains" | "migrated">;
   if (parsed.version !== 1 || parsed.root !== "tests") {
     throw new Error(`${path}: unsupported layout version/root`);
   }
   for (const key of ["keepAtRoot", "migrated"] as const) {
-    if (!Array.isArray(parsed[key])) throw new Error(`${path}: ${key} must be an array`);
+    if (!Array.isArray(seeds[key])) throw new Error(`${seedsPath}: ${key} must be an array`);
   }
-  if (typeof parsed.explicit !== "object" || parsed.explicit === null) {
+  if (typeof seeds.domains !== "object" || seeds.domains === null || Array.isArray(seeds.domains)) {
+    throw new Error(`${seedsPath}: domains must be an object`);
+  }
+  if (typeof parsed.explicit !== "object" || parsed.explicit === null || Array.isArray(parsed.explicit)) {
     throw new Error(`${path}: explicit must be an object`);
   }
-  return parsed;
+  if (parsed.explicitShards !== undefined && !Array.isArray(parsed.explicitShards)) {
+    throw new Error(`${path}: explicitShards must be an array`);
+  }
+  const explicit = { ...parsed.explicit };
+  for (const name of parsed.explicitShards ?? []) {
+    if (typeof name !== "string" || !/^[a-z][a-z0-9-]*\.json$/.test(name)) {
+      throw new Error(`${path}: explicit shard must be a sibling JSON filename`);
+    }
+    const shardPath = join(dirname(path), name);
+    const shard: unknown = JSON.parse(readFileSync(shardPath, "utf8"));
+    if (typeof shard !== "object" || shard === null || Array.isArray(shard)) {
+      throw new Error(`${shardPath}: explicit shard must be an object`);
+    }
+    for (const [test, target] of Object.entries(shard)) {
+      if (typeof target !== "string") throw new Error(`${shardPath}: target for ${test} must be a string`);
+      if (Object.hasOwn(explicit, test)) throw new Error(`${shardPath}: duplicate explicit test ${test}`);
+      explicit[test] = target;
+    }
+  }
+  return { ...parsed, ...seeds, explicit };
 }
 
 /**

@@ -2,10 +2,28 @@
 
 The opt-in key-auth Responses hosted-search bridge follows the
 [continuation binding contract](../providers-and-adapters.md#hosted-search-continuation-binding).
+`src/web-search/loop.ts` follows [prepaid initial sends](../transports/responses-spend.md#prepaid-initial-sends)
+for Combo child inference: generic HTTP/WS reports physical dispatch; fetchResponse receives the
+live adapter budget instead. Initial headers are acquired before Response return, so unsent failures
+remain with ingress cleanup. RunTurn search retains its ordinary producer owner; standalone search
+and direct callers keep their existing behavior.
+
+Final client tool output after hosted search follows the [explicit empty client-catalog boundary](../transports/responses-wire-shapes.md#declared-tool-membership-by-inbound-wire), before client delivery or continuation state. Internal search execution retains its existing behavior.
 
 ## Serving the relay without ChatGPT auth
 
-`POST /v1/alpha/search` relays verbatim through a configured ChatGPT forward provider. When no
+`POST /v1/alpha/search` first resolves a non-empty body `model` with `previewRouteModel()`. A route whose
+effective adapter is `devin` uses `src/web-search/devin-executor.ts` and the active Devin OAuth
+snapshot to call Cognition's non-inference `GetWebSearchResults` RPC. The account snapshot supplies
+both the credential and its allowlisted tenant URL; the request rejects redirects and bounds timeout
+and response bytes. This decision uses the resolved route, not a model-name family, so current and
+future Devin-hosted model ids share the path without a model table. A round-robin preview copies
+its selection state instead of claiming or advancing the turn's sticky slot. The RPC receives the
+search query but no model id, and its decoded results return in the normal
+`{ encrypted_output: null, output, results }` envelope. A configured key's destination scope is
+checked against that resolved provider/model before dispatch.
+
+Other requests relay verbatim through a configured ChatGPT forward provider. When no
 forward candidate exists, an explicitly configured `webSearchSidecar.backend` of `anthropic`,
 `xai`, `gemini`, or `exa` serves the request instead, spending only that backend's own
 credential: `src/web-search/alpha-search.ts` runs the query through that backend's executor and
@@ -15,6 +33,12 @@ missing is refused as well, but the message names that backend and the credentia
 find instead of asking for ChatGPT auth, and the request reaches no other backend. A backend that
 fails answers with its own diagnostic. The fallback never runs while a forward candidate exists,
 so the verbatim relay stays the path for a ChatGPT deployment.
+
+A configured key's scope covers both branches, each against what it actually reaches. An
+account-qualified selector is judged against its resolved route; an unqualified one against the
+account the upstream resolved and the model the body names; the fallback against the configured
+backend and the model that backend runs, with Exa named by its backend because it has no provider
+entry. `tests/server/api-key-scope-alpha-search.test.ts` covers the two unrouted branches.
 
 ## Standalone Search and exact account selectors
 
@@ -33,3 +57,9 @@ routing. Do not infer an exact account from caller-supplied account headers, pro
 selection, connection identity, or other ambient state; concurrent threads could cross-route
 credentials. Extending exact routing to those endpoints requires an opaque client correlation that
 can be bound server-side to a previously validated selector.
+
+The Responses sidecar parser in `src/web-search/parse.ts` checks runtime field shapes before consuming events: non-string types, non-array output/annotations, null content entries and `output_text` blocks whose text is not a string cannot throw away accumulated text. Streamed text is assembled per content part (`output_index`, `content_index`) in index order: each part contributes its done text, or its deltas when its done event never arrived, so one part's done text cannot discard another part's deltas. The first indexed event identifies any preceding unindexed accumulator. Later events without valid indexes join the only indexed part when exactly one exists; once multiple indexed parts exist, unindexed text stays separate and follows the indexed parts. When the completed output skipped a malformed entry, its text may be partial: an indexed stream fills only the parts the completed output lacks, while an unindexed stream replaces it as a whole; the completed output's citations are kept either way. Failure messages remain nonblank strings; malformed, empty or whitespace-only message values use the existing terminal diagnostic.
+
+Trailing source extraction in `src/web-search/parse.ts` pairs a pending title with a following URL only when the URL sits on an unmarked continuation line with no title of its own. A list item that cannot be paired, because another list item, a self-titled citation, or a URL that starts its own list item follows it, remains answer text, and extraction continues, so every later citation line, including one whose URL `appendSafeWebSearchSource` rejects, still leaves the answer. Non-HTTP URI-like text inside an inline code span of any backtick run, such as `mode:fast`, is not treated as a citation; an HTTP(S) URL is a citation even when code-formatted, and a closing code backtick is trimmed from it. Code spans are found by pairing backtick runs in one pass and the URI scheme length is bounded, so a long Sources line is scanned in linear time.
+
+Single-result query and answer truncation in `src/web-search/format-result.ts` uses the same surrogate-safe prefix as batched results. The existing UTF-16 limits and truncation markers remain unchanged.

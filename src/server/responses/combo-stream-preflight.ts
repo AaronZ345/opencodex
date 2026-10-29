@@ -1,11 +1,19 @@
+import { codexAccountModelRefusal, codexAccountModelRefusalPayload, hasConflictingCodexModelRefusalEnvelopes, type CodexAccountModelRefusal } from "../../combos/failover";
 import type { ResponsesTerminalStatus } from "../../bridge";
 import { comboFailureDecision } from "../../combos";
 import { httpStatusFromTerminalError } from "../../lib/errors";
+import { hasResponseMediaType } from "../../lib/http-response-semantics";
+import type { RequestFailureStage } from "../../lib/request-failure-model";
 import type { RequestLogContext } from "../request-log";
+import { carryResponseToolOwnership } from "./response-tool-ownership";
 import { createSseInspector } from "../relay";
 import { MAX_CLIENT_SSE_FRAME_BYTES } from "../sse-frame-buffer";
+import { REQUIRED_TOOL_CONTRACT_CODE } from "../../lib/errors";
+import { requiredToolReasoningPrelude } from "./combo-required-tool-stream";
 
 const COMBO_STREAM_PREFLIGHT_MAX_BYTES = MAX_CLIENT_SSE_FRAME_BYTES;
+// Required-tool reasoning may delay delivery, but never for an unbounded/trickling prelude.
+const COMBO_REQUIRED_TOOL_REASONING_HOLD_MS = 1_000;
 // Keep retained object count proportional to the same byte budget used by the
 // shared SSE framer. Tiny or empty upstream reads must not bypass the byte cap.
 const COMBO_STREAM_PREFLIGHT_MAX_CHUNKS = Math.max(
@@ -25,6 +33,10 @@ const TERMINAL_EVENTS = new Set([
   "response.failed",
   "response.incomplete",
 ]);
+
+// A failed terminal carrying one of these codes is a contract verdict, not a transient
+// upstream failure: another target would spend a request the adapter already refused.
+const NON_REPLAYABLE_FAILED_CODES = new Set(["required_tool_not_called"]);
 
 const RETRYABLE_ZERO_OUTPUT_INCOMPLETE_REASONS = new Set([
   "adapter_eof",
@@ -67,6 +79,26 @@ function bareErrorStatus(payload: unknown): number | undefined {
   });
 }
 
+/** Match the selected SSE error envelope before projection drops competing fields. */
+function terminalModelRefusal(status: number, event: Record<string, unknown>): CodexAccountModelRefusal {
+  if (hasConflictingCodexModelRefusalEnvelopes(status, event)) return "ambiguous";
+  const outer = codexAccountModelRefusalPayload(status, event);
+  if (outer === "ambiguous") return outer;
+  const nested = event.response;
+  if (event.type !== "error" && nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const nestedKind = codexAccountModelRefusalPayload(status, nested);
+    if (nestedKind === "ambiguous") return nestedKind;
+    const nestedError = (nested as Record<string, unknown>).error;
+    if (nestedError && typeof nestedError === "object" && !Array.isArray(nestedError)) {
+      return nestedKind;
+    }
+  }
+  if (event.type === "error" && !Object.hasOwn(event, "error") && typeof event.message === "string") {
+    return codexAccountModelRefusal(status, event.message, { allowNestedResponse: false });
+  }
+  return outer;
+}
+
 function bareErrorIsRetryable(payload: unknown): boolean {
   const status = bareErrorStatus(payload);
   if (status === undefined || !payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -83,19 +115,28 @@ function bareErrorIsRetryable(payload: unknown): boolean {
   const message = typeof error.message === "string"
     ? error.message
     : typeof event.message === "string" ? event.message : "";
-  return comboFailureDecision(status, message, { code }) === "hop";
+  return comboFailureDecision(status, message, {
+    code, codexModelRefusal: terminalModelRefusal(status, event),
+  }) === "hop";
 }
 
 function retryableZeroOutputTerminal(payload: unknown): boolean {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
   const event = payload as {
     type?: unknown;
-    response?: { incomplete_details?: { reason?: unknown } };
+    response?: { incomplete_details?: { reason?: unknown }; output?: unknown };
   };
   if (bareErrorIsRetryable(event)) return true;
-  if (event.type === "response.failed") return true;
+  if (event.type === "response.failed") {
+    const error = (event.response as { error?: { code?: unknown; retryable?: unknown } } | undefined)?.error;
+    const code = error?.code;
+    if (code === REQUIRED_TOOL_CONTRACT_CODE && error?.retryable === false) return false;
+    return !(typeof code === "string" && NON_REPLAYABLE_FAILED_CODES.has(code));
+  }
   if (event.type !== "response.incomplete") return false;
   const reason = event.response?.incomplete_details?.reason;
+  // A terminal-only upstream can carry output without preceding delta/item events.
+  if (reason === undefined) return !Array.isArray(event.response?.output) || event.response.output.length === 0;
   return typeof reason === "string" && RETRYABLE_ZERO_OUTPUT_INCOMPLETE_REASONS.has(reason);
 }
 
@@ -108,13 +149,53 @@ export function comboStreamPayloadCommitsOutput(payload: unknown): boolean {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return true;
   const type = (payload as { type?: unknown }).type;
   if (typeof type !== "string") return true;
+  if (type === "response.created") {
+    // A created event is a control frame only while its snapshot is empty. An origin that
+    // resumes a turn can put completed items in it, and treating that as a prelude would let
+    // a replacement re-emit output the caller already received.
+    const response = (payload as { response?: unknown }).response;
+    if (response && typeof response === "object" && !Array.isArray(response)) {
+      const output = (response as { output?: unknown }).output;
+      if (Array.isArray(output) && output.length > 0) return true;
+    }
+  }
   return !PRE_OUTPUT_CONTROL_EVENTS.has(type) && !TERMINAL_EVENTS.has(type);
+}
+
+/**
+ * How far this SSE body got, in the vocabulary of src/lib/request-failure-model.ts.
+ *
+ * The preflight cannot separate `semantic-output` from `side-effect`: it classifies any event
+ * that is not a lifecycle control frame as committing, without reading item types. Both stages
+ * refuse a resend, so the distinction would change no decision -- it is named here so a later
+ * reader does not mistake the collapse for an omission.
+ *
+ * A terminal that settled carrying no output is `protocol-prelude`, not `terminal`. That is
+ * the failure model's own rule: `terminal` means the answer was delivered, and an empty
+ * completion delivered none.
+ *
+ * Only the two nothing-observed stages actually reach a read error today: the loop below hands
+ * the body back as `accepted` the moment output commits or a terminal arrives, so a stream
+ * that committed anything never reports a stage at all. The committed branches stay because
+ * this has to be total for any other caller, and because a later change to that loop must not
+ * be able to promote a committed stream into a replaceable one by omission.
+ */
+function observedResponsesStage(state: {
+  readonly outputCommitted: boolean;
+  readonly terminalStatus: ResponsesTerminalStatus | undefined;
+  readonly responseCreated: boolean;
+}): RequestFailureStage {
+  if (state.outputCommitted) return "semantic-output";
+  if (state.terminalStatus === "completed") return "terminal";
+  if (state.responseCreated || state.terminalStatus !== undefined) return "protocol-prelude";
+  return "headers-only";
 }
 
 function replayBufferedResponse(
   response: Response,
   reader: ReadableStreamDefaultReader<Uint8Array>,
   buffered: Uint8Array[],
+  pendingRead?: ReturnType<typeof reader.read>,
 ): Response {
   let index = 0;
   const body = new ReadableStream<Uint8Array>({
@@ -124,7 +205,8 @@ function replayBufferedResponse(
         return;
       }
       try {
-        const next = await reader.read();
+        const next = await (pendingRead ?? reader.read());
+        pendingRead = undefined;
         if (next.done) controller.close();
         else controller.enqueue(next.value);
       } catch (error) {
@@ -135,11 +217,11 @@ function replayBufferedResponse(
       reader.cancel(reason).catch(() => undefined);
     },
   });
-  return new Response(body, {
+  return carryResponseToolOwnership(response, new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
-  });
+  }));
 }
 
 function failedTerminalResponse(
@@ -158,8 +240,13 @@ function failedTerminalResponse(
     : topLevelError && typeof topLevelError === "object" && !Array.isArray(topLevelError)
       ? topLevelError as Record<string, unknown>
     : {
-      type: "upstream_error",
-      code: "upstream_server_error",
+      // A caller-validated flat error can carry its identity beside type:error.
+      // Retain it when that caller established a 400, rather than discarding the
+      // rejection code before the single-shot opaque-state recovery sees it.
+      type: terminalPayload.type === "error" && logCtx.terminalHttpStatus === 400
+        ? "invalid_request_error" : "upstream_error",
+      code: terminalPayload.type === "error" && logCtx.terminalHttpStatus === 400
+        ? (typeof terminalPayload.code === "string" ? terminalPayload.code : null) : "upstream_server_error",
       message: typeof terminalPayload.message === "string"
         ? terminalPayload.message
         : logCtx.upstreamError ?? "Provider stream failed before producing output",
@@ -186,43 +273,78 @@ function failedTerminalResponse(
 
 export type ComboStreamPreflightResult =
   | { kind: "accepted"; response: Response }
-  | { kind: "failed"; response: Response };
+  | { kind: "failed"; response: Response; codexModelRefusal?: CodexAccountModelRefusal }
+  /**
+   * The body errored mid-stream and `replayReadErrors` asked for the prefix back rather than
+   * a rethrow. `stage` is how far the inspection actually got; whether that permits a
+   * replacement is the resend gate's decision, not this function's. Callers that only act on
+   * a projected terminal can treat this exactly as `accepted`, which is what it was before
+   * the stage became observable.
+   */
+  | { kind: "read-error"; response: Response; error: unknown; stage: RequestFailureStage };
 
 /**
- * Buffer a combo child's downstream SSE only until the request becomes unsafe to
- * replay or reaches a terminal. This owns exactly one body reader. The aggregate
- * buffer is capped by bytes and retained chunks; hitting either cap commits the
- * current target instead of growing memory or guessing that replay is safe.
+ * Buffer a Responses SSE only until the request becomes unsafe to replay or reaches a
+ * terminal. Combo failover and native post-header reset recovery share this protocol
+ * boundary, because they are asking the same question about the same bytes. This owns exactly
+ * one body reader. The aggregate buffer is capped by bytes and retained chunks; hitting either
+ * cap commits the current target instead of growing memory or guessing that replay is safe.
  */
 export async function preflightComboStreamResponse(
   response: Response,
   logCtx: RequestLogContext,
   retryableTerminal: (payload: unknown) => boolean = retryableZeroOutputTerminal,
-  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean },
+  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean; requiredToolPrelude?: boolean; signal?: AbortSignal },
 ): Promise<ComboStreamPreflightResult> {
-  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  const isEventStream = contentType.includes("text/event-stream")
+  const contentType = response.headers.get("content-type");
+  const isEventStream = hasResponseMediaType(response.headers, "text/event-stream")
     || (!contentType && options?.allowMissingContentType === true);
   if (!response.ok || !response.body || !isEventStream) {
     return { kind: "accepted", response };
   }
 
   const reader = response.body.getReader();
+  const cancelRead = () => { reader.cancel(options?.signal?.reason).catch(() => undefined); };
+  if (options?.signal?.aborted) cancelRead();
+  else options?.signal?.addEventListener("abort", cancelRead, { once: true });
   const buffered: Uint8Array[] = [];
   let bufferedBytes = 0;
   let outputCommitted = false;
+  let responseCreated = false;
   let terminalStatus: ResponsesTerminalStatus | undefined;
   let retryableTerminalPayload: Record<string, unknown> | undefined;
+  let holdTimer: ReturnType<typeof setTimeout> | undefined;
+  let holdDeadline: Promise<"hold-expired"> | undefined;
   const inspector = createSseInspector({
     logCtx,
+    // A payload the inspector could not parse still reached this proxy, and it may be output.
+    // Committing on it is what keeps an unreadable frame from reading as an empty prelude.
+    onOpaquePayload: () => { outputCommitted = true; },
     onParsedPayload: payload => {
       if (terminalStatus !== undefined || outputCommitted || retryableTerminalPayload) return;
+      if (payload !== null && typeof payload === "object" && !Array.isArray(payload)
+        && (payload as { type?: unknown }).type === "response.created") responseCreated = true;
       const retryable = retryableTerminal(payload);
       const matchedBareError = retryable && payload !== null && typeof payload === "object"
         && !Array.isArray(payload) && (payload as { type?: unknown }).type === "error";
       // A zero-output bare error is terminal evidence. Explicit client errors stay
       // committed; unknown and retryable upstream failures may advance the combo.
-      if (comboStreamPayloadCommitsOutput(payload) && !matchedBareError) outputCommitted = true;
+      const heldReasoning = options?.requiredToolPrelude && requiredToolReasoningPrelude(payload);
+      if (heldReasoning) holdDeadline ??= new Promise(resolve => {
+        holdTimer = setTimeout(() => resolve("hold-expired"), COMBO_REQUIRED_TOOL_REASONING_HOLD_MS);
+      });
+      if (comboStreamPayloadCommitsOutput(payload) && !matchedBareError && !heldReasoning) outputCommitted = true;
+      if (options?.requiredToolPrelude && payload && typeof payload === "object") {
+        const event = payload as { type?: unknown; response?: { output?: unknown; error?: { code?: unknown; retryable?: unknown } } };
+        const output = event.response?.output;
+        const contractFailure = event.type === "response.failed" && event.response?.error?.code === REQUIRED_TOOL_CONTRACT_CODE
+          && event.response.error.retryable !== false && Array.isArray(output) && output.every(item =>
+            item !== null && typeof item === "object" && !Array.isArray(item)
+            && ["message", "reasoning"].includes((item as { type: string }).type));
+        // Other lifecycle/terminal snapshots can hide effects too. Only our checked contract
+        // failure may discard a terminal-only text snapshot that was held in its entirety.
+        if (output !== undefined && (!Array.isArray(output) || output.length > 0) && !contractFailure) outputCommitted = true;
+      }
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
       if (retryable) retryableTerminalPayload = payload as Record<string, unknown>;
     },
@@ -231,15 +353,26 @@ export async function preflightComboStreamResponse(
 
   try {
     for (;;) {
+      options?.signal?.throwIfAborted();
       let next: Awaited<ReturnType<typeof reader.read>>;
       try {
-        next = await reader.read();
+        const pendingRead = reader.read();
+        const observed = await (holdDeadline ? Promise.race([pendingRead, holdDeadline]) : pendingRead);
+        options?.signal?.throwIfAborted();
+        if (observed === "hold-expired") {
+          // Expiry commits this child. Hand the in-flight read to the relay so its
+          // eventual chunk/error is delivered exactly once, never lost to the race.
+          return { kind: "accepted", response: replayBufferedResponse(response, reader, buffered, pendingRead) };
+        }
+        next = observed;
       } catch (error) {
         if (!options?.replayReadErrors) throw error;
         // The native relay still owns post-header transport failures. Preserve
         // the bounded prefix and the errored reader; cancelling it here would
         // erase the failure before either client relay or inspection sees it.
-        return { kind: "accepted", response: replayBufferedResponse(response, reader, buffered) };
+        const replay = replayBufferedResponse(response, reader, buffered);
+        const stage = observedResponsesStage({ outputCommitted, terminalStatus, responseCreated });
+        return { kind: "read-error", response: replay, error, stage };
       }
       if (next.done) {
         inspector.finish();
@@ -265,7 +398,10 @@ export async function preflightComboStreamResponse(
         || retryableTerminalPayload?.type === "error")
         && !outputCommitted && retryableTerminalPayload) {
         await reader.cancel("retrying zero-output combo stream terminal").catch(() => undefined);
-        return { kind: "failed", response: failedTerminalResponse(response, retryableTerminalPayload, logCtx) };
+        const failed = failedTerminalResponse(response, retryableTerminalPayload, logCtx);
+        return { kind: "failed", response: failed,
+          ...(failed.status === 400
+            ? { codexModelRefusal: terminalModelRefusal(failed.status, retryableTerminalPayload) } : {}) };
       }
       if (next.done || terminalStatus !== undefined || outputCommitted
         || bufferedBytes >= COMBO_STREAM_PREFLIGHT_MAX_BYTES
@@ -274,6 +410,113 @@ export async function preflightComboStreamResponse(
       }
     }
   } finally {
+    if (holdTimer !== undefined) clearTimeout(holdTimer);
+    options?.signal?.removeEventListener("abort", cancelRead);
     inspector.dispose();
   }
+}
+
+/** Produce a replacement body for a mid-stream failure at `stage`, or null to keep the error. */
+export type ProtocolSafeResetRecovery = (
+  error: unknown,
+  stage: RequestFailureStage,
+) => Promise<Response | null>;
+
+/**
+ * Defer protocol inspection until the downstream actually pulls the body.
+ *
+ * Direct passthrough must return response headers before the first SSE event arrives, so the
+ * inspection cannot be awaited at the dispatch site the way combo routing awaits it. Wrapping
+ * the body moves it to the first pull, which is the earliest moment the client is willing to
+ * wait anyway.
+ */
+export function deferProtocolSafeResetRecovery(
+  response: Response,
+  logCtx: RequestLogContext,
+  recover: ProtocolSafeResetRecovery,
+  options?: { allowMissingContentType?: boolean },
+): Response {
+  if (!response.body) return response;
+
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let initialization: Promise<void> | undefined;
+  let closed = false;
+
+  const cancelBody = (body: ReadableStream<Uint8Array> | null, reason?: unknown): void => {
+    try { void body?.cancel(reason).catch(() => {}); } catch { /* already locked or closed */ }
+  };
+  const initialize = async (): Promise<void> => {
+    const preflight = await preflightComboStreamResponse(
+      response,
+      logCtx,
+      () => false,
+      { allowMissingContentType: options?.allowMissingContentType === true, replayReadErrors: true },
+    );
+    let selected = preflight.response;
+    if (preflight.kind === "read-error") {
+      const replacement = await recover(preflight.error, preflight.stage);
+      if (replacement) {
+        cancelBody(selected.body, "using protocol-safe replacement stream");
+        selected = replacement;
+      }
+    }
+    if (closed) {
+      cancelBody(selected.body, "downstream cancelled before protocol preflight completed");
+      return;
+    }
+    reader = selected.body?.getReader();
+  };
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        initialization ??= initialize();
+        await initialization;
+        if (closed) return;
+        if (!reader) {
+          closed = true;
+          controller.close();
+          return;
+        }
+        const next = await reader.read();
+        if (closed) return;
+        if (next.done) {
+          closed = true;
+          try { reader.releaseLock(); } catch { /* already released */ }
+          reader = undefined;
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        if (closed) return;
+        closed = true;
+        try { reader?.releaseLock(); } catch { /* errored reader */ }
+        reader = undefined;
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      if (closed) return;
+      closed = true;
+      if (reader) {
+        try { void reader.cancel(reason).catch(() => {}); } catch { /* already closed */ }
+        try { reader.releaseLock(); } catch { /* already released */ }
+        reader = undefined;
+      } else if (initialization === undefined) {
+        // Nothing has read the upstream yet, so this body is still ours to cancel.
+        cancelBody(response.body, reason);
+      }
+      // A cancel while the preflight is mid-flight falls through deliberately. That body is
+      // locked by the preflight's own reader, so cancelling it here would reject and be
+      // swallowed; `initialize` sees `closed` when it settles and releases whichever body it
+      // ended up selecting, which is the one that actually has to be let go.
+    },
+  }, { highWaterMark: 0 });
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }

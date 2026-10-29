@@ -1,7 +1,10 @@
-import { CODEX_REASONING_LEVELS } from "../../reasoning-effort";
+import { isCodexControlPlaneModel } from "../control-plane-models";
+import { withCodexControlPlaneRows } from "./control-plane";
+import { CODEX_REASONING_LEVELS, type CodexReasoningLevel } from "../../reasoning-effort";
 import { clearModelCache } from "../model-cache";
 import { routedSlug, slugEquivalenceKey } from "../../providers/slug-codec";
 import { COMBO_NAMESPACE } from "../../combos";
+import { hasOcxComboAuthorship, hasOcxRoutedAuthorship, reapplyRetainedComboDescription, ROUTED_DESCRIPTION_PREFIX } from "./ownership";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
   CODEX_PROVIDER_MODEL_CATALOG_KIND,
@@ -46,6 +49,9 @@ import { NATIVE_RESERVE_MODEL } from "./native-models";
 import { isReserveCatalogProjection, type ReserveCatalogProjection } from "./reserve";
 import { deriveEntry, finishUpstreamNativeEntry, isExactComboCatalogEntry } from "./derive-entry";
 import { PICKER_ORDER_PRIORITY_BASE, SPAWN_PRIORITY_FIELD } from "./subagent-roster";
+import { applyConfiguredUltraFast, configuredUltraFastSlugs } from "./configured-tiers";
+import { applyNativeUltraFastTier } from "./native-ultrafast";
+import { applyNativePriority, retainedNativeSourcePriorities, type NativePrioritySource } from "./native-priority";
 
 export interface ObservedCatalogEntryBuildInput {
   readonly template: RawEntry | null;
@@ -69,6 +75,7 @@ export interface ObservedCatalogEntryBuildInput {
   readonly accountNativeSlugsBySelector?: ReadonlyMap<string, readonly string[]>;
   /** Codex-only manual selector metadata; deliberately independent of live permission. */
   readonly reserve?: ReserveCatalogProjection;
+  readonly nativeSource?: NativePrioritySource;
 }
 
 /** Build entries with the process-observed Codex feature state. */
@@ -88,6 +95,7 @@ export function buildCatalogEntries(
   accountNativeSlugsBySelector?: ReadonlyMap<string, readonly string[]>,
   keepNativeChatGptOnV1 = false,
   modelPickerOrder: readonly string[] = [],
+  nativeSource?: NativePrioritySource,
 ): RawEntry[] {
   const entries = buildCatalogEntriesFromObservedState({
     template,
@@ -106,7 +114,16 @@ export function buildCatalogEntries(
     openaiContextCap: contextCap,
     accountNativeSlugs,
     accountNativeSlugsBySelector,
+    nativeSource,
   });
+  // Live discovery does not run the disk merge; use the same captured declarations and row fences.
+  const configured = configuredUltraFastSlugs(goModels);
+  for (const entry of entries) {
+    if (typeof entry.slug !== "string" || !entry.slug.includes("/")
+      || isNativeAliasCatalogEntry(entry) || isExactComboCatalogEntry(entry, exactComboSlugs)
+      || trustedAccountBoundNativeCatalogSlug(entry) !== undefined) continue;
+    applyConfiguredUltraFast(entry, undefined, configured.has(entry.slug), false);
+  }
   applyFullModelPickerOrder(entries, modelPickerOrder);
   return entries;
 }
@@ -130,6 +147,7 @@ export function buildCatalogEntriesFromObservedState({
   accountNativeSlugs,
   accountNativeSlugsBySelector,
   reserve,
+  nativeSource,
 }: ObservedCatalogEntryBuildInput): RawEntry[] {
   // Codex's models-manager sorts by `priority` ASC and advertises the first 5 picker-visible
   // models to spawn_agent (sort_by_key(priority) + MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT=5). Catalog
@@ -194,9 +212,9 @@ export function buildCatalogEntriesFromObservedState({
   const comboPublicSlugs = new Set(goModels
     .filter(model => model.provider === COMBO_NAMESPACE)
     .map(catalogModelSlug));
-  for (const slug of gptSlugs) {
+  for (const slug of gptSlugs.filter(slug => !isCodexControlPlaneModel(slug))) {
     const native = deriveEntry(template, slug, "OpenAI native model (Codex OAuth passthrough).", 9, undefined, new Set(), openaiContextCap);
-    if (rank.has(slug)) native.priority = rank.get(slug)!;
+    applyNativePriority(native, slug, rank, featured?.length ?? 0, nativeSource);
     nativeEntries.push(native);
     const nativeAlias = nativeAliasesBySlug.get(slug);
     if (!nativeAlias || collisionSkipped.has(nativeAlias)) {
@@ -206,7 +224,7 @@ export function buildCatalogEntriesFromObservedState({
     const routed = deriveEntry(
       template,
       slug,
-      `Routed via opencodex → ${nativeAlias.provider} (${nativeAlias.owned_by ?? nativeAlias.provider}).`,
+      `${ROUTED_DESCRIPTION_PREFIX}${nativeAlias.provider} (${nativeAlias.owned_by ?? nativeAlias.provider}).`,
       5,
       nativeAlias,
       exactComboSlugs,
@@ -224,9 +242,9 @@ export function buildCatalogEntriesFromObservedState({
     const selectorNativeSlugs = accountNativeSlugsBySelector?.get(selector)
       ?? accountNativeSlugs
       ?? gptSlugs;
-    const accountNativeEntries = selectorNativeSlugs.filter(slug => slug !== NATIVE_RESERVE_MODEL).map(slug => (
+    const accountNativeEntries = selectorNativeSlugs.filter(slug => slug !== NATIVE_RESERVE_MODEL && !isCodexControlPlaneModel(slug)).map(slug => (
       nativeEntriesBySlug.get(slug)
-        ?? deriveEntry(template, slug, "OpenAI native model (Codex OAuth passthrough).", 9, undefined, new Set(), openaiContextCap)
+        ?? applyNativePriority(deriveEntry(template, slug, "OpenAI native model (Codex OAuth passthrough).", 9, undefined, new Set(), openaiContextCap), slug, rank, featured?.length ?? 0, nativeSource)
     ));
     if (reserve?.mainSelectors.includes(selector)) accountNativeEntries.push(reserve.source);
     for (const [nativeIndex, native] of accountNativeEntries.entries()) {
@@ -264,7 +282,7 @@ export function buildCatalogEntriesFromObservedState({
     const e = deriveEntry(
       template,
       slug,
-      `Routed via opencodex → ${m.provider} (${m.owned_by ?? m.provider}).`,
+      `${ROUTED_DESCRIPTION_PREFIX}${m.provider} (${m.owned_by ?? m.provider}).`,
       5,
       m,
       exactComboSlugs,
@@ -306,7 +324,7 @@ export function buildCatalogEntriesFromObservedState({
       delete entry.prefer_websockets;
     }
   }
-  return applyMultiAgentMode(out, multiAgentMode, multiAgentV2Enabled, {
+  return applyMultiAgentMode(withCodexControlPlaneRows(out, template ? [template] : [], true, wsEnabled), multiAgentMode, multiAgentV2Enabled, {
     keepNativeChatGptOnV1,
     preserveDefaultMultiAgentVersion: isReserveCatalogProjection,
   });
@@ -368,16 +386,15 @@ export function orderForModelPicker(
  * True when an existing catalog row was authored by OpenCodex routing (#855).
  * Every generated routed row — current full-slug form, the June–July 2026
  * provider-name form, and legacy combo aliases — carries the stable
- * description prefix `Routed via opencodex → `; foreign rows from Cursor or
- * user tooling do not. `owned_by` cannot serve as the signal (upstream
- * ownership), and `comp_hash` defaults to "opencodex" for every normalized
- * row.
+ * description prefix `Routed via opencodex → `, or — when a combo overrides its description
+ * (#7229) — the `opencodex_routed_origin` marker (./ownership); foreign rows from Cursor or
+ * user tooling do not. `owned_by` describes upstream ownership, and `comp_hash`
+ * describes history compatibility; neither is an authorship signal.
  */
-function isOcxAuthoredRoutedEntry(entry: RawEntry): boolean {
+export function isOcxAuthoredRoutedEntry(entry: RawEntry): boolean {
   if (isNativeAliasCatalogEntry(entry)) return true;
-  const desc = typeof entry.description === "string" ? entry.description : "";
   const slug = typeof entry.slug === "string" ? entry.slug : "";
-  return slug.includes("/") && desc.startsWith("Routed via opencodex → ");
+  return slug.includes("/") && hasOcxRoutedAuthorship(entry);
 }
 
 function recoverableNativeSlug(entry: RawEntry): string | null {
@@ -410,12 +427,12 @@ export function mergeCatalogModelsWithNativeRecovery(
 ): RawEntry[] {
   const merged = [...primaryCatalogModels];
   const recoveredNativeSlugs = new Set(primaryCatalogModels.flatMap(entry => {
-    const slug = recoverableNativeSlug(entry);
+    const slug = isCodexControlPlaneModel(entry.slug) ? String(entry.slug) : recoverableNativeSlug(entry);
     return slug === null ? [] : [slug];
   }));
   for (const source of nativeRecoverySources) {
     for (const entry of source) {
-      const slug = recoverableNativeSlug(entry);
+      const slug = isCodexControlPlaneModel(entry.slug) ? String(entry.slug) : recoverableNativeSlug(entry);
       if (slug === null || recoveredNativeSlugs.has(slug)) continue;
       merged.push(structuredClone(entry) as RawEntry);
       recoveredNativeSlugs.add(slug);
@@ -437,7 +454,8 @@ export interface ObservedCatalogMergePolicy {
 export const CANONICAL_NATIVE_CATALOG_CONTENT_POLICY: Readonly<
   Pick<ObservedCatalogMergePolicy, "nativeBackfillSlugs" | "unsupportedNativeEntries">
 > = Object.freeze({
-  nativeBackfillSlugs: Object.freeze([...NATIVE_OPENAI_MODELS]),
+  // A getter: configured natives join NATIVE_OPENAI_MODELS after this module loads.
+  get nativeBackfillSlugs() { return Object.freeze([...NATIVE_OPENAI_MODELS]); },
   unsupportedNativeEntries: "drop",
 });
 
@@ -460,6 +478,7 @@ export function applyFullModelPickerOrder(entries: RawEntry[], order: readonly s
   if (!pickerOrder.some(slug => !slug.includes("/"))) return;
   const rankOf = modelPickerRank(pickerOrder);
   for (const entry of entries) {
+    if (isCodexControlPlaneModel(entry.slug)) continue;
     const natural = entry[SPAWN_PRIORITY_FIELD] ?? entry.priority ?? 9;
     entry[SPAWN_PRIORITY_FIELD] = natural;
     entry.priority = rankOf(String(entry.slug)) ?? pickerOrder.length + Number(natural);
@@ -467,6 +486,12 @@ export function applyFullModelPickerOrder(entries: RawEntry[], order: readonly s
 }
 
 export interface ObservedCatalogMergeInput {
+  /** Preserve operator-supplied Ultra Fast only from the exact persisted routed row. */
+  readonly ultraFastTier?: boolean;
+  /** Current captured wire declarations; disk rows and templates never populate this set. */
+  readonly configuredUltraFastSlugs?: ReadonlySet<string>;
+  /** Current config-only verdict for persisted rows (not authority from the old disk tier). */
+  readonly retainedFlexPolicyBySlug?: ReadonlyMap<string, boolean>;
   readonly catalogModels: readonly RawEntry[];
   readonly baselineCatalogModels: readonly RawEntry[];
   readonly routedEntries: readonly RawEntry[];
@@ -486,6 +511,11 @@ export interface ObservedCatalogMergeInput {
   readonly multiAgentV2Enabled: boolean;
   readonly keepNativeChatGptOnV1?: boolean;
   readonly exactComboSlugs: ReadonlySet<string>;
+  /**
+   * Current combo row descriptions by public slug (#7229). When supplied, retained combo rows
+   * are re-projected onto it; absent means the caller has no config and leaves them unchanged.
+   */
+  readonly comboDescriptions?: ReadonlyMap<string, string>;
   readonly hasPhysicalComboProvider: boolean;
   readonly includeNativeOpenAi: boolean;
   readonly accountBoundEntries: readonly RawEntry[];
@@ -507,6 +537,9 @@ export interface ObservedCatalogMergeInput {
  * accidentally fall back to process-ambient catalog discovery or merge-policy warnings.
  */
 export function mergeCatalogEntriesFromObservedState({
+  ultraFastTier = false,
+  configuredUltraFastSlugs = new Set(),
+  retainedFlexPolicyBySlug = new Map(),
   catalogModels,
   baselineCatalogModels,
   routedEntries,
@@ -526,6 +559,7 @@ export function mergeCatalogEntriesFromObservedState({
   multiAgentV2Enabled,
   keepNativeChatGptOnV1,
   exactComboSlugs,
+  comboDescriptions,
   hasPhysicalComboProvider,
   includeNativeOpenAi,
   accountBoundEntries,
@@ -539,10 +573,12 @@ export function mergeCatalogEntriesFromObservedState({
   // Raw catalog rows contain nested arrays/objects that normalization mutates. Detach every row at
   // the observed-core boundary so callers can safely retain evidence objects or repeat the merge.
   const detachedCatalogModels = catalogModels
+    .filter(entry => !isCodexControlPlaneModel(entry.slug))
     .map(entry => restoreNativeDisplayName(structuredClone(entry) as RawEntry));
   const detachedBaselineCatalogModels = baselineCatalogModels
+    .filter(entry => !isCodexControlPlaneModel(entry.slug))
     .map(entry => restoreNativeDisplayName(structuredClone(entry) as RawEntry));
-  const detachedRoutedEntries = routedEntries.map(entry => structuredClone(entry) as RawEntry);
+  const detachedRoutedEntries = routedEntries.filter(entry => !isCodexControlPlaneModel(entry.slug)).map(entry => structuredClone(entry) as RawEntry);
   // Track this invocation's generated custom rows, not ownership markers read from disk.
   // Their builder already finalized exact native ladders and ordinary routed mock tiers.
   const freshCustomEntries = new Set(detachedRoutedEntries.filter(entry =>
@@ -618,8 +654,7 @@ export function mergeCatalogEntriesFromObservedState({
   }
   const freshExactComboEntries = new Set(admittedRoutedEntries.filter(entry => (
     isExactComboCatalogEntry(entry, exactComboSlugs)
-    && typeof entry.description === "string"
-    && entry.description.startsWith(`Routed via opencodex → ${COMBO_NAMESPACE} (`)
+    && hasOcxComboAuthorship(entry)
   )));
   const rank = new Map(featured.map((slug, i) => [slug, i] as const));
   const freshEquivalentKeys = new Set(admittedRoutedEntries.flatMap(entry => (
@@ -654,12 +689,7 @@ export function mergeCatalogEntriesFromObservedState({
     return staleComboKeys.has(key) && !currentNonComboKeys.has(key);
   });
   const catalogModelsForMerge = [...detachedCatalogModels, ...restoredComboShadows];
-  const nativePriority = (slug: string, fallback: unknown): number => {
-    const base = baseline.get(slug)
-      ?? (typeof fallback === "number" ? fallback : 9);
-    if (rank.has(slug)) return rank.get(slug)!;
-    return featured.length > 0 ? Math.max(base, featured.length + 100) : base;
-  };
+  const nativeSource: NativePrioritySource = { baseline, retainedBySlug: retainedNativeSourcePriorities(catalogModelsForMerge) };
   const nativeSourceEntries = includeNativeOpenAi
     ? catalogModelsForMerge
     .filter(m => typeof m.slug === "string"
@@ -677,10 +707,9 @@ export function mergeCatalogEntriesFromObservedState({
       if (shouldUpgradeToUpstreamEntry(m)) {
         const upstream = upstreamNativeEntry(slug)!;
         const finished = finishUpstreamNativeEntry(upstream, 9, openaiContextCap);
-        finished.priority = nativePriority(slug, upstream.priority);
-        return finished;
+        return applyNativePriority(finished, slug, rank, featured.length, nativeSource);
       }
-      const preserved = normalizeServiceTiers({ ...m, priority: nativePriority(slug, m[SPAWN_PRIORITY_FIELD] ?? m.priority) });
+      const preserved = normalizeServiceTiers(applyNativePriority({ ...m }, slug, rank, featured.length, nativeSource));
       // Recompute spawn rank from current featured models, not a prior picker override.
       delete preserved[SPAWN_PRIORITY_FIELD];
       // Older natives kept from disk still need the mock top tiers (max + ultra always
@@ -706,12 +735,12 @@ export function mergeCatalogEntriesFromObservedState({
         template ? JSON.parse(JSON.stringify(template)) : null,
         slug,
         "OpenAI native model (Codex OAuth passthrough).",
-        nativePriority(slug, upstreamNativeEntry(slug)?.priority),
+        9,
         undefined,
         new Set(),
         openaiContextCap,
       );
-      entry.priority = nativePriority(slug, upstreamNativeEntry(slug)?.priority);
+      applyNativePriority(entry, slug, rank, featured.length, nativeSource);
       native.push(entry);
     }
   }
@@ -781,7 +810,17 @@ export function mergeCatalogEntriesFromObservedState({
       delete entry[SPAWN_PRIORITY_FIELD];
     }
     const slug = String(entry.slug);
-    if (!isOcxAuthoredRoutedEntry(entry) || isNativeAliasCatalogEntry(entry)) continue;
+    if (comboDescriptions !== undefined && exactComboSlugs.has(slug)
+      && (isNativeAliasCatalogEntry(entry) || (entry.owned_by === COMBO_NAMESPACE && hasOcxComboAuthorship(entry)))) {
+      reapplyRetainedComboDescription(entry, comboDescriptions.get(slug));
+    }
+    if (!isOcxAuthoredRoutedEntry(entry)) continue;
+    // The builder no longer copies a template's comp_hash onto routed rows (#5796), but a row
+    // kept from disk may still carry one. Custom rows, Codex-forward aliases included, never
+    // reach this loop: they are rebuilt from config.
+    // Clear the former synthetic "opencodex" marker as well: it is not upstream evidence.
+    entry.comp_hash = null;
+    if (isNativeAliasCatalogEntry(entry)) continue;
     const featuredRank = featuredRankOf(slug);
     entry.priority = featuredRank !== undefined
       ? featuredRank * priorityStride
@@ -838,6 +877,39 @@ export function mergeCatalogEntriesFromObservedState({
     }
     return false;
   });
+  // First occurrence wins, matching enforceCatalogSlugUniqueness: a later duplicate row of the
+  // same slug is what the writer drops, so it must not decide which declaration survives.
+  const operatorRows = new Map<string, RawEntry | undefined>();
+  for (const entry of detachedCatalogModels) {
+    if (typeof entry.slug !== "string" || operatorRows.has(entry.slug)) continue;
+    operatorRows.set(entry.slug, trustedAccountBoundNativeCatalogSlug(entry) === undefined
+      && !isNativeAliasCatalogEntry(entry) && entry.owned_by !== COMBO_NAMESPACE ? entry : undefined);
+  }
+  for (const entry of finalRoutedEntries) {
+    if (typeof entry.slug !== "string" || !entry.slug.includes("/")
+      || isNativeAliasCatalogEntry(entry) || isExactComboCatalogEntry(entry, exactComboSlugs)
+      || trustedAccountBoundNativeCatalogSlug(entry) !== undefined) continue;
+    applyConfiguredUltraFast(entry, operatorRows.get(entry.slug), configuredUltraFastSlugs.has(entry.slug), ultraFastTier);
+  }
+  // Degraded discovery preserves disk rows, so they bypass fresh tier generation.
+  // Revoke only an explicitly disallowed Flex tier according to today's provider policy;
+  // a transient outage must not erase Flex while the configured wire still permits it.
+  const persistedRoutedSet = new Set(preservedRoutedEntries);
+  for (const entry of finalRoutedEntries) {
+    if (!persistedRoutedSet.has(entry)) continue;
+    const slug = typeof entry.slug === "string" ? entry.slug : "";
+    const excluded = isNativeAliasCatalogEntry(entry) || isExactComboCatalogEntry(entry, exactComboSlugs);
+    if (!excluded && retainedFlexPolicyBySlug.get(slug) !== false) continue;
+    if (Array.isArray(entry.service_tiers)) {
+      entry.service_tiers = entry.service_tiers.filter(tier => tier?.id !== "flex");
+    }
+    if (Array.isArray(entry.additional_speed_tiers)) {
+      entry.additional_speed_tiers = entry.additional_speed_tiers.filter(tier => tier !== "flex");
+    }
+    for (const field of ["service_tier", "default_service_tier"] as const) {
+      if (entry[field] === "flex") delete entry[field];
+    }
+  }
   const finalRoutedEntrySet = new Set(finalRoutedEntries);
   const degradedPreservedCount = preservedRoutedEntries.filter(entry => {
     if (!finalRoutedEntrySet.has(entry)) return false;
@@ -860,9 +932,22 @@ export function mergeCatalogEntriesFromObservedState({
     const normalized = reserveProjection ? m : normalizeServiceTiers(m);
     if (!reserveProjection && !isNativeAliasCatalogEntry(normalized)) applyNativeOpenAiContextOverride(normalized, openaiContextCap);
     const exactCombo = isExactComboCatalogEntry(m, exactComboSlugs);
+    // The builder copied this metadata from the pinned first-party row only for an exact
+    // ChatGPT/Codex forward custom alias. Freshness plus source equality prevents an old or
+    // unrelated routed row from claiming the native account's access programs at this second
+    // normalization boundary.
+    const nativeSourceSlug = typeof m.slug === "string" && m.slug.startsWith("openai/")
+      ? m.slug.slice("openai/".length) : undefined;
+    const nativeSource = nativeSourceSlug ? upstreamNativeEntry(nativeSourceSlug) : undefined;
+    const preserveNativeAccessPrograms = freshCustomEntries.has(m)
+      && m.owned_by !== COMBO_NAMESPACE
+      && nativeSource != null
+      && Object.hasOwn(nativeSource, "available_access_programs")
+      && JSON.stringify(m.available_access_programs) === JSON.stringify(nativeSource.available_access_programs);
     const e = reserveProjection ? normalized : ensureStrictCatalogFields(normalized, {
       preserveExactInputModalities: exactCombo,
       isRouted: finalRoutedEntrySet.has(m),
+      preserveNativeAccessPrograms,
     });
     // Mock-max universality (260709): preserved routed entries from disk may predate
     // the max rung — ensure it here so subagent max spawns validate on every
@@ -872,7 +957,7 @@ export function mergeCatalogEntriesFromObservedState({
     // (luna: no ultra) stay intact.
     if (!freshCustomEntries.has(m) && !exactCombo && !reserveProjection && !String(e.slug ?? "").startsWith("opencode-go/")) {
       const levels = Array.isArray(e.supported_reasoning_levels)
-        ? e.supported_reasoning_levels as Array<{ effort?: string }>
+        ? e.supported_reasoning_levels as Array<Partial<CodexReasoningLevel>>
         : [];
       if (levels.length > 0
         && !suppressedSyntheticMaxSlugs.has(String(e.slug ?? ""))
@@ -890,6 +975,11 @@ export function mergeCatalogEntriesFromObservedState({
         );
       }
     }
+    // Native Astra/Sol rows (bare and account-bound) gain or lose the documented Ultrafast
+    // choice with the switch; aliases, combos and reserve projections keep their own tiers.
+    if (!reserveProjection && !exactCombo && m.owned_by !== COMBO_NAMESPACE && !isNativeAliasCatalogEntry(e)) {
+      applyNativeUltraFastTier(e, ultraFastTier);
+    }
     if (wsEnabled) e.supports_websockets = true;
     else {
       delete e.supports_websockets;
@@ -902,7 +992,10 @@ export function mergeCatalogEntriesFromObservedState({
   // clobber a hide flag back to list. Bare ids disable every account clone; qualified ids disable
   // only their generated account row.
   const versionedEntries = applyMultiAgentMode(
-    applyNativeVisibility(mergedEntries, disabledModels, alignedAccountBoundEntries.length > 0, observedNativeSlugs),
+    withCodexControlPlaneRows(
+      applyNativeVisibility(mergedEntries, disabledModels, alignedAccountBoundEntries.length > 0, observedNativeSlugs),
+      [...catalogModels, ...baselineCatalogModels, ...routedEntries], includeNativeOpenAi, wsEnabled,
+    ),
     multiAgentMode,
     multiAgentV2Enabled,
     { keepNativeChatGptOnV1, preserveDefaultMultiAgentVersion: isReserveCatalogProjection, nativeDefaults: nativeMultiAgentDefaults },

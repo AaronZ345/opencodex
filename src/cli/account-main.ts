@@ -1,5 +1,7 @@
 import { isAbsolute } from "node:path";
+import { redactSecretArgs } from "./secret-args";
 import { codexExecInvocation } from "../codex/exec-invocation";
+import { validatedCodexExecInvocationAsync, type CodexExecBoundaryAsyncDeps } from "../codex/exec-boundary";
 import { resolveAndPersistCodexRuntime, type ResolveCodexRuntimeDeps } from "../codex/runtime";
 import type { ResolveDeps, SpawnInvocation } from "../lib/win-exec";
 import {
@@ -45,6 +47,41 @@ export type NativeMainCodexLoginInvocationDeps =
   & ResolveDeps
   & Pick<ResolveCodexRuntimeDeps, "existsSync" | "execFileSync" | "configDir" | "readFileSync">;
 
+export type NativeMainCodexLoginValidatedDeps =
+  & NativeMainCodexLoginInvocationDeps
+  & CodexExecBoundaryAsyncDeps;
+
+/**
+ * Resolve+persist the runtime selection, then let the exec boundary produce the
+ * invocation that is spawned. Validating the raw command matters: re-wrapping
+ * the already-prepared invocation would launch cmd.exe as if it were Codex and
+ * drop windowsVerbatimArguments.
+ */
+export async function nativeMainCodexLoginValidatedInvocation(
+  platform: NodeJS.Platform = process.platform,
+  deps: NativeMainCodexLoginValidatedDeps = {},
+): Promise<SpawnInvocation> {
+  const env = deps.env ?? process.env;
+  const command = resolveAndPersistCodexRuntime({
+    env,
+    platform,
+    existsSync: deps.existsSync,
+    execFileSync: deps.execFileSync,
+    configDir: deps.configDir,
+    readFileSync: deps.readFileSync,
+    discoverAlternatives: false,
+  }).runtime.command || "codex";
+  return validatedCodexExecInvocationAsync(command, ["login"], {
+    env,
+    platform,
+    exists: deps.exists,
+    executable: deps.executable,
+    realpath: deps.realpath,
+    macBundleTrustReasonAsync: deps.macBundleTrustReasonAsync,
+    signal: deps.signal,
+  });
+}
+
 function flag(args: string[], name: string): boolean {
   const index = args.indexOf(name);
   if (index < 0) return false;
@@ -53,7 +90,7 @@ function flag(args: string[], name: string): boolean {
 }
 
 function reject(args: string[]): number {
-  if (args.length > 0) console.error(`Unexpected argument(s): ${args.join(", ")}`);
+  if (args.length > 0) console.error(`Unexpected argument(s): ${redactSecretArgs(args).join(", ")}`);
   console.error(USAGE);
   return 1;
 }
@@ -64,8 +101,10 @@ function effectiveCodexHome(result: Record<string, unknown>): string {
     : "the effective CODEX_HOME";
 }
 
+const EMPTY_PROFILES_NOTES = ["No native main login profiles registered.", "Next: ocx account main add <label>"];
+
 function printProfiles(profiles: PublicProfile[]): void {
-  if (profiles.length === 0) { console.log("No native main login profiles registered."); return; }
+  if (profiles.length === 0) { for (const note of EMPTY_PROFILES_NOTES) console.log(note); return; }
   const rows = profiles.map(profile => [profile.state === "active" ? "*" : " ", profile.label, profile.id, profile.identityHint]);
   const header = ["", "LABEL", "PROFILE ID", "IDENTITY"];
   const widths = header.map((value, index) => Math.max(value.length, ...rows.map(row => row[index]!.length)));
@@ -89,14 +128,16 @@ export function nativeMainCodexLoginInvocation(
   return codexExecInvocation(command, ["login"], platform, deps);
 }
 
-function spawnOfficialCodexLogin(codexHome: string): NativeMainLoginChild {
-  const invocation = nativeMainCodexLoginInvocation();
-  const child = Bun.spawn([invocation.file, ...invocation.args], {
+async function spawnOfficialCodexLogin(codexHome: string): Promise<NativeMainLoginChild> {
+  // The boundary validates the raw resolved command and returns the invocation
+  // to spawn; the prepared-invocation builder above stays trust-free on purpose.
+  const validated = await nativeMainCodexLoginValidatedInvocation();
+  const child = Bun.spawn([validated.file, ...validated.args], {
     env: { ...process.env, CODEX_HOME: codexHome },
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
-    ...(invocation.options.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    ...(validated.options.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   return child;
 }
@@ -272,8 +313,12 @@ export async function cmdNativeMainAccount(args: string[], deps: AccountDeps): P
     const result = await apiJson(deps, baseUrl, "GET", path);
     if (result.status === 0) return proxyUnreachable(result.transportError);
     if (result.status !== 200) return apiError(result.json, `failed to ${sub} native profiles`, result.status);
-    if (wantsJson || sub === "doctor") console.log(JSON.stringify(result.json, null, 2));
-    else printProfiles(Array.isArray(result.json.profiles) ? result.json.profiles as PublicProfile[] : []);
+    const profiles = Array.isArray(result.json.profiles) ? result.json.profiles as PublicProfile[] : [];
+    if (wantsJson || sub === "doctor") console.log(JSON.stringify({
+      ...result.json,
+      ...(sub === "list" && profiles.length === 0 ? { notes: [...(Array.isArray(result.json.notes) ? result.json.notes : []), ...EMPTY_PROFILES_NOTES] } : {}),
+    }, null, 2));
+    else printProfiles(profiles);
     return 0;
   }
 
@@ -316,7 +361,7 @@ export async function cmdNativeMainAccount(args: string[], deps: AccountDeps): P
         ? deps.spawnCodexLoginImpl(stagingHome)
         : deps.runCodexLoginImpl
           ? { exited: deps.runCodexLoginImpl(stagingHome), kill: () => {} }
-          : spawnOfficialCodexLogin(stagingHome);
+          : await spawnOfficialCodexLogin(stagingHome);
       const heartbeatAbort = new AbortController();
       const heartbeat = maintainStageLease(
         deps,

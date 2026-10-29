@@ -12,11 +12,11 @@ const orca: CatalogPreset = {
   sponsorUrl: "https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme",
   dashboardUrl: "https://www.orcarouter.ai/console",
 };
-const packy: CatalogPreset = {
-  id: "packycode", label: "PackyCode", adapter: "openai-chat", auth: "key",
-  baseUrl: "https://cf.api.fan/v1", sponsor: "standard",
-  sponsorUrl: "https://www.packyapi.com/register?aff=k5KT",
-  dashboardUrl: "https://www.packyapi.com/register?aff=k5KT",
+const tokenlab: CatalogPreset = {
+  id: "tokenlab", label: "TokenLab", adapter: "openai-chat", auth: "key",
+  baseUrl: "https://api.tokenlab.sh/v1", sponsor: "standard",
+  sponsorUrl: "https://tokenlab.sh/r/OPENCODEX",
+  dashboardUrl: "https://tokenlab.sh/dashboard/api?tab=keys",
 };
 const configured = (preset: CatalogPreset): WorkspaceItem => ({
   name: preset.id, adapter: preset.adapter, baseUrl: preset.baseUrl, authMode: preset.auth,
@@ -54,10 +54,26 @@ test("key and OAuth sponsor presets render disclosed links, keeping affiliate pa
   }
 });
 
-test("Packy preserves its affiliate link and does not repeat an identical console link", () => {
-  const html = render(packy, configured(packy));
-  expect(html).toContain('href="https://www.packyapi.com/register?aff=k5KT"');
+test("a sponsor link identical to the console link is not repeated", () => {
+  const sameLink = { ...tokenlab, dashboardUrl: tokenlab.sponsorUrl };
+  const html = render(sameLink, configured(sameLink));
+  expect(html).toContain('href="https://tokenlab.sh/r/OPENCODEX"');
   expect(html.match(/<a /g)).toHaveLength(1);
+});
+
+test("TokenLab renders its own copy with separate sponsor and API-key links", () => {
+  const html = render(tokenlab, configured(tokenlab));
+  expect(html).toContain("TokenLab");
+  expect(html).toContain("One API key for leading models");
+  expect(html).not.toContain("A model for every prompt");
+  expect(html).toContain('href="https://tokenlab.sh/r/OPENCODEX"');
+  expect(html).toContain('href="https://tokenlab.sh/dashboard/api?tab=keys"');
+  expect(html.match(/<a /g)).toHaveLength(2);
+});
+
+test("a sponsor preset with no brand row renders nothing instead of another sponsor's copy", () => {
+  const unknown = { ...tokenlab, id: "future-sponsor" };
+  expect(render(unknown, configured(unknown))).toBe("");
 });
 
 test("missing and non-sponsor presets render nothing; non-web links never become anchors", () => {

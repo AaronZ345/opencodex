@@ -13,9 +13,11 @@ catalogue, les services auxiliaires, les réglages des sous-agents et le trafic 
 ocx gui
 ```
 
-Cette commande ouvre `http://localhost:<port>` dans votre navigateur — ou
-`http://127.0.0.1:<port de gestion>` lorsque l’ingress de gestion du hub est activé — et démarre d'abord automatiquement le
-proxy si nécessaire. En développement, vous pouvez lancer séparément le serveur de développement de
+Cette commande ouvre l’adresse du proxy actif dans votre navigateur : `http://127.0.0.1:<port>` par défaut,
+ou `http://[::1]:<port>` pour une liaison à l’adresse de bouclage IPv6 littérale `::1`. Ces adresses conservent
+l’origine configurée nécessaire à l’appairage local du navigateur. Lorsque l’ingress de gestion du hub est activé,
+elle ouvre `http://127.0.0.1:<port de gestion>`. Le proxy démarre d’abord automatiquement si nécessaire.
+En développement, vous pouvez lancer séparément le serveur de développement de
 l'interface contre un proxy déjà actif :
 
 ```bash
@@ -37,6 +39,35 @@ remplissage automatique. Le tableau de bord lui-même ne conserve le jeton qu'en
 dans `localStorage` ni dans `sessionStorage` ; son enregistrement dépend entièrement du navigateur ou du
 gestionnaire de mots de passe.
 
+**Mémoriser cet appareil** est désactivé par défaut. Sur un tableau de bord HTTPS direct (ou en boucle locale), le serveur échange le jeton administrateur contre un cookie d’appareil HttpOnly, SameSite=Strict et une preuve distincte stockée dans le localStorage de ce site. Le cookie est Secure en HTTPS et limité à l’hôte. Ni le cookie ni la preuve ne sont le jeton administrateur, et aucun ne fonctionne seul. Les cookies sont partagés entre les ports d’un même nom d’hôte ; la preuve, limitée à l’origine, lie l’appareil mémorisé à l’origine de ce tableau de bord. Préférez tout de même un nom d’hôte dédié. Le jeton administrateur n’est jamais écrit dans localStorage ou sessionStorage. Si le stockage du navigateur est indisponible ou ne peut enregistrer la preuve, la mémorisation est signalée comme indisponible.
+
+Le fichier privé dashboard-sessions.json conserve les empreintes du cookie, de la preuve, du jeton administrateur et de l’identité du navigateur, l’origine du serveur et une expiration fixe de 30 jours. La relance de l’application Safari reprend une session courte tant que cet appareil reste autorisé. Les sessions mémorisées ne peuvent pas approuver les actions de consentement : étoile GitHub, consommation de crédits de réinitialisation, modification des couches de prompt, connexion Meta Muse, changements de compatibilité du bureau ou validation des quotas. Utilisez une nouvelle session locale ou appairée pour ces actions. Les tableaux de bord relayés, inter-origines ou HTTP distant ne prennent pas en charge la mémorisation. L’expiration, un changement d’identité du navigateur ou la rotation du jeton suivie d’un redémarrage imposent une nouvelle connexion.
+
+Une action **Oublier cet appareil** réussie, dans la barre latérale ou les actions mobiles, ainsi que la déconnexion réussie, révoque immédiatement l’enregistrement et toutes ses sessions et supprime la preuve du navigateur. Un échec de déconnexion conserve la preuve pour réessayer. Le serveur synchronise le contenu avant de publier le changement ; la persistance de l’entrée de répertoire après un plantage est assurée au mieux. Les anciennes clés de jeton mémorisé sont supprimées sans lecture ni migration. Réservez cette option aux appareils de confiance ; elle ne rétablit pas l’AutoFill de Safari.
+
+## Barre de résumé des quotas
+
+Une ligne de résumé en haut de chaque page, sauf la page Sécurité au démarrage, indique
+l'utilisation actuelle des quotas de chaque fournisseur, par exemple
+`OpenAI 31% | Claude 54% | xAI 12% | Google 8%`. Elle lit les mêmes rapports de quotas que l'espace
+fournisseur (`GET /api/provider-quotas`, toutes les 60 secondes tant que l'onglet est visible) et ne
+force jamais d'actualisation en amont.
+
+- Chaque étiquette affiche la fenêtre signalée prioritaire : d'abord hebdomadaire, puis mensuelle,
+  puis 5 heures, puis une fenêtre nommée par le fournisseur ou des crédits prépayés.
+- Une étiquette passe en ambre à 70 % d'utilisation et en rouge à 90 %.
+- Survolez une étiquette ou donnez-lui le focus au clavier pour voir toutes les fenêtres signalées
+  avec leur heure de réinitialisation et l'heure de la lecture. Sur un écran tactile, le premier
+  appui affiche ces détails.
+- Cliquez sur une étiquette (ou appuyez une seconde fois) pour ouvrir l'onglet Comptes de ce
+  fournisseur dans Fournisseurs, où ses comptes ou clés API sont gérés.
+- La barre reste toujours sur une seule ligne. Quand les étiquettes ne tiennent pas, faites-la
+  défiler horizontalement ou utilisez les boutons « et » à chaque extrémité.
+- Les fournisseurs qui ne signalent aucune fenêtre de quota sont omis. La barre est masquée quand
+  aucun fournisseur n'en signale.
+- Le bord droit indique quand le tableau de bord a lu les rapports pour la dernière fois. Il passe en
+  ambre lorsque la dernière lecture a échoué et que la lecture précédente est encore affichée.
+
 ## Fonctions disponibles
 
 | Zone | Fonction |
@@ -44,7 +75,7 @@ gestionnaire de mots de passe.
 | **Résumé du tableau de bord** | Mode multi-agent, état en ligne, version, durée de fonctionnement, nombre de fournisseurs, total de jetons sur 30 jours, fournisseurs actifs et modèles natifs/routés disponibles. |
 | **Délégation de sous-agent** | Choisissez un modèle natif ou routé et, facultativement, un effort de raisonnement partagés entre les consignes de délégation OpenCodex et l'option distincte de valeurs par défaut natives. Il ne s'agit pas d'un routeur par création de sous-agent côté proxy ; voir ci-dessous. |
 | **Services auxiliaires** | Choisissez le modèle et l'effort de recherche web, ainsi que le modèle de description visuelle. Les modifications s'appliquent à la requête suivante. |
-| **Maintenance** | Resynchronisez le catalogue de modèles Codex, examinez les avertissements de contournement par une configuration locale au projet, recherchez la dernière version stable ou préliminaire et lancez une mise à jour avec redémarrage facultatif du proxy. |
+| **Maintenance** | Resynchronisez le catalogue de modèles Codex, examinez les avertissements de contournement par une configuration locale au projet, recherchez la dernière version stable ou préliminaire et lancez une mise à jour avec redémarrage facultatif du proxy. Dans le shell de bureau, son entrée de mise à jour ouvre la page de mise à jour native au lieu d’exécuter la mise à jour du paquet. |
 | **Sécurité au démarrage** | Vérifiez si le routage Codex injecté résiste à un redémarrage, avec des états distincts pour le service et le lanceur intermédiaire, ainsi que les commandes de réparation exactes. |
 | **Zone de notification Windows** | Installez au niveau de l'utilisateur un contrôleur lancé à la connexion pour démarrer, arrêter ou redémarrer le proxy en un clic, ouvrir le tableau de bord et consulter l'état. Ce contrôleur n'est pas un service de redémarrage du proxy. |
 | **Démarrage automatique de Codex** | Autorisez un lanceur intermédiaire Codex déjà installé à exécuter `ocx ensure`. Ce commutateur n'installe ni lanceur ni service d'arrière-plan. |
@@ -132,7 +163,29 @@ OpenCodex demandent à Codex de transmettre les remplacements à `spawn_agent` ;
 
 ## Sessions, clés et usage Remote Hub
 
-Le plan de gestion du tableau de bord est séparé du trafic modèle direct client→hub. **Integrations → API Keys** affiche les rotations en attente, montre le secret de remplacement une seule fois et exige une validation ou une annulation explicite. La déconnexion du navigateur n'invalide que la session courante. L'usage connecté vient du hub filtré par `apiKeyId`; l'usage déconnecté est local, sans réplication.
+Le plan de gestion du tableau de bord est séparé du trafic modèle direct client→hub. **Connexion → Clés API** affiche les rotations en attente, montre le secret de remplacement une seule fois et exige une validation ou une annulation explicite. La déconnexion du navigateur n'invalide que la session courante. L'usage connecté vient du hub filtré par `apiKeyId`; l'usage déconnecté est local, sans réplication.
+
+### Afficher une clé API enregistrée
+
+L'affichage de la valeur complète d'une clé enregistrée exige une session du tableau de bord
+créée par un appairage explicite ou une identité Tailscale de confiance. Une session locale
+créée automatiquement peut lire la liste masquée, mais ne peut pas révéler les valeurs enregistrées.
+Le jeton administrateur ne peut pas non plus appeler cette opération réservée aux sessions.
+Utilisez le processus d'appairage Remote Hub existant ou une connexion Tailscale de confiance, si disponible.
+
+Le formulaire d'appairage local est proposé uniquement sur un tableau de bord autonome de même origine,
+ouvert en HTTP à l'adresse IP littérale `127.0.0.1` ou `[::1]`. L'origine doit correspondre à l'adresse
+IP de bouclage configurée pour l'écoute du serveur. Depuis `localhost` ou un alias, vérifiez cette adresse :
+rouvrez `http://127.0.0.1:<port>` pour une écoute sur `127.0.0.1`, ou `http://[::1]:<port>` pour
+une écoute sur `::1`, puis effectuez l'appairage. Un serveur dont le hostname est `localhost` n'a
+aucune origine admissible pour l'appairage local. Le tableau de bord ne peut pas déduire l'adresse
+d'écoute d'une URL avec un alias : il affiche donc le refus général sans suggérer une autre URL.
+
+Après l'appairage, cliquez à nouveau sur la clé pour demander sa valeur. L'appairage seul ne révèle aucune clé.
+Les valeurs affichées et l'état de copie sont effacés lorsque la session partagée est supprimée ou remplacée,
+au début d'un appairage, en quittant ce panneau, en masquant l'onglet ou la fenêtre de l'application,
+ou en changeant de serveur. Cela inclut les valeurs des clés créées ou remplacées, affichées une seule fois.
+Si la session autorisée expire ou est révoquée, effectuez à nouveau l'appairage.
 
 La garantie de remplacement lors d'une création de sous-agent s'applique au texte de consignes v2 **intégré**.
 Un `injectionPrompt` personnalisé remplace entièrement ce texte et doit contenir les espaces réservés
@@ -152,7 +205,8 @@ la connexion du compte appelant/principal. Les requêtes en cours conservent les
 capturés. Une réauthentification 401/403 ou un temps de recharge 429 peut effacer l'affinité et faire passer
 la route à un autre compte Pool admissible. Ce mécanisme est distinct d'`openai-apikey` et des autres fournisseurs.
 
-- Choisir manuellement un compte s'applique immédiatement : un fil déjà associé y passe à sa prochaine requête, et seules les requêtes déjà en cours conservent le compte capturé. Le choix manuel est aussi épinglé : la fiche affiche le badge **ÉPINGLÉ**, et un ordre de sélection supérieur ne peut pas prendre la priorité sur ce compte avant son épuisement, la sélection d'un autre compte ou la modification de l'ordre de sélection de n'importe quel compte.
+- Choisir manuellement un compte s'applique immédiatement : un fil déjà associé y passe à sa prochaine requête, et seules les requêtes déjà en cours conservent le compte capturé. Le choix manuel est aussi épinglé : la fiche affiche le badge **ÉPINGLÉ**, et un ordre de sélection supérieur ne peut pas prendre la priorité sur ce compte avant son épuisement, la sélection d'un autre compte ou la modification de l'ordre de sélection de n'importe quel compte. Sélectionner à nouveau le badge demande de confirmer la libération de l'épingle : une fois confirmée, la sélection est effacée, les fils déjà associés conservent le compte capturé, et les requêtes nouvelles ou sans association repassent à l'ordre de sélection et aux seuils.
+  Si le compte épinglé change pendant la confirmation, celle-ci ne peut pas libérer le nouveau compte épinglé. Après un refus ou un résultat incertain, la vue des comptes est actualisée ; vérifiez la sélection actuelle avant de confirmer à nouveau.
 - Chaque fiche de compte possède un contrôle **Ordre de sélection** (**Premier**, **Plus tôt**, **Normal**, **Plus tard**, **Dernier**). Les ordres supérieurs sont utilisés en premier ; le pool ne descend à un ordre inférieur qu'une fois tous les comptes supérieurs épuisés ou indisponibles. Un changement d'ordre s'applique dès la prochaine requête sans association et ne déplace jamais un fil déjà associé. Le compte Codex Desktop principal est ordonné comme les autres : il peut être placé en **Dernier** et conservé comme réserve. Un ordre défini avec `ocx account priority` en dehors de ces cinq préréglages reste visible et sélectionnable sur la fiche.
 - L'affinité des fils évite les changements à chaque requête. Avec `pool.cacheAffinity` activé (par défaut), un fil de longue durée n'est pas réassocié simplement parce que l'utilisation a atteint le seuil ; il reste jusqu'à ce que le compte soit épuisé ou ne puisse plus servir, puis seulement vers un compte dont l'utilisation est strictement inférieure et qui dispose d'une véritable marge de quota. Définissez le drapeau à `false` pour rétablir la réaffectation au seuil lorsqu'un compte admissible strictement moins utilisé existe.
 - Les nouvelles sessions peuvent choisir le compte admissible le moins utilisé. Pour les forfaits payants, le score retient la fenêtre connue la plus sollicitée parmi 5 h, une semaine et 30 jours ; les forfaits Go/Free utilisent uniquement la fenêtre de 30 jours.

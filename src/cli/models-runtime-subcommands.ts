@@ -18,6 +18,7 @@ export const MODELS_RUNTIME_SUBCOMMANDS = [
   "price",
   "set-price",
   "edit",
+  "set",
   "enable",
   "disable",
   "provider",
@@ -27,6 +28,9 @@ export const MODELS_RUNTIME_SUBCOMMANDS = [
   "new-arrivals",
   "context",
   "shadow",
+  "auto-review",
+  "order",
+  "display-name",
 ] as const;
 
 export type ModelsRuntimeSubcommand = (typeof MODELS_RUNTIME_SUBCOMMANDS)[number];

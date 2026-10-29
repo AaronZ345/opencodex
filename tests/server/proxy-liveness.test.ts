@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createServer } from "node:net";
 import {
   createReadinessGate,
   runStartupReadinessSync,
@@ -6,8 +7,11 @@ import {
 import {
   DEFAULT_PROBE_TIMEOUT_MS,
   findLiveProxy,
+  isHealthzVersion,
   isOpencodexHealthz,
+  isConnectionRefused,
   loopbackProbeHosts,
+  probeEndpointLiveness,
   probeHostname,
   probePortOwner,
   probeReadiness,
@@ -21,6 +25,7 @@ import {
   readyProtocolMetadata,
 } from "../../src/remote/protocol";
 import { getDefaultConfig } from "../../src/config";
+import { buildPeerFeatures } from "../../src/remote/features";
 
 function healthz(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
@@ -90,10 +95,108 @@ describe("probeHostname", () => {
   });
 });
 
+describe("probeEndpointLiveness", () => {
+  test("classifies identity, foreign, non-200, refusal, timeout, and invalid ports", async () => {
+    const endpoint = { port: 10100, hostname: "127.0.0.1" };
+    const fakeFetch = (body: unknown, status = 200) => (async () => healthz(body, status)) as typeof fetch;
+    expect(await probeEndpointLiveness(endpoint, { fetchFn: fakeFetch(OURS) })).toBe("live");
+    expect(await probeEndpointLiveness(endpoint, { fetchFn: fakeFetch({ status: "ok" }) })).toBe("dead");
+    expect(await probeEndpointLiveness(endpoint, { fetchFn: fakeFetch(OURS, 503) })).toBe("unknown");
+    const refusedServer = createServer();
+    await new Promise<void>((resolve, reject) => {
+      refusedServer.once("error", reject);
+      refusedServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const refusedPort = (refusedServer.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) => {
+      refusedServer.close(error => error ? reject(error) : resolve());
+    });
+    expect(await probeEndpointLiveness({ port: refusedPort, hostname: "127.0.0.1" })).toBe("dead");
+    expect(await probeEndpointLiveness(endpoint, {
+      fetchFn: (async () => { throw new DOMException("aborted", "AbortError"); }) as typeof fetch,
+    })).toBe("unknown");
+    expect(await probeEndpointLiveness(endpoint, {
+      fetchFn: (async () => { throw new Error("connection reset"); }) as typeof fetch,
+    })).toBe("unknown");
+    expect(await probeEndpointLiveness({ port: 0 }, { fetchFn: fakeFetch(OURS) })).toBe("dead");
+  });
+
+  test("checks both loopback families sequentially", async () => {
+    const seen: string[] = [];
+    const fetchFn = (async (url: string) => {
+      seen.push(url);
+      if (url.startsWith("http://127.0.0.1:10100")) {
+        throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      }
+      return healthz(OURS);
+    }) as typeof fetch;
+    expect(await probeEndpointLiveness({ port: 10100, hostname: "::" }, { fetchFn })).toBe("live");
+    expect(seen).toEqual([
+      "http://127.0.0.1:10100/healthz",
+      "http://[::1]:10100/healthz",
+    ]);
+
+    seen.length = 0;
+    const refused = (async (url: string) => {
+      seen.push(url);
+      throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+    }) as typeof fetch;
+    expect(await probeEndpointLiveness({ port: 10100, hostname: "::" }, { fetchFn: refused })).toBe("dead");
+    expect(seen).toEqual([
+      "http://127.0.0.1:10100/healthz",
+      "http://[::1]:10100/healthz",
+    ]);
+
+    seen.length = 0;
+    const mixed = (async (url: string) => {
+      seen.push(url);
+      if (url.startsWith("http://127.0.0.1:10100")) {
+        throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      }
+      throw new DOMException("timed out", "TimeoutError");
+    }) as typeof fetch;
+    expect(await probeEndpointLiveness({ port: 10100, hostname: "::" }, { fetchFn: mixed })).toBe("unknown");
+    expect(seen).toEqual([
+      "http://127.0.0.1:10100/healthz",
+      "http://[::1]:10100/healthz",
+    ]);
+  });
+});
+
+describe("isConnectionRefused", () => {
+  test("recognizes aggregate socket refusals", () => {
+    const refused = Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+    expect(isConnectionRefused(new AggregateError([refused]))).toBe(true);
+    expect(isConnectionRefused(new AggregateError([
+      Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }),
+    ]))).toBe(false);
+  });
+
+  test("a mixed aggregate is not proof of absence", () => {
+    // Happy-eyeballs style fan-out puts every address in one error. If one address refused and
+    // another never answered, the endpoint's state is unknown: the refusal speaks only for the
+    // address that produced it.
+    const refused = Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+    const timedOut = Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+    expect(isConnectionRefused(new AggregateError([refused, timedOut]))).toBe(false);
+    expect(isConnectionRefused(new AggregateError([timedOut, refused]))).toBe(false);
+    expect(isConnectionRefused(new AggregateError([refused, refused]))).toBe(true);
+    expect(isConnectionRefused(new AggregateError([]))).toBe(false);
+  });
+});
+
 describe("proxyIdentityAt", () => {
   test("returns the reported pid for our proxy", async () => {
     const identity = await proxyIdentityAt(10100, {}, { fetchFn: (async () => healthz(OURS)) as typeof fetch });
     expect(identity).toEqual({ pid: 4242, version: "2.6.17" });
+  });
+
+  test("does not propagate an unsafe version from the process holding the port", async () => {
+    const version = "9.9.9\nFAKE OK\u001b]52;c;SGVsbG8=\u0007";
+    const identity = await proxyIdentityAt(10100, {}, {
+      fetchFn: (async () => healthz({ ...OURS, version })) as typeof fetch,
+    });
+    expect(identity).toEqual({ pid: 4242 });
   });
 
   test("rejects foreign 200s, non-OK responses, and pid mismatches", async () => {
@@ -165,6 +268,14 @@ describe("proxyIdentityAt", () => {
     expect(identity).toBeNull();
     // First attempt spends the budget; remaining retries must not fire.
     expect(calls).toBe(1);
+  });
+});
+
+describe("isHealthzVersion", () => {
+  test("accepts bounded semver and rejects unsafe or oversized display text", () => {
+    expect(isHealthzVersion("2.35.0-preview.1+build.7")).toBe(true);
+    expect(isHealthzVersion("9.9.9\nFAKE OK\u001b]52;c;SGVsbG8=\u0007")).toBe(false);
+    expect(isHealthzVersion(`1.0.0-${"a".repeat(59)}`)).toBe(false);
   });
 });
 
@@ -248,7 +359,7 @@ describe("findLiveProxy", () => {
       }) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: 4242, port: 58195, source: "runtime", version: "2.6.17" });
+    expect(live).toEqual({ pid: 4242, port: 58195, hostname: "127.0.0.1", source: "runtime", version: "2.6.17" });
     expect(urls).toEqual(["http://127.0.0.1:58195/healthz"]);
   });
 
@@ -261,7 +372,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(OURS)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: 4242, port: 10100, source: "config", version: "2.6.17" });
+    expect(live).toEqual({ pid: 4242, port: 10100, hostname: "127.0.0.1", source: "config", version: "2.6.17" });
   });
 
   test("a foreign listener on the configured port is not treated as our proxy", async () => {
@@ -304,7 +415,7 @@ describe("findLiveProxy", () => {
 
     // The record's pid 1111 may be dead/reused — synthesizing it would let `ocx stop`
     // kill an unrelated process via the taskkill/kill fallback.
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: "127.0.0.1", source: "runtime", version: "2.6.16" });
   });
 
   test("an orphaned record whose healthz pid mismatches is rejected (config fallback still runs)", async () => {
@@ -329,7 +440,7 @@ describe("findLiveProxy", () => {
     });
 
     // healthz-reported pids must pass identity verification before they become kill targets.
-    expect(live).toEqual({ pid: null, port: 58195, source: "config", version: "2.6.17" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: "127.0.0.1", source: "config", version: "2.6.17" });
   });
 
   test("a pidless legacy healthz never promotes an unverified cheap pid to a kill target", async () => {
@@ -342,7 +453,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(legacyBody)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: "127.0.0.1", source: "runtime", version: "2.6.16" });
   });
 
   test("a pidless legacy healthz returns the cheap pid once full identity verification echoes it", async () => {
@@ -360,7 +471,7 @@ describe("findLiveProxy", () => {
     });
 
     expect(verified).toEqual([1111]);
-    expect(live).toEqual({ pid: 1111, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
+    expect(live).toEqual({ pid: 1111, port: 58195, hostname: "127.0.0.1", source: "runtime", version: "2.6.16" });
   });
 
   test("a verifier answering with a DIFFERENT pid than the candidate is rejected (TOCTOU guard)", async () => {
@@ -373,7 +484,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(legacyBody)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: "127.0.0.1", source: "runtime", version: "2.6.16" });
   });
 });
 
@@ -506,7 +617,7 @@ describe("findLiveProxy single-deadline candidate gating", () => {
     });
     expect(urls).toEqual(["http://127.0.0.1:58195/healthz", "http://127.0.0.1:10100/healthz"]);
     expect(urls).toHaveLength(2);
-    expect(live).toEqual({ pid: 4242, port: 10100, hostname: undefined, source: "config", version: "2.6.17" });
+    expect(live).toEqual({ pid: 4242, port: 10100, hostname: "127.0.0.1", source: "config", version: "2.6.17" });
   });
 });
 
@@ -776,7 +887,7 @@ describe("remote readiness protocol metadata", () => {
       expect(readyProtocolMetadata(
         { ...getDefaultConfig(), runtimeRole },
         new Request("https://hub.example.test/readyz"),
-      )).toEqual(metadata);
+      )).toEqual({ ...metadata, features: buildPeerFeatures() });
     }
   });
 
@@ -792,6 +903,7 @@ describe("remote readiness protocol metadata", () => {
       protocol: 1,
       minimumClientProtocol: 1,
       managementUrl: "http://hub.example.test:8443",
+      features: buildPeerFeatures(),
     });
   });
 
@@ -1026,7 +1138,7 @@ describe("client-role discrimination (#4662)", () => {
       configFn: () => ({ port: 10100 }),
       fetchFn: (async () => healthz(CLIENT)) as typeof fetch,
     });
-    expect(live).toEqual({ pid: 4242, port: 10100, source: "runtime", version: "2.6.17", role: "client" });
+    expect(live).toEqual({ pid: 4242, port: 10100, hostname: "127.0.0.1", source: "runtime", version: "2.6.17", role: "client" });
   });
 
   test("findLiveProxy reports the role on the configured-port path", async () => {
@@ -1037,6 +1149,6 @@ describe("client-role discrimination (#4662)", () => {
       verifyPidFn: candidate => candidate,
       fetchFn: (async () => healthz(CLIENT)) as typeof fetch,
     });
-    expect(live).toEqual({ pid: 4242, port: 10100, hostname: undefined, source: "config", version: "2.6.17", role: "client" });
+    expect(live).toEqual({ pid: 4242, port: 10100, hostname: "127.0.0.1", source: "config", version: "2.6.17", role: "client" });
   });
 });

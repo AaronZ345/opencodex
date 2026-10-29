@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   appendFileSync,
   existsSync,
@@ -15,6 +16,8 @@ import { handleManagementAPI } from "../../src/server/management-api";
 import { ManagementRequest } from "../helpers/management-auth";
 import {
   appendUsageEntry,
+  currentUsageLogRevision,
+  normalizeUsageEntryForTest,
   resetUsageReadCacheForTests,
   usageLogPath,
   type PersistedUsageEntry,
@@ -24,13 +27,17 @@ import {
   queryRequestHistory,
   rebuildRequestHistoryIndex,
   requestHistoryRowById,
+  sourceIdentityMatches,
   REQUEST_HISTORY_MAX_RECORD_BYTES,
   REQUEST_HISTORY_MAX_PAGE_SIZE,
   REQUEST_HISTORY_READ_CHUNK_BYTES,
 } from "../../src/routing/history/indexer";
 import { InvalidCursorError } from "../../src/routing/history/cursor";
-import { HISTORY_DB_FILENAME } from "../../src/routing/history/schema";
+import { metaValue, recordSourceMeta, resetAndCreateSchema, setMeta } from "../../src/routing/history/ingest";
+import { HISTORY_DB_FILENAME, HISTORY_SCHEMA_VERSION } from "../../src/routing/history/schema";
 import { getConfigDir } from "../../src/config";
+import { flushConfigDirHardeningForTests } from "../../src/config/paths";
+import { flushWindowsSecretAclReapsBeforeRemoval } from "../../src/lib/windows-secret-acl";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -72,8 +79,11 @@ beforeEach(() => {
   closeRequestHistoryIndex();
 });
 
-afterEach(() => {
+afterEach(async () => {
   closeRequestHistoryIndex();
+  // Management/config reads may still own a Windows ACL child after the query ends.
+  await flushConfigDirHardeningForTests();
+  await flushWindowsSecretAclReapsBeforeRemoval(testDir);
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (testDir) removeTreeWithRetry(testDir);
@@ -97,12 +107,70 @@ async function apiGet(path: string): Promise<Response> {
 }
 
 describe("request-history index (RI-02)", () => {
+  test("SQLite source identities distinguish adjacent device and inode ids above 2^53", () => {
+    appendUsageEntry(entry("exact-id", 1234, "a", "m1"));
+    const revision = currentUsageLogRevision()!;
+    const low = "9007199254740992";
+    const high = "9007199254740993";
+    expect(Number(low)).toBe(Number(high));
+    const db = new Database(":memory:");
+    try {
+      resetAndCreateSchema(db);
+      for (const field of ["dev", "ino"] as const) {
+        const exact = { ...revision, [field]: high };
+        recordSourceMeta(db, exact);
+        expect(metaValue(db, `source_${field}`)).toBe(high);
+        expect(sourceIdentityMatches(db, exact)).toBe(true);
+        expect(sourceIdentityMatches(db, { ...exact, [field]: low })).toBe(false);
+        // The old Number-based writer rounded the high id to its neighbour.
+        setMeta(db, `source_${field}`, Number(high));
+        expect(sourceIdentityMatches(db, exact)).toBe(false);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("legacy rounded source metadata rebuilds once and then reuses the corrected index", async () => {
+    appendUsageEntry(entry("legacy-id", 1234, "a", "m1"));
+    await queryRequestHistory({}, undefined, 10);
+    closeRequestHistoryIndex();
+    const dbFile = join(getConfigDir(), HISTORY_DB_FILENAME);
+    let db = new Database(dbFile);
+    try {
+      setMeta(db, "source_ino", Number("9007199254740993"));
+    } finally {
+      db.close();
+    }
+    const page = await queryRequestHistory({}, undefined, 10);
+    expect(page.rows.map(row => row.requestId)).toEqual(["legacy-id"]);
+    expect(page.meta.lastError).toBe("rebuilt after identity/schema mismatch");
+    closeRequestHistoryIndex();
+    db = new Database(dbFile);
+    try {
+      const revision = currentUsageLogRevision()!;
+      expect(metaValue(db, "source_dev")).toBe(revision.dev);
+      expect(metaValue(db, "source_ino")).toBe(revision.ino);
+      setMeta(db, "reuse_marker", "preserve");
+    } finally {
+      db.close();
+    }
+    expect((await queryRequestHistory({}, undefined, 10)).rows).toHaveLength(1);
+    closeRequestHistoryIndex();
+    db = new Database(dbFile);
+    try {
+      expect(metaValue(db, "reuse_marker")).toBe("preserve");
+    } finally {
+      db.close();
+    }
+  });
+
   test("missing database and empty history produce an empty page", async () => {
     const page = await queryRequestHistory({}, undefined, 10);
     expect(page.rows).toEqual([]);
     expect(page.hasMore).toBe(false);
     expect(page.meta.indexedRows).toBe(0);
-    expect(page.meta.schemaVersion).toBe(1);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
     expect(existsSync(join(getConfigDir(), HISTORY_DB_FILENAME))).toBe(true);
   });
 
@@ -163,7 +231,12 @@ describe("request-history index (RI-02)", () => {
 
   test("large history indexes fully and paginates without duplicates or misses", async () => {
     const rows = seedRows(1500, 10_000);
-    for (const row of rows) appendUsageEntry(row);
+    // Exercise all 1,500 indexed rows and 15 pages without timing 1,500 filesystem opens.
+    // This is byte-for-byte the append writer's normalization + JSON + LF representation;
+    // the incremental-append cases above continue to exercise appendUsageEntry itself.
+    writeFileSync(usageLogPath(), rows.map(row => `${JSON.stringify(normalizeUsageEntryForTest(row))}\n`).join(""), {
+      encoding: "utf-8", mode: 0o600,
+    });
     const seen = new Set<string>();
     let cursor: string | undefined;
     let pages = 0;
@@ -202,7 +275,25 @@ describe("request-history index (RI-02)", () => {
     db.close();
     const page = await queryRequestHistory({}, undefined, 10);
     expect(page.rows.length).toBe(4);
-    expect(page.meta.schemaVersion).toBe(1);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
+  });
+
+  test("upgrading a version-one index reprojects long requested selectors from canonical JSONL", async () => {
+    const selector = `policy/${"long-selector".repeat(20)}`;
+    // Model a pre-encoding ledger and index: both originally carried the raw selector.
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("legacy-selector", 1234, "a", "m1", { requestedModel: selector }))}\n`);
+    await queryRequestHistory({}, undefined, 10);
+    closeRequestHistoryIndex();
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(join(getConfigDir(), HISTORY_DB_FILENAME));
+    db.query("UPDATE requests SET requested_model = ? WHERE request_id = 'legacy-selector'").run(selector);
+    db.query("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'").run();
+    db.close();
+
+    const page = await queryRequestHistory({ requestedModel: selector }, undefined, 10);
+    expect(page.rows.map(row => row.requestId)).toEqual(["legacy-selector"]);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
+    expect(page.meta.lastError).toContain("rebuilt");
   });
 
   test("partial final JSONL line is skipped until it completes", async () => {
@@ -300,6 +391,35 @@ describe("request-history index (RI-02)", () => {
     expect(byRange.rows.map(row => row.requestId)).toEqual(["f2"]);
   });
 
+  test("requestedModel filter matches the encoded form of over-long selectors", async () => {
+    // Two valid selectors sharing the first 130 chars must stay distinguishable:
+    // the persisted form is prefix + digest, and the filter encodes identically.
+    const sharedPrefix = `a/${"m".repeat(200)}`;
+    const selectorA = `${sharedPrefix}-alpha`;
+    const selectorB = `${sharedPrefix}-omega`;
+    appendUsageEntry(entry("sel-a", 1000, "a", "m1", { requestedModel: selectorA }));
+    appendUsageEntry(entry("sel-b", 2000, "a", "m1", { requestedModel: selectorB }));
+
+    const pageA = await queryRequestHistory({ requestedModel: selectorA }, undefined, 10);
+    expect(pageA.rows.map(row => row.requestId)).toEqual(["sel-a"]);
+    const pageB = await queryRequestHistory({ requestedModel: selectorB }, undefined, 10);
+    expect(pageB.rows.map(row => row.requestId)).toEqual(["sel-b"]);
+
+    // Rows surface the bounded persisted form; filtering by that displayed value
+    // round-trips because the encoding is idempotent.
+    const persistedA = pageA.rows[0]!.requestedModel!;
+    expect(persistedA).not.toBe(selectorA);
+    expect(persistedA.length).toBeLessThanOrEqual(130);
+    const roundTrip = await queryRequestHistory({ requestedModel: persistedA }, undefined, 10);
+    expect(roundTrip.rows.map(row => row.requestId)).toEqual(["sel-a"]);
+
+    // Documented limit of an idempotent encoding: a literal selector equal to another selector's
+    // persisted form shares that persisted identity, so the exact filter returns both rows.
+    appendUsageEntry(entry("sel-literal", 3000, "a", "m1", { requestedModel: persistedA }));
+    const aliased = await queryRequestHistory({ requestedModel: persistedA }, undefined, 10);
+    expect(aliased.rows.map(row => row.requestId).sort()).toEqual(["sel-a", "sel-literal"]);
+  });
+
   test("row-by-id returns the canonical entry and unknown ids 404 through the API", async () => {
     appendUsageEntry(entry("target-id", 1234));
     const row = await requestHistoryRowById("target-id");
@@ -331,7 +451,7 @@ describe("request-history index (RI-02)", () => {
     expect(body.entries.length).toBe(2);
     expect(body.hasMore).toBe(true);
     expect(typeof body.nextCursor).toBe("string");
-    expect(body.index.schemaVersion).toBe(1);
+    expect(body.index.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
     expect(body.index.indexedRows).toBe(5);
   });
 

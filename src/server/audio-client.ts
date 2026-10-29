@@ -2,8 +2,9 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { formatErrorResponse } from "../bridge";
 import type { OcxConfig } from "../types";
 import { captureExplicitOpenAiCallerAuth, selectOpenAiImagesProvider } from "../providers/openai-sidecar";
-import { isProxyAdmissionSecret, type DataPlaneAdmission } from "./auth-cors";
+import { isProxyAdmissionSecret, type DataPlaneAdmission, type DataPlaneAdmissionOptions } from "./auth-cors";
 import { resolveAudioAdmission } from "./audio-upstream";
+import { authorizationCredential } from "../lib/authorization-scheme";
 
 export const AUDIO_WEBSOCKET_PROTOCOL = "opencodex-audio";
 const KEY_PROTOCOL_PREFIX = "opencodex-key.";
@@ -16,7 +17,12 @@ export interface AudioClient {
 }
 
 /** Browser protocols are an audio-only credential carrier; only the public marker is echoed. */
-export function resolveAudioClient(req: Request, config: OcxConfig, required = false): AudioClient | Response | null {
+export function resolveAudioClient(
+  req: Request,
+  config: OcxConfig,
+  required = false,
+  options: DataPlaneAdmissionOptions = {},
+): AudioClient | Response | null {
   const headers = new Headers(req.headers);
   let protocol: string | undefined;
   let carrier = false;
@@ -43,7 +49,7 @@ export function resolveAudioClient(req: Request, config: OcxConfig, required = f
       }
     }
   }
-  const admission = resolveAudioAdmission(headers, config);
+  const admission = resolveAudioAdmission(headers, config, options);
   if (!admission) {
     const bearer = /^Bearer\s+([^\s,]+)$/i.exec(headers.get("authorization") ?? "")?.[1];
     const platformKey = selectOpenAiImagesProvider(config).keyed?.apiKey;
@@ -56,7 +62,7 @@ export function resolveAudioClient(req: Request, config: OcxConfig, required = f
       : null;
   }
   const credential = admission.source === "dedicated" ? headers.get("x-opencodex-api-key")
-    : admission.source === "x-api-key" ? headers.get("x-api-key") : headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    : admission.source === "x-api-key" ? headers.get("x-api-key") : authorizationCredential(headers);
   const owner = admission.kind === "configured"
     ? JSON.stringify(["configured", admission.keyId])
     : JSON.stringify(["environment", createHash("sha256").update(credential?.trim() ?? "").digest("hex")]);

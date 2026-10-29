@@ -1,15 +1,16 @@
 /**
  * `ocx models` subcommand — list configured models and manage custom models.
  */
+import { getConfigDir, withConfigDirHardeningSettled } from "../config/paths";
+import { resolveMatchedPrice, type MatchedPrice } from "../usage/cost";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { syncModelsToCodex } from "../codex/sync";
 import { configuredContextWindow } from "../codex/catalog/provider-fetch";
 import { hasOwnProvider, isValidProviderName, loadConfig, saveConfig } from "../config";
+import { readCliConfigForMutation } from "./config-mutation";
 import {
-  canonicalizeReasoningEfforts,
   configuredReasoningEfforts,
-  isDeclaredReasoningEffort,
   modelRecordValue,
 } from "../reasoning-effort";
 import { encodedModelIdCollides, resolveSlugSelection, routedSlug } from "../providers/slug-codec";
@@ -17,66 +18,19 @@ import { isModelsRuntimeSubcommand } from "./models-runtime-subcommands";
 import { knownModelIdsForProvider } from "../router";
 import { findLiveProxy } from "../server/proxy-liveness";
 import { modelInList, type OcxConfig, type OcxCustomModel } from "../types";
+import type { RuntimeApiDeps } from "./runtime-api";
+import { projectLocalSyncResult, type LocalSyncResult } from "./local-sync-result";
 
-const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>]";
-const REMOVE_USAGE = "Usage: ocx models remove <customId|provider/modelId> [--yes]";
+export interface ModelsCommandDeps extends RuntimeApiDeps { syncModels?: typeof syncModelsToCodex; }
+
+const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>] [--live] [--json]";
+const REMOVE_USAGE = "Usage: ocx models remove <customId|provider/modelId> [--yes] [--live] [--json]";
 const LIST_CUSTOM_USAGE = "Usage: ocx models list-custom [--json]";
 const ALLOWED_MODALITIES = new Set(["text", "image", "audio"]);
 
-/**
- * Parse and validate the reasoning flags shared by `ocx models add` (offline path).
- * "-" means "inherit" and omits the field entirely; "" means an explicit empty ladder
- * ("no reasoning" override, the same state the dashboard stores for the toggle-off
- * checkbox set). Malformed CSV like `low,,high` or `,,` is rejected instead of being
- * silently normalized. Values are canonicalized into Codex ladder order so the stored
- * config matches what the API stores.
- */
-export function parseReasoningArgs(
-  reasoningEffortsValue: string | undefined,
-  defaultEffortValue: string | undefined,
-): { reasoningEfforts?: string[]; defaultReasoningEffort?: string; error?: string } {
-  if (reasoningEffortsValue === undefined && defaultEffortValue === undefined) return {};
-  let reasoningEfforts: string[] | undefined;
-  if (reasoningEffortsValue !== undefined) {
-    const trimmed = reasoningEffortsValue.trim();
-    if (trimmed === "-") {
-      reasoningEfforts = undefined;
-    } else if (trimmed === "") {
-      // Explicit no-reasoning override, exactly like the API's [] / the dashboard's
-      // uncheck-all state.
-      reasoningEfforts = [];
-    } else {
-      const parts = trimmed.split(",").map(value => value.trim());
-      if (parts.some(part => part === "")) {
-        return { error: "--reasoning-efforts must be comma-separated values from none, minimal, low, medium, high, xhigh, max, ultra (\"\" for no reasoning, \"-\" to inherit)" };
-      }
-      const invalid = parts.filter(value => !isDeclaredReasoningEffort(value));
-      if (invalid.length > 0) {
-        return { error: `unsupported reasoning effort: ${invalid.join(", ")} (allowed: none, minimal, low, medium, high, xhigh, max, ultra)` };
-      }
-      reasoningEfforts = canonicalizeReasoningEfforts(parts);
-    }
-  }
-  let defaultReasoningEffort: string | undefined;
-  if (defaultEffortValue !== undefined) {
-    const trimmed = defaultEffortValue.trim();
-    if (trimmed === "-") {
-      defaultReasoningEffort = undefined;
-    } else {
-      if (!isDeclaredReasoningEffort(trimmed)) {
-        return { error: `unsupported reasoning effort: ${trimmed} (allowed: none, minimal, low, medium, high, xhigh, max, ultra)` };
-      }
-      if (!reasoningEfforts || reasoningEfforts.length === 0) {
-        return { error: "--default-reasoning-effort requires --reasoning-efforts" };
-      }
-      if (!reasoningEfforts.includes(trimmed)) {
-        return { error: `--default-reasoning-effort "${trimmed}" is not in the declared reasoning efforts` };
-      }
-      defaultReasoningEffort = trimmed;
-    }
-  }
-  return { reasoningEfforts, defaultReasoningEffort };
-}
+import { parseReasoningArgs } from "./models-custom-input";
+import { redactSecretArgs } from "./secret-args";
+export { parseReasoningArgs } from "./models-custom-input";
 
 interface ModelEntry {
   provider: string;
@@ -85,6 +39,7 @@ interface ModelEntry {
   contextWindow: number | null;
   inputModalities: string[] | null;
   reasoningEfforts: string[] | null;
+  price: MatchedPrice | null;
 }
 
 /**
@@ -132,6 +87,7 @@ function collectModels(config: OcxConfig, providerFilter?: string): ModelEntry[]
         contextWindow: configuredContextWindow(prov, model) ?? null,
         inputModalities: modalities,
         reasoningEfforts: efforts,
+        price: resolveMatchedPrice(provName, model),
       });
     };
 
@@ -170,29 +126,44 @@ function fail(message: string, usage?: string): never {
 
 function rejectUnexpectedArgs(args: string[], usage: string): void {
   if (args.length === 0) return;
-  const unknown = args.filter(arg => arg.startsWith("-"));
+  const shown = redactSecretArgs(args);
+  const unknown = shown.filter(arg => arg.startsWith("-"));
   fail(
     unknown.length > 0
       ? `Unknown flag(s): ${unknown.join(", ")}`
-      : `Unexpected argument(s): ${args.join(", ")}`,
+      : `Unexpected argument(s): ${shown.join(", ")}`,
     usage,
   );
 }
 
-async function syncCustomModelsIfLive(): Promise<void> {
-  const live = await findLiveProxy();
-  if (!live) return;
-  const synced = await syncModelsToCodex(live.port).catch(error => {
-    console.error(`Warning: custom model saved, but catalog sync failed: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  });
-  if (synced?.status === "skipped") {
-    console.log("Custom model saved; Codex integration is OFF, so its catalog was not changed.");
+async function syncCustomModelsIfLive(config: OcxConfig, deps: ModelsCommandDeps): Promise<LocalSyncResult> {
+  try {
+    const live = await (deps.findLiveProxy ?? findLiveProxy)();
+    if (!live) return { status: "not-attempted", ok: false };
+    return projectLocalSyncResult(await (deps.syncModels ?? syncModelsToCodex)(live.port, config, null));
+  } catch {
+    return { status: "failed", ok: false };
   }
 }
 
-async function handleCustomAdd(args: string[]): Promise<void> {
+function printCustomMutation(action: "added" | "removed", model: OcxCustomModel, sync: LocalSyncResult, wantsJson: boolean): void {
+  const complete = sync.configApplied === true && sync.ok;
+  if (sync.status !== "not-attempted" && (!sync.ok || sync.status === "refused")) process.exitCode = 1;
+  if (wantsJson) {
+    console.log(JSON.stringify({ action,
+      model: action === "added" ? model : { id: model.id, provider: model.provider, modelId: model.modelId },
+      needsSync: !complete, sync }, null, 2));
+    return;
+  }
+  if (sync.warning) console.log(`Warning: ${sync.warning}`);
+  console.log(`${action === "added" ? "Added" : "Removed"} custom model ${routedSlug(model.provider, model.modelId)}${action === "added" ? ` (${model.id})` : ""}.`);
+  if (sync.status === "skipped") console.log("Custom model saved; client sync was skipped by the integration policy.");
+  else if (!complete && sync.status !== "not-attempted") console.log("Custom model saved; client/catalog sync remains incomplete. Inspect the target before retrying.");
+}
+
+async function handleCustomAdd(args: string[], deps: ModelsCommandDeps): Promise<void> {
   const rest = [...args];
+  const wantsJson = consumeFlag(rest, "--json");
   const provider = rest.shift()?.trim() ?? "";
   const modelId = rest.shift()?.trim() ?? "";
   const displayNameValue = consumeFlagValue(rest, "--display-name");
@@ -205,60 +176,63 @@ async function handleCustomAdd(args: string[]): Promise<void> {
   if (!provider || !modelId) fail("provider and modelId are required", ADD_USAGE);
   if (!isValidProviderName(provider)) fail(`invalid provider name "${provider}"`);
 
-  const config = loadConfig();
-  if (!hasOwnProvider(config.providers, provider)) {
-    fail(`provider "${provider}" is not configured. See: ocx provider list`);
-  }
-
-  const displayName = displayNameValue?.trim() || undefined;
-  if (displayName?.includes("/")) fail("displayName must not contain /");
-
-  let contextWindow: number | undefined;
-  if (contextWindowValue !== undefined) {
-    contextWindow = Number(contextWindowValue);
-    if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
-      fail("context window must be a positive integer");
+  const { config, entry } = await withConfigDirHardeningSettled(getConfigDir(), () => {
+    const config = readCliConfigForMutation();
+    if (!hasOwnProvider(config.providers, provider)) {
+      fail(`provider "${provider}" is not configured. See: ocx provider list`);
     }
-  }
 
-  let inputModalities: string[] | undefined;
-  if (modalitiesValue !== undefined) {
-    inputModalities = modalitiesValue.split(",").map(value => value.trim());
-    const invalid = inputModalities.filter(value => !ALLOWED_MODALITIES.has(value));
-    if (inputModalities.length === 0 || invalid.length > 0) {
-      fail("modalities must be comma-separated values from text|image|audio");
+    const displayName = displayNameValue?.trim() || undefined;
+    if (displayName?.includes("/")) fail("displayName must not contain /");
+
+    let contextWindow: number | undefined;
+    if (contextWindowValue !== undefined) {
+      contextWindow = Number(contextWindowValue);
+      if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
+        fail("context window must be a positive integer");
+      }
     }
-    inputModalities = [...new Set(inputModalities)];
-  }
 
-  const parsed = parseReasoningArgs(reasoningEffortsValue, defaultEffortValue);
-  if (parsed.error) fail(parsed.error);
+    let inputModalities: string[] | undefined;
+    if (modalitiesValue !== undefined) {
+      inputModalities = modalitiesValue.split(",").map(value => value.trim());
+      const invalid = inputModalities.filter(value => !ALLOWED_MODALITIES.has(value));
+      if (inputModalities.length === 0 || invalid.length > 0) {
+        fail("modalities must be comma-separated values from text|image|audio");
+      }
+      inputModalities = [...new Set(inputModalities)];
+    }
 
-  const existing = config.customModels ?? [];
-  const slug = routedSlug(provider, modelId);
-  if (existing.some(model => routedSlug(model.provider, model.modelId) === slug)) {
-    fail(`custom model "${slug}" already exists`);
-  }
-  const known = knownModelIdsForProvider(provider, config.providers[provider], config);
-  if (encodedModelIdCollides(modelId, known)) {
-    fail(`custom model "${slug}" is ambiguous; it encodes to an existing model id`);
-  }
+    const parsed = parseReasoningArgs(reasoningEffortsValue, defaultEffortValue);
+    if (parsed.error) fail(parsed.error);
 
-  const entry: OcxCustomModel = {
-    id: randomUUID(),
-    provider,
-    modelId,
-    ...(displayName ? { displayName } : {}),
-    ...(contextWindow ? { contextWindow } : {}),
-    ...(inputModalities ? { inputModalities } : {}),
-    ...(parsed.reasoningEfforts ? { reasoningEfforts: parsed.reasoningEfforts } : {}),
-    ...(parsed.defaultReasoningEffort ? { defaultReasoningEffort: parsed.defaultReasoningEffort } : {}),
-    addedAt: new Date().toISOString(),
-  };
-  config.customModels = [...existing, entry];
-  saveConfig(config);
-  await syncCustomModelsIfLive();
-  console.log(`Added custom model ${slug} (${entry.id}).`);
+    const existing = config.customModels ?? [];
+    const slug = routedSlug(provider, modelId);
+    if (existing.some(model => routedSlug(model.provider, model.modelId) === slug)) {
+      fail(`custom model "${slug}" already exists`);
+    }
+    const known = knownModelIdsForProvider(provider, config.providers[provider], config);
+    if (encodedModelIdCollides(modelId, known)) {
+      fail(`custom model "${slug}" is ambiguous; it encodes to an existing model id`);
+    }
+
+    const entry: OcxCustomModel = {
+      id: randomUUID(),
+      provider,
+      modelId,
+      ...(displayName ? { displayName } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(inputModalities ? { inputModalities } : {}),
+      ...(parsed.reasoningEfforts ? { reasoningEfforts: parsed.reasoningEfforts } : {}),
+      ...(parsed.defaultReasoningEffort ? { defaultReasoningEffort: parsed.defaultReasoningEffort } : {}),
+      addedAt: new Date().toISOString(),
+    };
+    config.customModels = [...existing, entry];
+    saveConfig(config);
+    return { config, entry };
+  });
+  const sync = await syncCustomModelsIfLive(config, deps);
+  printCustomMutation("added", entry, sync, wantsJson);
 }
 
 async function confirmCustomRemoval(model: OcxCustomModel): Promise<boolean> {
@@ -274,14 +248,20 @@ async function confirmCustomRemoval(model: OcxCustomModel): Promise<boolean> {
   }
 }
 
-async function handleCustomRemove(args: string[]): Promise<void> {
+async function handleCustomRemove(args: string[], deps: ModelsCommandDeps): Promise<void> {
   const rest = [...args];
+  const wantsJson = consumeFlag(rest, "--json");
   const confirmed = consumeFlag(rest, "--yes");
   const target = rest.shift()?.trim() ?? "";
   rejectUnexpectedArgs(rest, REMOVE_USAGE);
   if (!target) fail("custom model id or provider/modelId is required", REMOVE_USAGE);
+  if (wantsJson && !confirmed) {
+    console.error("Error: JSON removal requires --yes; it does not prompt.");
+    process.exitCode = 2;
+    return;
+  }
 
-  const config = loadConfig();
+  const config = readCliConfigForMutation({ passive: true });
   const existing = config.customModels ?? [];
   // Slug matching goes through the shared resolver so this command sees the same collision
   // class catalog filtering and persisted sync see (#2491). `slugEquals` compares the raw and
@@ -323,11 +303,19 @@ async function handleCustomRemove(args: string[]): Promise<void> {
     return;
   }
 
-  const next = existing.filter((_, modelIndex) => modelIndex !== index);
-  config.customModels = next.length > 0 ? next : undefined;
-  saveConfig(config);
-  await syncCustomModelsIfLive();
-  console.log(`Removed custom model ${routedSlug(model.provider, model.modelId)}.`);
+  const savedConfig = await withConfigDirHardeningSettled(getConfigDir(), () => {
+    const fresh = readCliConfigForMutation();
+    const current = fresh.customModels ?? [];
+    if (JSON.stringify(current.find(row => row.id === model.id)) !== JSON.stringify(model)) {
+      fail("custom model changed before removal; inspect it before retrying");
+    }
+    const next = current.filter(row => row.id !== model.id);
+    fresh.customModels = next.length > 0 ? next : undefined;
+    saveConfig(fresh);
+    return fresh;
+  });
+  const sync = await syncCustomModelsIfLive(savedConfig, deps);
+  printCustomMutation("removed", model, sync, wantsJson);
 }
 
 function customModelCells(model: OcxCustomModel): string[] {
@@ -381,11 +369,12 @@ function handleConfiguredModels(args: string[]): void {
   const providerFilter = consumeFlagValue(restArgs, "--provider");
 
   if (restArgs.length > 0) {
-    const unknown = restArgs.filter(a => a.startsWith("-"));
+    const shown = redactSecretArgs(restArgs);
+    const unknown = shown.filter(a => a.startsWith("-"));
     if (unknown.length > 0) {
       console.error(`Unknown flag(s): ${unknown.join(", ")}`);
     } else {
-      console.error(`Unexpected argument(s): ${restArgs.join(", ")}`);
+      console.error(`Unexpected argument(s): ${shown.join(", ")}`);
     }
     console.error("Usage: ocx models [--provider <name>] [--json]");
     process.exit(1);
@@ -428,7 +417,9 @@ function handleConfiguredModels(args: string[]): void {
     for (const m of provModels) {
       const marker = m.isDefault ? " *" : "";
       const ctx = m.contextWindow ? ` (${Math.round(m.contextWindow / 1000)}k)` : "";
-      console.log(`  ${m.model}${marker}${ctx}`);
+      const rates = m.price?.cost4;
+      const pricing = rates ? ` ~$${rates.input}/$${rates.output} input/output per 1M tokens` : " price unknown";
+      console.log(`  ${m.model}${marker}${ctx}${pricing}`);
     }
     console.log();
   }
@@ -437,14 +428,26 @@ function handleConfiguredModels(args: string[]): void {
   console.log("Note: providers with liveModels may have additional models at runtime.");
 }
 
-export async function handleModels(args: string[]): Promise<void> {
+export async function handleModels(args: string[], deps: ModelsCommandDeps = {}): Promise<void> {
   const [subcommand, ...rest] = args;
+  const live = rest.filter(arg => arg === "--live" || arg.startsWith("--live="));
+  if (live.length) {
+    if (live.length !== 1 || live[0] !== "--live" || (subcommand !== "add" && subcommand !== "remove")) {
+      console.error("Error: --live is a single boolean flag for models add or remove.");
+      process.exitCode = 2;
+      return;
+    }
+    rest.splice(rest.indexOf("--live"), 1);
+    const { handleModelsCustomRuntimeCommand } = await import("./models-custom-runtime");
+    process.exitCode = await handleModelsCustomRuntimeCommand(subcommand, rest, deps);
+    return;
+  }
   if (subcommand === "add") {
-    await handleCustomAdd(rest);
+    await handleCustomAdd(rest, deps);
     return;
   }
   if (subcommand === "remove") {
-    await handleCustomRemove(rest);
+    await handleCustomRemove(rest, deps);
     return;
   }
   if (subcommand === "list-custom") {
@@ -453,7 +456,7 @@ export async function handleModels(args: string[]): Promise<void> {
   }
   if (isModelsRuntimeSubcommand(subcommand)) {
     const { handleModelsRuntimeCommand } = await import("./models-runtime");
-    const code = await handleModelsRuntimeCommand(subcommand!, rest);
+    const code = await handleModelsRuntimeCommand(subcommand!, rest, deps);
     if (code !== null) process.exitCode = code;
     return;
   }

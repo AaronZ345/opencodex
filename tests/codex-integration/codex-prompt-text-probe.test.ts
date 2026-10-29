@@ -12,11 +12,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   extractSectionsForTests,
+  mapSectionsToLayersForTests,
   probePromptText,
   promptTextProbeSpawnAttemptsForTests,
   resetPromptTextProbeForTests,
   setPromptTextProbeCloseBarrierForTests,
   setPromptTextProbeCommandForTests,
+  setPromptTextProbeExecBoundaryDepsForTests,
+  setPromptTextProbeMetadataBarrierForTests,
   setPromptTextProbeRuntimeForTests,
   type PromptTextProbe,
 } from "../../src/codex/prompt-text-probe";
@@ -183,6 +186,23 @@ describe("section extraction", () => {
     expect(sections.get("apps_instructions")).toBe("line one\nline two");
   });
 
+  test("context-dependent collaboration text maps to its prompt layer", () => {
+    const rendered = extractSectionsForTests(
+      message("<collaboration_mode>Pair-programming instructions.</collaboration_mode>"),
+    );
+    expect(mapSectionsToLayersForTests(rendered).collaboration).toEqual({
+      text: "Pair-programming instructions.",
+      reason: "ok",
+      bytes: 30,
+    });
+
+    expect(mapSectionsToLayersForTests(new Map()).collaboration).toEqual({
+      text: null,
+      reason: "not-rendered",
+      bytes: 0,
+    });
+  });
+
   test("AGENTS.md is bounded by its own INSTRUCTIONS wrapper", () => {
     // Capturing to end-of-message swept up whatever untagged prose followed. The
     // body is delimited, so the delimiter is the boundary.
@@ -208,6 +228,38 @@ describe("section extraction", () => {
     const sections = extractSectionsForTests(raw);
     expect(sections.has("div")).toBe(false);
     expect(sections.get("__agents_md")).toContain("<div>");
+  });
+
+  test("the no-directory AGENTS.md header is still extracted", () => {
+    // Upstream emits `# AGENTS.md instructions` with no `for <dir>` when the
+    // working set carries no path (core/src/context.rs). The `for` suffix is
+    // optional in the pattern for exactly this shape.
+    const raw = message("# AGENTS.md instructions\n\n<INSTRUCTIONS>\nAnswer tersely.\n</INSTRUCTIONS>");
+    expect(extractSectionsForTests(raw).get("__agents_md")).toBe("Answer tersely.");
+  });
+
+  test("the multi-environment form keeps its labels inside the capture", () => {
+    // The newer render labels each project's block `for \`<env>\` with root
+    // <cwd>` INSIDE the <INSTRUCTIONS> wrapper rather than in the header. Those
+    // labels are what the model sees, so the body keeps them.
+    const body = "for `prod` with root /srv/a\n\nRules for prod.\n\nfor `dev` with root /srv/b\n\nRules for dev.";
+    const raw = message(`# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${body}\n</INSTRUCTIONS>`);
+    expect(extractSectionsForTests(raw).get("__agents_md")).toBe(body);
+  });
+
+  test("an unrecognized AGENTS.md header maps to unmapped, not not-rendered", () => {
+    // A header that renders without its INSTRUCTIONS wrapper — a future
+    // upstream shape — must not be reported as "sent nothing": the text exists,
+    // it just cannot be shown. `unmapped` is the honest bucket for that.
+    const raw = message("# AGENTS.md instructions for /x\n\nThe whole file inline, no wrapper.");
+    const sections = extractSectionsForTests(raw);
+    expect(sections.has("__agents_md")).toBe(false);
+    expect(sections.has("__agents_md_unmatched")).toBe(true);
+    expect(mapSectionsToLayersForTests(sections)["agents-md"]).toEqual({
+      text: null,
+      reason: "unmapped",
+      bytes: 0,
+    });
   });
 });
 
@@ -497,6 +549,142 @@ describe("prompt probe process lifecycle", () => {
     expect(readFileSync(started, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
   });
 
+  for (const cancelFirst of [false, true]) {
+  test(`metadata admission preserves ${cancelFirst ? "earlier external cancellation" : "elapsed-only timeout"} and starts no child`, async () => {
+    const home = promptHome({
+      "config.toml": 'model = "gpt-test"\nmodel_instructions_file = "base.md"\n',
+      "base.md": "Base prompt body.",
+    });
+    const previousHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    setPromptTextProbeCommandForTests({
+      binary: process.execPath,
+      args: ["-e", `process.stdout.write(${JSON.stringify(VALID_PROBE_OUTPUT)})`],
+    });
+    let release!: () => void;
+    setPromptTextProbeMetadataBarrierForTests(new Promise<void>(resolve => { release = resolve; }));
+    let now = Date.now(), fired = false;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    const realSetTimeout = globalThis.setTimeout;
+    const controller = new AbortController();
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn, ms, ...args) =>
+      realSetTimeout(() => { if (ms === 60_000) fired = true; fn(...args); }, ms)) as typeof setTimeout);
+    try {
+      const pending = probePromptText(60_000, controller.signal);
+      if (cancelFirst) controller.abort(new Error("external cancellation won first"));
+      now += 60_001;
+      release();
+      const result = await pending;
+
+      expect(fired).toBe(false);
+      expect(result).toMatchObject({
+        ok: false,
+        detail: cancelFirst ? "prompt probe cancelled" : "prompt probe timed out",
+      });
+      if (!cancelFirst) expect(result.failure?.kind).toBe("execution-failed");
+      else expect(result.failure).toBeUndefined();
+      expect(result.base).toMatchObject({ text: "Base prompt body.", reason: "ok" });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(0);
+
+      timer.mockRestore(); clock.mockRestore();
+      setPromptTextProbeMetadataBarrierForTests(null);
+      expect((await probePromptText(2_000)).ok).toBe(true);
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
+    } finally {
+      release(); timer.mockRestore(); clock.mockRestore();
+      if (previousHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousHome;
+    }
+  });
+  }
+
+  test("a caller whose deadline expires mid-flight reports timed out while a joined caller keeps the shared child", async () => {
+    // Drive only the owner's deadline after both waiters joined. The child
+    // releases output on a file barrier, independent of scheduler timing.
+    const started = join(root(), "shared-deadline-start.txt");
+    const released = join(root(), "shared-deadline-release.txt");
+    const source = [
+      `require("node:fs").writeFileSync(${JSON.stringify(started)}, "started");`,
+      `const timer = setInterval(() => { if (require("node:fs").existsSync(${JSON.stringify(released)})) { clearInterval(timer); process.stdout.write(${JSON.stringify(VALID_PROBE_OUTPUT)}); } }, 10);`,
+    ].join("");
+    setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
+    const callbacks: Array<() => void> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn, ms, ...args) => {
+      if (ms === 30_000) callbacks.push(() => fn(...args));
+      return realSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout);
+    try {
+    const first = probePromptText(30_000);
+    await waitUntil(() => existsSync(started), "shared child started");
+    const second = probePromptText(30_000);
+    expect(callbacks).toHaveLength(3); // owner, fixed flight, joined caller
+    callbacks[0]!();
+
+    const expired = await first;
+    expect(expired).toMatchObject({
+      ok: false,
+      detail: "prompt probe timed out",
+      failure: { kind: "execution-failed" },
+    });
+    writeFileSync(released, "release");
+    expect((await second).ok).toBe(true);
+    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
+    expect(readFileSync(started, "utf8").trim()).toBe("started");
+    } finally { writeFileSync(released, "release"); timer.mockRestore(); }
+  });
+
+  test("the shared flight's own deadline surfaces as timed out for a joined caller still inside its budget", async () => {
+    // Hold verification at an entered barrier and expire only the fixed
+    // flight timer after both callers joined; caller deadlines remain quiet.
+    let entered!: () => void;
+    const verifying = new Promise<void>(resolve => { entered = resolve; });
+    setPromptTextProbeCommandForTests({
+      binary: "/Applications/ChatGPT.app/Contents/Resources/codex",
+      args: ["-e", "process.exit(0)"],
+    });
+    setPromptTextProbeExecBoundaryDepsForTests({
+      platform: "darwin",
+      executable: () => true,
+      realpath: path => path,
+      macBundleTrustReasonAsync: (_bundle, _binary, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          entered();
+        }),
+    });
+
+    const callbacks: Array<() => void> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn, ms, ...args) => {
+      if (ms === 30_000) callbacks.push(() => fn(...args));
+      return realSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout);
+    try {
+    const first = probePromptText(30_000);
+    await verifying;
+    const second = probePromptText(30_000);
+    expect(callbacks).toHaveLength(3);
+    callbacks[1]!(); // fixed flight, neither caller deadline
+
+    const [owner, joined] = await Promise.all([first, second]);
+    expect(owner).toMatchObject({
+      ok: false,
+      detail: "prompt probe timed out",
+      failure: { kind: "execution-failed" },
+    });
+    expect(joined).toMatchObject({
+      ok: false,
+      detail: "prompt probe timed out",
+      failure: { kind: "execution-failed" },
+    });
+    // The joined caller was handed the flight's own timeout failure, proving
+    // the shared backstop surfaced it rather than the caller deadline wrapper.
+    expect(joined.failure?.command).toContain("ChatGPT.app");
+    expect(promptTextProbeSpawnAttemptsForTests()).toBe(0);
+    } finally { timer.mockRestore(); }
+  });
+
   test("concurrent callers share one failure and a later caller retries", async () => {
     const started = join(root(), "failed-starts.txt");
     const source = [
@@ -724,5 +912,23 @@ describe("runtime resolution and failure classification", () => {
     expect(result.detail).toBe("codex debug prompt-input failed");
     expect(result.failure?.kind).toBe("execution-failed");
     expect(result.failure?.detail).not.toContain(marker);
+  });
+});
+
+
+describe("malformed bundled CLI prompt output", () => {
+  for (const output of ["[null]", '[{"content":[null]}]', '[{"content":[{"text":42}]}]']) {
+    test(`${output} yields output-invalid`, async () => {
+      setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", `process.stdout.write(${JSON.stringify(output)})`] });
+      const result = await probePromptText(2_000);
+      expect(result.ok).toBe(false);
+      expect(result.failure?.kind).toBe("output-invalid");
+    });
+  }
+  test("spawn failure of a resolved installed runtime yields program-not-found", async () => {
+    setPromptTextProbeRuntimeForTests({ command: join(root(), "missing-codex"), source: "installed" });
+    const result = await probePromptText(2_000);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.kind).toBe("program-not-found");
   });
 });

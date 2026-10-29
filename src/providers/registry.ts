@@ -7,7 +7,7 @@ import type {
 } from "./registry/types";
 import { PROVIDER_REGISTRY_CORE } from "./registry/entries-core";
 import { PROVIDER_REGISTRY_EXTENDED } from "./registry/entries-extended";
-
+import { anthropicInstanceRowShapeMatches } from "./anthropic-instance-id";
 export type {
   ProviderAuthKind,
   MetadataModelIdNormalize,
@@ -49,8 +49,7 @@ export function getProviderRegistryEntry(id: string): ProviderRegistryEntry | un
  * was only ever true for a freshly seeded config: `providerConfigSeed` copies the block once
  * (`derive.ts`), `enrichProviderFromCatalog` fills it only when the whole block is absent, and
  * nothing merged it at request time. So an install that predates a header — or that saved any
- * header of its own — never received the new one, which is exactly what #2067 would have
- * shipped for every existing opencode-free user.
+ * header of its own — never received the new one.
  *
  * The comparison is case-insensitive on purpose. HTTP header names are case-insensitive, but a
  * plain object spread is not: merging a registry `User-Agent` over a user's `user-agent`
@@ -81,7 +80,7 @@ export function registryModelServiceTierCapabilityApplies(
   return guard === undefined || guard(provider.baseUrl);
 }
 
-function normalizedProviderEndpoint(value: string): string {
+export function normalizedProviderEndpoint(value: string): string {
   const trimmed = value.trim();
   try {
     const parsed = new URL(trimmed);
@@ -102,10 +101,11 @@ function normalizedProviderEndpoint(value: string): string {
  */
 export function providerMatchesRegistryTransport(
   id: string,
-  provider: Pick<OcxProviderConfig, "baseUrl" | "adapter"> & Partial<Pick<OcxProviderConfig, "authMode">>,
+  provider: Pick<OcxProviderConfig, "baseUrl" | "adapter"> & Partial<Pick<OcxProviderConfig, "authMode" | "anthropicOAuthInstance">>,
 ): boolean {
   const entry = getProviderRegistryEntry(id);
   if (!entry) return false;
+  if (id === "anthropic2") return entry.authKind === "oauth" && entry.oauthId === id && entry.oauthFamily === "anthropic" && anthropicInstanceRowShapeMatches(id, provider);
   if (entry.authKind !== "key" || entry.preserveCustomDestination !== true) return true;
   // The opt-in is intentionally limited to fixed key destinations. Fail closed if a future
   // registry edit combines it with an override/template despite the registry parity tests.
@@ -115,7 +115,6 @@ export function providerMatchesRegistryTransport(
   if (provider.authMode !== undefined && provider.authMode !== "key") return false;
   return normalizedProviderEndpoint(provider.baseUrl) === normalizedProviderEndpoint(entry.baseUrl);
 }
-
 /**
  * Resolve the registry entry a configured provider actually points at, by TRANSPORT
  * rather than by name.
