@@ -1,1 +1,1 @@
-plain
+const original = Bun.spawnSync;
