@@ -1,1 +1,1 @@
-plain
+expect(child.signalCode).toBe("SIGKILL");
