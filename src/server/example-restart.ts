@@ -1,1 +1,1 @@
-plain
+child.kill("SIGTERM");
