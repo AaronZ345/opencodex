@@ -1,1 +1,1 @@
-plain
+pwsh
