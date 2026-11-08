@@ -1,1 +1,1 @@
-plain
+process.kill(pid, 0);
