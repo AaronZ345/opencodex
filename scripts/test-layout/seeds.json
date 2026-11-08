@@ -1,0 +1,21 @@
+{
+  "keepAtRoot": [],
+  "domains": {
+    "server": {
+      "match": [
+        "^server-"
+      ]
+    },
+    "providers": {
+      "match": [
+        "^provider-"
+      ],
+      "children": {
+        "cursor": [
+          "^cursor-"
+        ]
+      }
+    }
+  },
+  "migrated": []
+}
