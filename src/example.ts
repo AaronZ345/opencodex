@@ -1,1 +1,1 @@
-plain
+WIN32
