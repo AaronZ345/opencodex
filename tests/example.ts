@@ -1,1 +1,1 @@
-plain
+ordinary
