@@ -1,5 +1,0 @@
-{
-  "exec-trust-boundary.test.ts": "codex-integration",
-  "exec-boundary-launch.test.ts": "codex-integration",
-  "exec-known-app-bundles.test.ts": "codex-integration"
-}
