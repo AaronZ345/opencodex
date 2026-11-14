@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,7 +9,7 @@ import {
   USAGE_LEDGER_MAX_LINE_BYTES,
   UsageLedgerRebuildRequiredError,
 } from "../../src/usage/ledger-scanner";
-import { usageLogIdentityKey, usageLogPath, type PersistedUsageEntry } from "../../src/usage/log";
+import { normalizePersistedUsageRow, usageLogIdentityKey, usageLogPath, type PersistedUsageEntry } from "../../src/usage/log";
 
 let testDir = "";
 let previousHome: string | undefined;
@@ -46,6 +46,50 @@ afterEach(() => {
 });
 
 describe("usage ledger cooperative scanner", () => {
+  test("ASCII usage metadata does not repeat Unicode normalization for each ledger row (#7846)", async () => {
+    const row = entry("ascii-metadata", {
+      servedModel: "gpt-5.5", callerServiceTier: "priority", responseServiceTier: "default",
+      shadowCallRewrittenFrom: "openai/helper",
+    });
+    writeFileSync(usageLogPath(), `${JSON.stringify(row)}\n`.repeat(100));
+    const unicodeNormalize = spyOn(String.prototype, "normalize");
+    try {
+      const result = await scanUsageLedgerCooperatively({ onEntry: () => {} });
+      expect(result.parsedRows).toBe(100);
+      expect(unicodeNormalize).toHaveBeenCalledTimes(0);
+    } finally {
+      unicodeNormalize.mockRestore();
+    }
+  });
+
+  test("normalization preserves byte-exact legacy, redacted, nested and rejected row shapes (#7846)", async () => {
+    const base = entry("equivalence");
+    const attempt = {
+      ordinal: 1, provider: "openai", model: "gpt-5.5", adapter: "responses", status: 200,
+      durationMs: 1, sendCount: 1, recoveryKinds: [], usageStatus: "reported",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    };
+    const expectedBase = JSON.stringify(base);
+    const cases: Array<[unknown, string | undefined]> = [
+      [base, expectedBase],
+      [{ requestId: "legacy", provider: "openai" }, '{"requestId":"legacy","provider":"openai"}'],
+      [null, undefined], [[], undefined], ["row", undefined],
+      [{ requestId: 1, provider: "openai" }, undefined], [{ requestId: "missing-provider" }, undefined],
+      [{ ...base, callerServiceTier: "  priority\u0000  ", servedModel: "gpt-5.5", extra: "drop" },
+        '{"requestId":"equivalence","timestamp":1,"provider":"openai","model":"gpt-5.5","servedModel":"gpt-5.5","callerServiceTier":"priority","status":200,"durationMs":1,"usageStatus":"reported","usage":{"inputTokens":1,"outputTokens":1},"totalTokens":2}'],
+      [{ ...base, servedModel: "openai/gpt-5.5", resolvedModel: "openai/gpt-5.5", attempts: [null, attempt, { ...attempt, status: 0 }] },
+        expectedBase.slice(0, -1) + ',"attempts":[' + JSON.stringify(attempt) + ']}'],
+      [{ ...base, callerServiceTier: "author%69zation=fixture-value", servedModel: "gpt-\u200b5.5" },
+        '{"requestId":"equivalence","timestamp":1,"provider":"openai","model":"gpt-5.5","callerServiceTier":"author%69zation=[REDACTED]","status":200,"durationMs":1,"usageStatus":"reported","usage":{"inputTokens":1,"outputTokens":1},"totalTokens":2}'],
+    ];
+    for (const [input, expected] of cases) expect(JSON.stringify(normalizePersistedUsageRow(input))).toBe(expected);
+    writeFileSync(usageLogPath(), cases.map(([input]) => JSON.stringify(input)).join("\n") + "\n");
+    const scanned: string[] = [];
+    const result = await scanUsageLedgerCooperatively({ onEntry: row => { scanned.push(JSON.stringify(row)); } });
+    expect(scanned).toEqual(cases.flatMap(([, expected]) => expected === undefined ? [] : [expected]));
+    expect(result.invalidRows).toBe(5);
+  });
+
   test("a missing ledger is a complete empty snapshot", async () => {
     const entries: PersistedUsageEntry[] = [];
     const result = await scanUsageLedgerCooperatively({ onEntry: value => entries.push(value) });
@@ -119,6 +163,52 @@ describe("usage ledger cooperative scanner", () => {
     expect(result.parsedRows).toBe(2_100);
     expect(result.invalidRows).toBe(0);
     expect(totalTokens).toBe(4_200);
+  });
+
+  test("yields between expensive rows even when the ledger fits in one read", async () => {
+    const rows = Array.from({ length: 40 }, (_, index) => line(`slow-${index}`));
+    writeFileSync(usageLogPath(), rows.join(""));
+    let elapsed = 0;
+    let visited = 0;
+    let visitedAtTimer = -1;
+    const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+    const timer = setTimeout(() => { visitedAtTimer = visited; }, 0);
+    try {
+      const result = await scanUsageLedgerCooperatively({
+        onEntry() { visited += 1; elapsed += 10; },
+      });
+      expect(visitedAtTimer).toBeGreaterThan(0);
+      expect(visitedAtTimer).toBeLessThan(rows.length);
+      expect(result.parsedRows).toBe(rows.length);
+      expect(result.processedThroughBytes).toBe(Buffer.byteLength(rows.join("")));
+      // Pausing between rows must not change the checkpoint a scan publishes.
+      clock.mockRestore();
+      const unpaused = await scanUsageLedgerCooperatively({ onEntry() {} });
+      expect(result.processedThroughDigest).toBe(unpaused.processedThroughDigest);
+    } finally {
+      clearTimeout(timer);
+      clock.mockRestore();
+    }
+  });
+
+  test("honors cancellation delivered between expensive rows in one read", async () => {
+    writeFileSync(usageLogPath(), Array.from({ length: 40 }, (_, index) => line(`abort-${index}`)).join(""));
+    let elapsed = 0;
+    let visited = 0;
+    const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+    const abort = new AbortController();
+    const reason = new Error("cancel slow scan");
+    const timer = setTimeout(() => abort.abort(reason), 0);
+    try {
+      await expect(scanUsageLedgerCooperatively({
+        signal: abort.signal,
+        onEntry() { visited += 1; elapsed += 10; },
+      })).rejects.toBe(reason);
+      expect(visited).toBeLessThan(40);
+    } finally {
+      clearTimeout(timer);
+      clock.mockRestore();
+    }
   });
 
   test("skips malformed, invalid UTF-8, oversized, and torn final rows with bounded recovery", async () => {
