@@ -51,13 +51,9 @@ import {
   toolLoopPinnedPick,
 } from "./combo-tool-loop-pin";
 import {
-  sessionLaneIdFromRequest,
-  conversationIdFromResponsesRequest,
-  assignNativeLogConversationId,
-  fillHermesLogConversationFallback,
-  nativeLogConversationIdFromHeaders,
-  sessionIdHeaderFromRequest,
-  reasoningReplayConversationIdFromResponsesRequest,
+  sessionLaneIdFromRequest, conversationIdFromResponsesRequest, assignNativeLogConversationId,
+  fillHermesLogConversationFallback, nativeLogConversationIdFromHeaders, sessionIdHeaderFromRequest,
+  promotePromptCacheKeySession, reasoningReplayConversationIdFromResponsesRequest,
 } from "../request-log-conversation";
 import { contextPrincipalIdOf, resolveContextPrincipal } from "../auth-cors";
 import { responseTurnMembership } from "./turn-membership";
@@ -299,6 +295,10 @@ export async function prepareResponsesRequest(
       : options.promptCacheKeyIsSharedCohort === false ? "metadata-derived" : "caller",
     contextPrincipalIdOf(options.admission),
   );
+  // After the diagnostic above: a body prompt_cache_key stands in for a missing session header (#9137).
+  if (inboundWire === "responses" && options.promptCacheKeyIsSharedCohort !== true) {
+    promotePromptCacheKeySession(req.headers, body, options.admission);
+  }
   if (!concreteSelection && !options.compactionRoutingOverride && inboundWire === "responses") {
     options.compactionRoutingOverride = applyCompactionRoutingOverride(body, req.headers, config, {
       endpoint: "responses",
@@ -666,9 +666,7 @@ export async function prepareResponsesRequest(
         // The enclosing branch already proves this is not the shared cohort.
         promptCacheKeyIsSharedCohort: false,
       });
-      if (normalizedCacheKey) {
-        parsed._reasoningReplayScope = { clientThreadId: normalizedCacheKey };
-      }
+      if (normalizedCacheKey) parsed._reasoningReplayScope = { clientThreadId: normalizedCacheKey };
     }
     if (cursorClientThreadId) parsed._cursorClientThreadId = cursorClientThreadId;
     if (options.shadowCallIntercepted === true) parsed._cursorIsolateConversation = true;
@@ -676,6 +674,7 @@ export async function prepareResponsesRequest(
       parsed._memoryModelPhase = options.memoryModelPhase;
       parsed._cursorIsolateConversation = true;
     }
+    if (options.advisorSessionIdentity) parsed._advisorSessionIdentity = options.advisorSessionIdentity;
   } catch (err) {
     if (isTranslatorBudgetExceededError(err)) {
       return markProxyError(formatErrorResponse(413, "request_too_large", "request translation buffer exceeded the safe limit", {

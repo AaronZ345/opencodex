@@ -194,7 +194,7 @@ provider block in `models.yml`; default presets and proxy routing in `config.yml
 
 TOML temporal scalars cannot survive the JSON-cloned merge representation with their types
 intact. The common parser refuses documents containing them before either status or mutation
-proceeds, including nested arrays and inline tables. Quoted date strings remain supported.
+proceeds, including nested arrays and inline tables. Quoted date strings remain supported. YAML serializers quote leading-dot numeric strings, including exponent forms, in keys and values to preserve their string types. Kimi Code's `config.toml` is patched in place by `src/integrations/toml-source.ts` (#9152): only the owned `[providers.opencodex]` and `[models."opencodex/…"]` tables are replaced, so comments, `[[array]]` tables and sibling edits survive, and a layout that cannot be patched that way is refused rather than re-rendered.
 
 ## Catalog visibility
 
@@ -319,7 +319,7 @@ New records pair the exact contribution fingerprints with semantic fingerprints 
 sort JSON object keys while preserving array order. Existing records without the semantic companion
 fall back to comparing the recorded generated contribution when the catalog has not moved. This
 keeps old records readable while preventing a client's formatting-only key reorder from
-masquerading as a protected edit.
+masquerading as a protected edit. On the shared JSON files for Qoder, Qoder CN and OpenCode, a clean Advisor MCP companion write advances `fileFingerprint` but not the journal `resultFingerprint`, so Undo sees drift and requires confirmation.
 
 > Decision record: [ADR-0091](../decisions/ADR-0091-ownership-axes.md)
 
